@@ -64,14 +64,24 @@ SetCompressor /SOLID lzma
 ; Refuse rather than corrupt. Windows will not let a running image be
 ; overwritten, and an installer that ploughs on leaves a half-installed
 ; directory and a confusing error.
+;
+; The probe is the condition itself: open the installed executable for
+; writing, which Windows refuses while it runs. `System.dll` ships with
+; every NSIS; the `FindProcDLL` plugin this used to lean on ships with
+; none of them, is no longer on Chocolatey, and had been lying on 64-bit
+; Windows for years anyway. Pressing OK re-runs the probe rather than
+; taking anybody's word for it.
 Function .onInit
-  FindProcDLL::FindProc "mbrd.exe"
-  ${If} $R0 == 1
+  check:
+  IfFileExists "$INSTDIR\mbrd.exe" 0 clear
+  System::Call 'kernel32::CreateFileW(w "$INSTDIR\mbrd.exe", i 0x40000000, i 0, p 0, i 3, i 0x80, p 0) i .r0'
+  ${If} $0 = -1
     MessageBox MB_OKCANCEL|MB_ICONEXCLAMATION \
-      "mbrd is running. Close it and press OK to carry on." IDOK retry
+      "mbrd is running. Close it and press OK to carry on." IDOK check
     Abort
-    retry:
   ${EndIf}
+  System::Call 'kernel32::CloseHandle(i r0)'
+  clear:
 FunctionEnd
 
 Section "Install"

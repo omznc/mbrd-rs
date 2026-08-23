@@ -148,10 +148,11 @@ jobs:
           if (-not (Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe")) {
             choco install nsis --no-progress -y
           }
-          # `FindProcDLL`, which `mbrd.nsi` uses to refuse to install over a
-          # running copy. Not part of the base NSIS install.
-          choco install nsis-plugin-findprocdll --no-progress -y `
-            --ignore-package-exit-codes || Write-Host "findprocdll unavailable; continuing"
+          # No plugins. `mbrd.nsi`'s running-copy check uses `System.dll`,
+          # which base NSIS carries — the `FindProcDLL` plugin it once wanted
+          # is no longer on Chocolatey, and a `pwsh` step cannot even shrug a
+          # failed `choco` off: the runner appends `exit $LASTEXITCODE`, so
+          # the `|| continue` that guarded it never actually continued.
 
       - name: Find the shader compiler
         if: matrix.platform == 'windows-latest'
