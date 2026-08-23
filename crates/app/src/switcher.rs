@@ -358,7 +358,7 @@ pub fn render(
     cx: &mut Context<BoardView>,
 ) -> impl IntoElement {
     let theme = view.theme;
-    let presence = view.overlay_presence;
+    let presence = view.overlay_presence.value();
     let matches = switcher.matches();
 
     let rows: Vec<_> = matches

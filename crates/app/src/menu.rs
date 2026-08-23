@@ -369,7 +369,7 @@ pub fn render(menu: &Menu, view: &BoardView, cx: &mut Context<BoardView>) -> imp
     // row that owns the submenu and nothing else moves it while the submenu
     // is open. One field, one meaning: see [`Menu::cursor`].
     let lit = menu.cursor;
-    let presence = view.overlay_presence;
+    let presence = view.overlay_presence.value();
 
     // Both lists in one wrapper, so the submenu is a sibling of the list that
     // opened it and paints over it rather than inside it. The wrapper fills the

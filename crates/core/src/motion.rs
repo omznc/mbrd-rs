@@ -135,6 +135,22 @@ impl Spring {
     /// anything slower than this reads as lag rather than as motion.
     pub const ZOOM: Spring = Spring::new(1.0, 0.19);
 
+    /// A surface arriving over the board — the menu, the switcher, the
+    /// palette, the settings page.
+    ///
+    /// Critically damped, because a panel was summoned by a key press and a
+    /// key press carries no momentum — overshoot here would be an invented
+    /// gesture, per the module note. Quick, because a palette that lags the
+    /// Shift-Shift that asked for it reads as the app hesitating.
+    ///
+    /// The reason this is a spring at all rather than the linear fade it
+    /// replaced: these surfaces *move* as they come and go, and an Escape
+    /// pressed while one is still arriving has to bend it back out of its
+    /// own motion — same value, same velocity, new target — rather than
+    /// hard-cutting into a second animation. A linear ramp reverses with a
+    /// kink; a retargeted spring does not.
+    pub const SURFACE: Spring = Spring::new(1.0, 0.18);
+
     /// The undamped angular frequency the two numbers imply.
     fn omega(&self) -> f32 {
         TAU / self.response

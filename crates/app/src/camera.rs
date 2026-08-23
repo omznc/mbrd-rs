@@ -282,6 +282,22 @@ impl Camera {
         dt
     }
 
+    /// Restart the clock at `now`, without measuring anything.
+    ///
+    /// For the first frame after the board has been *still* — which is a
+    /// different thing from a long frame. [`tick`](Self::tick)'s clamp
+    /// exists for a stall in the middle of a motion, where the springs are
+    /// owed the time and a slow frame is better than a dropped one. An idle
+    /// board owes its springs nothing: no frames were requested because
+    /// nothing was moving, and billing the whole quiet stretch — even
+    /// clamped — to the first thing that *starts* moving lands a palette's
+    /// entire arrival inside one invisible frame. The caller knows which of
+    /// the two it is looking at, because the caller is the one that stopped
+    /// asking for frames; see `BoardView::advance`.
+    pub fn wake(&mut self, now: Instant) {
+        self.last = Some(now);
+    }
+
     /// Advance by `dt` and write the result into the viewport.
     ///
     /// Answers whether another frame is wanted. That return value is the whole
@@ -759,6 +775,19 @@ mod tests {
         let now = Instant::now();
         cam.tick(now);
         assert_eq!(cam.tick(now + Duration::from_secs(30)), LONGEST_FRAME);
+    }
+
+    #[test]
+    fn waking_forgives_the_idle_time_instead_of_billing_it() {
+        // A board that sat still for half an hour and then had its palette
+        // opened: the first animation frame must be a fresh start, not a
+        // quarter-second leap that lands every spring before it can be seen.
+        let mut cam = Camera::new(&vp());
+        let now = Instant::now();
+        cam.tick(now);
+        let later = now + Duration::from_secs(1800);
+        cam.wake(later);
+        assert_eq!(cam.tick(later), 0.0);
     }
 
     #[test]
