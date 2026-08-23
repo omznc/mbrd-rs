@@ -558,6 +558,10 @@ pub fn render(
         .bottom_0()
         .flex()
         .justify_center()
+        // As tall as what is in it. The cross-axis default is stretch, which
+        // takes the panel to its `max_h` however few rows survived the query
+        // and leaves the footer stranded above a band of empty chrome.
+        .items_start()
         // Not centred vertically: a list that grows downward from a fixed
         // point does not move the thing you are aiming at as you type.
         .pt(px(96.0))

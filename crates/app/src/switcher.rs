@@ -484,6 +484,12 @@ pub fn render(
         .bottom_0()
         .flex()
         .justify_center()
+        // The panel is as tall as what is in it, not as tall as it is allowed
+        // to get. Without this the default cross-axis stretch pulls it to its
+        // own `max_h` whatever the list holds, and three boards leave the
+        // footer floating in the middle of an empty box — see `palette.rs`,
+        // which hugs its content for the same reason.
+        .items_start()
         // Not centred vertically: a list that grows downward from a fixed point
         // does not move the thing you are aiming at as you type.
         .pt(px(96.0))
