@@ -378,7 +378,17 @@ pub fn render(menu: &Menu, view: &BoardView, cx: &mut Context<BoardView>) -> imp
     div()
         .absolute()
         .size_full()
-        .child(list("menu", menu.list, menu.entries, lit, presence, false, Some(&menu.scroll), view, cx))
+        .child(list(
+            "menu",
+            menu.list,
+            menu.entries,
+            lit,
+            presence,
+            false,
+            Some(&menu.scroll),
+            view,
+            cx,
+        ))
         .children(menu.open.as_ref().map(|open| {
             list("submenu", open.list, open.entries, open.cursor, presence, true, None, view, cx)
         }))

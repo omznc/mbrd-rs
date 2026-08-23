@@ -403,7 +403,11 @@ impl Wires {
                 let still = cache.revision == revision
                     && same(&cache.visible, &visible)
                     && board.connections.len() == cache.lit.len()
-                    && board.connections.iter().zip(cache.lit.iter()).all(|(c, &was)| lit(c) == was);
+                    && board
+                        .connections
+                        .iter()
+                        .zip(cache.lit.iter())
+                        .all(|(c, &was)| lit(c) == was);
                 if still {
                     return cache.wires.clone();
                 }

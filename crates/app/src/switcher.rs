@@ -557,17 +557,13 @@ pub fn render(
                         // The query takes the room the button does not, so the
                         // caret sits where you are typing rather than being
                         // pushed along by a control at the far end of the row.
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .py(px(4.0))
-                                .child(crate::palette::query_line(
-                                    &switcher.query,
-                                    "open a board\u{2026}",
-                                    &theme,
-                                )),
-                        )
+                        .child(div().flex_1().min_w_0().py(px(4.0)).child(
+                            crate::palette::query_line(
+                                &switcher.query,
+                                "open a board\u{2026}",
+                                &theme,
+                            ),
+                        ))
                         .child(new_board_button(cx, theme)),
                 )
                 .child(

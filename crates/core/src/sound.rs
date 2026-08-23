@@ -287,9 +287,8 @@ fn riff(bytes: &[u8]) -> Option<bool> {
     while at + 8 <= bytes.len() {
         let mut kind = [0u8; 4];
         kind.copy_from_slice(&bytes[at..at + 4]);
-        let size =
-            u32::from_le_bytes([bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]])
-                as usize;
+        let size = u32::from_le_bytes([bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]])
+            as usize;
         let payload = at + 8;
         let end = payload.checked_add(size).filter(|end| *end <= bytes.len())?;
         if &kind == b"LIST" && payload + 4 <= end && &bytes[payload..payload + 4] == b"hdrl" {

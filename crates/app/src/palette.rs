@@ -645,12 +645,11 @@ pub fn render(
                                 .text_color(theme.accent)
                                 .child(palette.mode.chip()),
                         )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .child(query_line(&palette.query, palette.mode.prompt(), &theme)),
-                        ),
+                        .child(div().flex_1().min_w_0().child(query_line(
+                            &palette.query,
+                            palette.mode.prompt(),
+                            &theme,
+                        ))),
                 )
                 .child(
                     div()

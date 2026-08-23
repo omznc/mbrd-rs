@@ -380,8 +380,7 @@ impl Images {
         // resharpened copy has a card waiting on it that just has not drawn
         // a frame since it landed, where a first decode has not been asked
         // for at full size by anyone yet.
-        let was_resharpen =
-            matches!(self.slots.get(hash), Some(Slot::Ready(r)) if matches!(r.sharp, Sharp::Coming));
+        let was_resharpen = matches!(self.slots.get(hash), Some(Slot::Ready(r)) if matches!(r.sharp, Sharp::Coming));
 
         // A re-decode replaces what was there, and if the picture it is
         // replacing had not finished arriving yet, that count has to come

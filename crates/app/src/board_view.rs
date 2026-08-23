@@ -334,8 +334,11 @@ fn step_presence(presence: &mut f32, leaving: bool, dt: f32) -> bool {
     }
     let rate = if leaving { OVERLAY_OUT } else { OVERLAY_IN };
     let step = dt / rate;
-    *presence =
-        if *presence < target { (*presence + step).min(target) } else { (*presence - step).max(target) };
+    *presence = if *presence < target {
+        (*presence + step).min(target)
+    } else {
+        (*presence - step).max(target)
+    };
     true
 }
 
@@ -2677,8 +2680,13 @@ impl BoardView {
             // catches an align. See `Self::present_move`. Taken over the
             // whole board rather than just the selection because the snap
             // itself does not ask what is selected; it moves everything.
-            let before: HashMap<String, (f32, f32)> =
-                self.doc.board.items.iter().map(|item| (item.id.clone(), (item.x, item.y))).collect();
+            let before: HashMap<String, (f32, f32)> = self
+                .doc
+                .board
+                .items
+                .iter()
+                .map(|item| (item.id.clone(), (item.x, item.y)))
+                .collect();
             let moved =
                 self.doc.board.edit(if now { "Snap to grid" } else { "Off the grid" }, |board| {
                     if now {
@@ -2691,8 +2699,13 @@ impl BoardView {
                 // Cloned out rather than walked in place: the loop below
                 // wants `self` mutably for `present_move`, and the board is
                 // not one of the fields that call can be split around.
-                let after: Vec<(String, f32, f32)> =
-                    self.doc.board.items.iter().map(|item| (item.id.clone(), item.x, item.y)).collect();
+                let after: Vec<(String, f32, f32)> = self
+                    .doc
+                    .board
+                    .items
+                    .iter()
+                    .map(|item| (item.id.clone(), item.x, item.y))
+                    .collect();
                 for (id, x, y) in after {
                     if let Some(&(ox, oy)) = before.get(&id) {
                         self.present_move(&id, ox - x, oy - y);
@@ -3281,8 +3294,10 @@ impl BoardView {
         if dx == 0.0 && dy == 0.0 {
             return;
         }
-        let (sx, sy) =
-            self.presenting.entry(id.to_string()).or_insert_with(|| (Sprung::at(0.0), Sprung::at(0.0)));
+        let (sx, sy) = self
+            .presenting
+            .entry(id.to_string())
+            .or_insert_with(|| (Sprung::at(0.0), Sprung::at(0.0)));
         let mut x = Sprung::at(sx.value() + dx);
         x.retarget(0.0);
         let mut y = Sprung::at(sy.value() + dy);
@@ -3616,7 +3631,8 @@ impl BoardView {
             // the line a few pixels further out, which is the one of the two
             // a chip sitting on top of its own line should win.
             let pad = 4.0 / zoom;
-            ((world.x - at.x).abs() <= wide / 2.0 + pad && (world.y - at.y).abs() <= tall / 2.0 + pad)
+            ((world.x - at.x).abs() <= wide / 2.0 + pad
+                && (world.y - at.y).abs() <= tall / 2.0 + pad)
                 .then(|| (w.a.clone(), w.b.clone()))
         })
     }
@@ -4587,9 +4603,7 @@ impl BoardView {
                 }
 
                 let wanted = view
-                    .update(cx, |view, cx| {
-                        view.arrive(token, found, batch, unreadable, heavy, cx)
-                    })
+                    .update(cx, |view, cx| view.arrive(token, found, batch, unreadable, heavy, cx))
                     .unwrap_or(false);
                 // The view has gone, or this drop has been called off. Dropping
                 // the receiver is what tells the reader to stop.
@@ -6238,11 +6252,8 @@ impl BoardView {
                 // is only the fallback for a board that shifted mid-gesture,
                 // which nothing does.
                 let fits = board.items.get(held.index).is_some_and(|item| item.id == held.id);
-                let found = if fits {
-                    board.items.get_mut(held.index)
-                } else {
-                    board.item_mut(&held.id)
-                };
+                let found =
+                    if fits { board.items.get_mut(held.index) } else { board.item_mut(&held.id) };
                 if let Some(item) = found {
                     let home = &held.home;
                     // The free position: where the card would be with no
@@ -6981,8 +6992,7 @@ impl BoardView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let text_field_open =
-            matches!(self.overlay, Overlay::Palette(_) | Overlay::Switcher(_));
+        let text_field_open = matches!(self.overlay, Overlay::Palette(_) | Overlay::Switcher(_));
         if self.editing.is_some() || text_field_open {
             self.taps.forget();
             return;
@@ -7365,9 +7375,8 @@ impl BoardView {
         // up. The press, unlike the hover, does not need a gesture check —
         // `pressed_control` is only ever set by a press that landed on one of
         // these three buttons in the first place.
-        let hover_control = matches!(self.gesture, Gesture::None)
-            .then(|| self.controls_at(self.pointer))
-            .flatten();
+        let hover_control =
+            matches!(self.gesture, Gesture::None).then(|| self.controls_at(self.pointer)).flatten();
         let press_control = self.pressed_control.clone();
 
         // The prospective host for a single loose note being dragged on its
@@ -7411,7 +7420,9 @@ impl BoardView {
         // whenever the gesture is not a marquee, so a plain lookup below
         // reads as "not being swept" without a match of its own.
         let marqueed: HashSet<&str> = match &self.gesture {
-            Gesture::Marquee { provisional, .. } => provisional.iter().map(String::as_str).collect(),
+            Gesture::Marquee { provisional, .. } => {
+                provisional.iter().map(String::as_str).collect()
+            }
             _ => HashSet::new(),
         };
 
@@ -7532,7 +7543,10 @@ impl BoardView {
             // would be a wash `paint_controls` was never asked to draw.
             let for_this = |held: &Option<(String, transport::Hit)>| {
                 held.as_ref().filter(|(id, _)| id == &item.id).map(|(_, hit)| *hit).filter(|hit| {
-                    matches!(hit, transport::Hit::PlayPause | transport::Hit::Mute | transport::Hit::Looping)
+                    matches!(
+                        hit,
+                        transport::Hit::PlayPause | transport::Hit::Mute | transport::Hit::Looping
+                    )
                 })
             };
             let controls = controls_for(
