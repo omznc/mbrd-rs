@@ -947,7 +947,7 @@ impl BoardView {
         if self.selection.is_empty() {
             return;
         }
-        let doomed: Vec<String> = self.selection.drain(..).collect();
+        let doomed: Vec<String> = std::mem::take(&mut self.selection);
         let at = mbrd_core::naming::now_millis();
         let binned = self.doc.board.edit("To the bin", |board| {
             let mut binned = 0;

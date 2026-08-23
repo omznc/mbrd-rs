@@ -262,7 +262,7 @@ pub fn decode(bytes: &[u8]) -> Option<Arc<RenderImage>> {
     // of the difference: swap the two ends of each pixel in place. Doing it
     // here rather than at paint time means it is paid once, off the main
     // thread, instead of on every upload.
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
 
