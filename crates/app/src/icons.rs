@@ -110,9 +110,10 @@ icons! {
     CaretDown => "regular/caret-down",
     CaretRight => "regular/caret-right",
 
-    // The two wordless buttons beside the project switcher.
+    // The wordless buttons beside the project switcher.
     Commands => "duotone/command",
     Find => "duotone/list-magnifying-glass",
+    Settings => "duotone/gear",
 
     // The bottom bar.
     Zoom => "duotone/magnifying-glass",

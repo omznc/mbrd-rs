@@ -41,6 +41,7 @@ mod playback;
 mod prefs;
 mod recent;
 mod save;
+mod settings;
 mod switcher;
 mod taps;
 mod theme;

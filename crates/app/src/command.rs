@@ -18,6 +18,7 @@
 
 use gpui::{Context, Modifiers, Window};
 use mbrd_core::align::{Axis, Edge};
+use mbrd_core::arrange::Arrangement;
 use mbrd_core::model::{ConnColor, ConnDir, ConnStyle, ConnWeight};
 
 use crate::board_view::BoardView;
@@ -106,6 +107,13 @@ pub enum Command {
     /// menu where two rows are always wrong. What it does depends on how far
     /// the last press got; see `BoardView::update_step`.
     CheckForUpdates,
+    /// Open the settings page — every switch the app has, on one surface.
+    ///
+    /// The page itself is `settings.rs`; this is only the door onto it. A
+    /// command rather than a submenu so the palette can reach it and a key
+    /// can open it, and because the board's numbers — grid step, card gap,
+    /// media fit — are choices a menu row cannot show.
+    Settings,
     /// Join everything selected with the fewest lines that reach all of it.
     Connect,
     /// Put a labelled rectangle around what is selected. Membership is
@@ -120,8 +128,14 @@ pub enum Command {
     /// The other half of grouping, and the reason binning a group takes its
     /// contents with it: there is already a word for keeping them.
     Ungroup,
-    /// Take a sticky note off the card it is pinned to.
-    Unstick,
+    /// Whether the selected notes pin to whatever they lie on.
+    ///
+    /// **Off by default.** A note that merely overlaps a photograph is two
+    /// things near each other; a note the author has marked sticky is *on*
+    /// it, travels with it, and hands a drag to it. The flag is the door
+    /// onto all of `core::stick`, and it used to be the other way around —
+    /// see that module for what the old default kept breaking.
+    ToggleSticky,
     /// Whether this card's words keep their size as the board moves under
     /// them. **On unless somebody turns it off**, which is why it is named
     /// for the state it is normally in rather than for the change it makes.
@@ -177,6 +191,20 @@ pub enum Command {
     /// Push overlapping cards off each other.
     Separate,
 
+    // The whole-board layouts. `Arrange` carries which one, for the reason
+    // `Align` carries its edge: the menu builds its list by mapping over
+    // `Arrangement::ALL`, which the *core* defines, so a layout the engine
+    // gains is a row here the moment it exists.
+    /// Pick a named arrangement and lay the board out in it. Also what the
+    /// board remembers in `arrangements.desktop`, so the menu ticks the one
+    /// the board was last laid out in.
+    Arrange(Arrangement),
+    /// Lay the whole board out again in the arrangement it already has, with
+    /// a fresh seed — the "shake the board loose" gesture.
+    Rearrange,
+    /// The same, over only what is selected, centred where the selection is.
+    RearrangeSelection,
+
     // The connection commands. Every one of them is about the rope that is
     // selected, and every one is unavailable when none is — see `available`.
     /// Type a word onto the middle of it.
@@ -228,10 +256,11 @@ impl Command {
             Self::ToggleMotion => "Animation",
             Self::ToggleUpdateChecks => "Look for new versions",
             Self::CheckForUpdates => "Check for updates…",
+            Self::Settings => "Settings…",
             Self::Connect => "Connect",
             Self::AddFence => "Group",
             Self::Ungroup => "Ungroup",
-            Self::Unstick => "Unstick note",
+            Self::ToggleSticky => "Sticky",
             Self::DontScaleText => "Don't scale text",
             Self::FitText => "Dynamic size",
             Self::PlayPause => "Play / pause",
@@ -249,6 +278,12 @@ impl Command {
                 Axis::Vertical => "Space down",
             },
             Self::Separate => "Push apart",
+
+            // Named after the shape rather than the act — the menu ticks the
+            // one the board is in, so a row reads as a choice already made.
+            Self::Arrange(arrangement) => arrangement.label(),
+            Self::Rearrange => "Rearrange everything",
+            Self::RearrangeSelection => "Rearrange selection",
 
             Self::ConnLabel => "Label",
             Self::ConnDelete => "Remove connection",
@@ -340,10 +375,12 @@ impl Command {
             Self::Palette => "Shift Shift",
             Self::Search => "Ctrl F",
             Self::CheckForUpdates => "Ctrl U",
+            // The spelling every application means settings by.
+            Self::Settings => "Ctrl ,",
             Self::Connect => "J",
             Self::AddFence => "Ctrl G",
             Self::Ungroup => "Ctrl Shift G",
-            Self::Unstick => "U",
+            Self::ToggleSticky => "U",
             Self::PlayPause => "Space",
             // No key: the letters worth spending are gone, and unlike play or
             // pause this is not the one control every media player binds a
@@ -358,6 +395,11 @@ impl Command {
             | Self::ToggleMotion
             | Self::ToggleUpdateChecks => "",
             Self::Align(_) | Self::Distribute(_) | Self::Separate => "",
+            // No key: a whole-board relayout is deliberate and rare, and a
+            // single letter that scattered twenty thousand cards would be the
+            // most expensive typo in the app. Undo covers it, but reaching
+            // for it through the palette is the right amount of friction.
+            Self::Arrange(_) | Self::Rearrange | Self::RearrangeSelection => "",
 
             Self::ConnLabel
             | Self::ConnDelete
@@ -393,7 +435,7 @@ impl Command {
             // Shift first, or the plain-group arm would swallow both.
             "g" if mods.secondary() && mods.shift => Self::Ungroup,
             "g" if mods.secondary() => Self::AddFence,
-            "u" if plain => Self::Unstick,
+            "u" if plain => Self::ToggleSticky,
             "]" if plain => Self::BringToFront,
             "[" if plain => Self::SendToBack,
             // Enter as well as F2: F2 is the one to learn and Enter is the
@@ -422,8 +464,9 @@ impl Command {
             // and `Ctrl K` is what this app's own roadmap promised. Neither is
             // the alias — they are both simply it.
             "f" | "k" if mods.secondary() => Self::Search,
-            // Plain `u` is Unstick; the modified form was free.
+            // Plain `u` is the sticky toggle; the modified form was free.
             "u" if mods.secondary() => Self::CheckForUpdates,
+            "," if mods.secondary() => Self::Settings,
             // Shift first, or the plain-undo arm would swallow both.
             "z" if mods.secondary() && mods.shift => Self::Redo,
             "z" if mods.secondary() => Self::Undo,
@@ -472,8 +515,17 @@ impl Command {
             // Three, for spacing: with two, the gap between them is the only
             // gap there is and it is already even.
             Self::Distribute(_) => view.selection.len() >= 3,
+            // Anything at all to lay out — furniture does not count, because
+            // the title card and the hints are exactly what a rearrangement
+            // leaves where they are.
+            Self::Arrange(_) | Self::Rearrange => view.doc.board.items.iter().any(|i| {
+                !matches!(i.kind, mbrd_core::ItemType::Title | mbrd_core::ItemType::Ghost)
+            }),
+            // Two: one card rearranged alone is a card teleported somewhere
+            // arbitrary, which nobody has ever meant by the word.
+            Self::RearrangeSelection => view.selection.len() >= 2,
             Self::Ungroup => view.can_ungroup(),
-            Self::Unstick => view.can_unstick(),
+            Self::ToggleSticky => view.can_toggle_sticky(),
             Self::DontScaleText => view.text_unscaled().is_some(),
             Self::FitText => view.text_fitted().is_some(),
             // A note or a swatch selected alone has neither, and a menu that
@@ -515,8 +567,17 @@ impl Command {
             Self::ToggleGuides => Some(settings.guides),
             // The two that are about the person rather than about the board,
             // which is why they read from `prefs` and not from `settings`.
+            // Per-card rather than board-wide: what the tick shows is whether
+            // every selected note is sticky, and the row stays untickable
+            // when nothing selected is a note.
+            Self::ToggleSticky => view.sticky_state(),
             Self::ToggleMotion => Some(view.prefs.motion),
             Self::ToggleUpdateChecks => Some(view.prefs.update),
+            // The arrangement the board was last laid out in, so the Layout
+            // list reads as a state and not only as eight verbs.
+            Self::Arrange(arrangement) => {
+                Some(view.doc.board.arrangements.desktop == arrangement.as_str())
+            }
             Self::ConnColour(colour) => Some(view.rope_meta()?.color == colour),
             Self::ConnArrow(dir) => Some(view.rope_meta()?.dir == dir),
             Self::ConnStyleAs(style) => Some(view.rope_meta()?.style == style),
@@ -562,10 +623,11 @@ impl Command {
             Self::Palette => view.open_palette(crate::palette::Mode::Commands, cx),
             Self::Search => view.open_palette(crate::palette::Mode::Search, cx),
             Self::CheckForUpdates => view.update_step(cx),
+            Self::Settings => view.open_settings(cx),
             Self::Connect => view.connect_selection(cx),
             Self::AddFence => view.add_fence(cx),
             Self::Ungroup => view.ungroup(cx),
-            Self::Unstick => view.unstick(cx),
+            Self::ToggleSticky => view.toggle_sticky(cx),
             Self::DontScaleText => view.toggle_text_scaling(cx),
             Self::FitText => view.toggle_fit_text(cx),
             Self::PlayPause => view.play_pause_selection(cx),
@@ -573,6 +635,9 @@ impl Command {
             Self::Align(edge) => view.arrange(Self::Align(edge), cx),
             Self::Distribute(axis) => view.arrange(Self::Distribute(axis), cx),
             Self::Separate => view.arrange(Self::Separate, cx),
+            Self::Arrange(arrangement) => view.set_arrangement(arrangement, cx),
+            Self::Rearrange => view.rearrange(false, cx),
+            Self::RearrangeSelection => view.rearrange(true, cx),
 
             Self::ConnLabel => view.start_labelling(cx),
             Self::ConnDelete => view.delete_rope(cx),
@@ -615,6 +680,11 @@ impl Command {
             Self::Connect => "rope line link join",
             Self::ConnLabel => "rename",
             Self::Separate => "overlap unstack",
+            Self::Rearrange => "layout shuffle relay tidy",
+            Self::RearrangeSelection => "layout shuffle relay",
+            // One word for the family, so typing "layout" surfaces the whole
+            // list; the labels themselves carry spiral, masonry and the rest.
+            Self::Arrange(_) => "layout arrangement",
             Self::ToggleWeb => "ropes lines",
             Self::ToggleGuides => "smart guides rulers",
             // Spelled both ways: the setting is *called* Animation and the
@@ -622,6 +692,8 @@ impl Command {
             Self::ToggleMotion => "reduced motion accessibility animate",
             Self::ToggleUpdateChecks => "updates version automatic",
             Self::CheckForUpdates => "upgrade version new",
+            Self::ToggleSticky => "pin stick unstick attach note",
+            Self::Settings => "preferences options configure grid step gap spacing media fit",
             Self::DontScaleText => "font size zoom",
             Self::Save => "write disk",
             Self::NewBoard => "create empty fresh blank",
@@ -668,10 +740,12 @@ impl Command {
             Self::FitText,
             Self::PlayPause,
             Self::ToggleMute,
-            Self::Unstick,
+            Self::ToggleSticky,
             Self::BringToFront,
             Self::SendToBack,
             Self::Separate,
+            Self::Rearrange,
+            Self::RearrangeSelection,
             Self::SelectAll,
             Self::ClearSelection,
             Self::Undo,
@@ -693,11 +767,13 @@ impl Command {
             Self::ToggleMotion,
             Self::ToggleUpdateChecks,
             Self::CheckForUpdates,
+            Self::Settings,
             Self::ConnLabel,
             Self::ConnDelete,
         ];
-        // The value-carrying six, each mapped over the list the *format*
-        // keeps. See `Edge::ALL` and `model::named_enum`.
+        // The value-carrying commands, each mapped over the list its own
+        // module keeps. See `Edge::ALL` and `model::named_enum`.
+        out.extend(Arrangement::ALL.map(Self::Arrange));
         out.extend(Edge::ALL.map(Self::Align));
         out.extend(Axis::ALL.map(Self::Distribute));
         out.extend(ConnColor::ALL.iter().copied().map(Self::ConnColour));
@@ -809,24 +885,52 @@ const VIEW: [Entry; 13] = [
     Entry::Does(Command::ZoomIn),
     Entry::Does(Command::ZoomOut),
     Entry::Rule,
-    // Last, and behind its own rule. Everything above this is about the board
-    // in front of you; this one is about the application, and it is the only
-    // row on any list that is.
+    // Last, and behind their own rule. Everything above this is about the
+    // board in front of you; these two are about the application, and they
+    // are the only rows on any list that are. The settings *page* replaced
+    // the two-row Settings submenu that used to sit here: the preferences it
+    // held are still one press away, on a surface that can also show the
+    // numbers — grid step, card gap — that a menu row cannot.
     Entry::Does(Command::CheckForUpdates),
-    Entry::More("Settings", &SETTINGS),
+    Entry::Does(Command::Settings),
 ];
 
-/// The two choices that are about the person rather than about the board.
+/// The eight shapes a board can be laid out in, and the one verb over them.
 ///
-/// Its own list rather than four more rows on `VIEW`, because the distinction
-/// is the one `prefs.rs` is built on and a menu that mixed them would erase it:
-/// everything on `VIEW` is a property of the board in front of you and travels
-/// inside the `.mbrd`, and neither of these does.
-const SETTINGS: [Entry; 2] =
-    [Entry::Does(Command::ToggleMotion), Entry::Does(Command::ToggleUpdateChecks)];
+/// Built by hand rather than mapped because `Entry` lists are `const`, but the
+/// test module holds it to `Arrangement::ALL`'s order and length — see
+/// `the_layout_menu_offers_every_arrangement_the_engine_has`.
+const LAYOUTS: [Entry; 8] = [
+    Entry::Does(Command::Arrange(Arrangement::Spiral)),
+    Entry::Does(Command::Arrange(Arrangement::Free)),
+    Entry::Does(Command::Arrange(Arrangement::Grid)),
+    Entry::Does(Command::Arrange(Arrangement::Masonry)),
+    Entry::Does(Command::Arrange(Arrangement::Type)),
+    Entry::Does(Command::Arrange(Arrangement::Tag)),
+    Entry::Does(Command::Arrange(Arrangement::Date)),
+    Entry::Does(Command::Arrange(Arrangement::Scatter)),
+];
+
+/// The same choices with the verb underneath: the one-row form for the lists
+/// that are already long. The board menu carries [`LAYOUTS`] and `Rearrange`
+/// as two rows instead, because a submenu of pure choices names the current
+/// one on its closed row — see [`Entry::hint`] — and the board menu is the
+/// one with the room to spend on that readout.
+const LAYOUT_MENU: [Entry; 10] = [
+    Entry::Does(Command::Arrange(Arrangement::Spiral)),
+    Entry::Does(Command::Arrange(Arrangement::Free)),
+    Entry::Does(Command::Arrange(Arrangement::Grid)),
+    Entry::Does(Command::Arrange(Arrangement::Masonry)),
+    Entry::Does(Command::Arrange(Arrangement::Type)),
+    Entry::Does(Command::Arrange(Arrangement::Tag)),
+    Entry::Does(Command::Arrange(Arrangement::Date)),
+    Entry::Does(Command::Arrange(Arrangement::Scatter)),
+    Entry::Rule,
+    Entry::Does(Command::Rearrange),
+];
 
 /// Everything about where several cards are in relation to each other.
-const ARRANGE: [Entry; 10] = [
+const ARRANGE: [Entry; 12] = [
     Entry::Does(Command::Align(Edge::Left)),
     Entry::Does(Command::Align(Edge::CentreX)),
     Entry::Does(Command::Align(Edge::Right)),
@@ -837,6 +941,8 @@ const ARRANGE: [Entry; 10] = [
     Entry::Does(Command::Distribute(Axis::Horizontal)),
     Entry::Does(Command::Distribute(Axis::Vertical)),
     Entry::Does(Command::Separate),
+    Entry::Rule,
+    Entry::Does(Command::RearrangeSelection),
 ];
 
 // The four axes a connection has. Every one of them is a single choice, so
@@ -879,7 +985,7 @@ const WEIGHTS: [Entry; 3] = [
 /// Reaching it *lets go* of whatever was selected — see `on_mouse_down` —
 /// because a menu about the board over a board with three cards selected would
 /// be a menu whose every entry meant something other than what it said.
-pub const BOARD_MENU: [Entry; 9] = [
+pub const BOARD_MENU: [Entry; 11] = [
     Entry::More("Add", &ADD),
     // With nothing in hand this fences off an empty space, which is the way
     // round somebody who wants to lay a board out before filling it works.
@@ -887,6 +993,14 @@ pub const BOARD_MENU: [Entry; 9] = [
     Entry::Does(Command::Paste),
     Entry::Does(Command::SelectAll),
     Entry::Rule,
+    // The whole-board layouts live on the board's own menu because they are
+    // about the board, not about anything in hand — and the submenu, holding
+    // only choices, names the arrangement the board is in on its closed row,
+    // the way the rope menu names its colour. `Rearrange` sits outside the
+    // submenu for exactly that reason: one verb inside the list would cost
+    // the readout.
+    Entry::More("Layout", &LAYOUTS),
+    Entry::Does(Command::Rearrange),
     Entry::Does(Command::Undo),
     Entry::Does(Command::Redo),
     Entry::Rule,
@@ -917,12 +1031,22 @@ pub const CARD_MENU: [Entry; 27] = [
     // above them are dimmed off a card that is not a note.
     Entry::Does(Command::PlayPause),
     Entry::Does(Command::ToggleMute),
-    Entry::Does(Command::Unstick),
+    Entry::Does(Command::ToggleSticky),
     Entry::Does(Command::BringToFront),
     Entry::Does(Command::SendToBack),
     Entry::Rule,
     Entry::Does(Command::SelectAll),
-    Entry::Does(Command::ClearSelection),
+    // "Select none" used to sit here and paid for the Layout row below: the
+    // list has to fit a 700-tall window, Escape does the same thing from
+    // anywhere, and with exactly one card in hand it was the least useful row
+    // on the longest list. It keeps its place on the many-cards menu, where
+    // letting go of a marquee's worth is a real errand.
+    //
+    // The board-wide layouts, below the card's own rows for the reason the
+    // board menu carries them at all: they are about the board the card is
+    // on, and the invariant the tests hold is that bare paper offers nothing
+    // a card does not. One row here where the board menu spends two.
+    Entry::More("Layout", &LAYOUT_MENU),
     Entry::Rule,
     Entry::Does(Command::Undo),
     Entry::Does(Command::Redo),
@@ -1053,10 +1177,11 @@ mod tests {
                 | Command::Palette
                 | Command::Search
                 | Command::CheckForUpdates
+                | Command::Settings
                 | Command::Connect
                 | Command::AddFence
                 | Command::Ungroup
-                | Command::Unstick
+                | Command::ToggleSticky
                 | Command::DontScaleText
                 | Command::FitText
                 | Command::PlayPause
@@ -1064,6 +1189,9 @@ mod tests {
                 | Command::Align(_)
                 | Command::Distribute(_)
                 | Command::Separate
+                | Command::Arrange(_)
+                | Command::Rearrange
+                | Command::RearrangeSelection
                 | Command::ConnLabel
                 | Command::ConnDelete
                 | Command::ConnColour(_)
@@ -1074,13 +1202,26 @@ mod tests {
                 }
             }
         }
-        // 43 nullary, plus the six that carry values mapped over the format's
-        // own lists: 6 edges, 2 axes, 5 colours, 4 arrows, 3 styles, 3 weights.
+        // 46 nullary, plus the seven that carry values mapped over their own
+        // modules' lists: 8 arrangements, 6 edges, 2 axes, 5 colours, 4
+        // arrows, 3 styles, 3 weights.
         assert_eq!(
             Command::all().len(),
-            43 + 6 + 2 + 5 + 4 + 3 + 3,
+            46 + 8 + 6 + 2 + 5 + 4 + 3 + 3,
             "a command was added to the enum and not to Command::all",
         );
+    }
+
+    /// The Layout submenu is `Arrangement::ALL`, row for row.
+    ///
+    /// The list is written out because `Entry` tables are `const`; this is
+    /// what keeps it from quietly missing a layout the engine gains.
+    #[test]
+    fn the_layout_menu_offers_every_arrangement_the_engine_has() {
+        assert_eq!(LAYOUTS.len(), Arrangement::ALL.len());
+        for (entry, arrangement) in LAYOUTS.iter().zip(Arrangement::ALL) {
+            assert_eq!(*entry, Entry::Does(Command::Arrange(arrangement)));
+        }
     }
 
     /// Nothing is offered twice by the palette.

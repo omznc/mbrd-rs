@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mbrd_core::align::Axis;
+use mbrd_core::arrange::{self as arranging, Arrangement};
 use mbrd_core::geometry::{self, point, Point as WorldPoint, Rect};
 use mbrd_core::guides::{self, Line, Snap};
 use mbrd_core::index::Grid;
@@ -278,6 +279,18 @@ const OVERLAY_IN: f32 = 0.12;
 /// beat longer to read as *going away* rather than as a flicker.
 const OVERLAY_OUT: f32 = 0.16;
 
+/// How close a presence spring has to be to count as arrived — under half a
+/// percent of opacity, which is beneath what a monitor can show.
+const PRESENCE_REST: f32 = 0.004;
+
+/// A switch's knob crossing its track, and a segmented row's wash crossing
+/// its segments.
+///
+/// Critically damped and quicker than [`Spring::SURFACE`]: a control this
+/// small crosses fourteen pixels, and the motion is there to say *which way
+/// it went*, not to be watched.
+const KNOB: Spring = Spring::new(1.0, 0.15);
+
 /// Roughly how wide one character is, as a fraction of the font size.
 ///
 /// Used to break a label into lines without shaping it first. It is an estimate
@@ -319,14 +332,14 @@ fn dropped_at(home: WorldPoint, dx: f32, dy: f32, to_grid: Option<f32>) -> World
     }
 }
 
-/// Move a presence value — see `overlay_presence` — a frame nearer 0 or 1,
-/// and say whether it moved.
+/// Move a presence value a frame nearer 0 or 1, and say whether it moved.
 ///
 /// Linear rather than sprung, on the same reasoning [`BoardView::fade_anchors`]
 /// gives for the anchors: this is a light coming up, not a thing being moved,
 /// and a spring on an opacity buys overshoot nobody can see and a settle time
-/// everybody can. Shared by the overlay and the loading panel, which fade in
-/// and out the same way for the same reason.
+/// everybody can. The loading panel is the one thing left on it — the
+/// overlay used to share it, until the overlay grew a slide, and a thing
+/// that moves wants what a spring has: see `overlay_presence`.
 fn step_presence(presence: &mut f32, leaving: bool, dt: f32) -> bool {
     let target = if leaving { 0.0 } else { 1.0 };
     if *presence == target {
@@ -799,6 +812,24 @@ enum Updating {
     Staged(update::install::Staged),
 }
 
+/// What the title bar should say about the update, if anything.
+///
+/// A projection of [`Updating`] rather than the thing itself, so the bar can
+/// read the state without the state machine leaking out of this module: the
+/// bar needs three sentences and a fraction, not artifacts and paths. `None`
+/// covers both `Idle` and `Looking` — a check that is merely running is not
+/// worth a badge, because most checks end in nothing and a flicker of chrome
+/// on every launch would teach everybody to ignore the spot.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpdateBadge {
+    /// A newer version exists; clicking downloads it.
+    Available { version: String },
+    /// It is on its way down. `fraction` is `0.0..=1.0` of the bytes.
+    Downloading { fraction: f32 },
+    /// Unpacked and waiting; clicking saves the board and restarts into it.
+    Ready { version: String },
+}
+
 /// A drop that is still arriving.
 ///
 /// **The reason this exists is that a folder is not one file.** Reading, hashing
@@ -971,6 +1002,10 @@ enum Overlay {
     Menu(Menu),
     Switcher(Switcher),
     Palette(Palette),
+    /// The settings page. The payload is only which section the sidebar has
+    /// open — everything the rows show is read off the view each frame. See
+    /// `settings.rs`.
+    Settings(crate::settings::Page),
 }
 
 pub struct BoardView {
@@ -1155,13 +1190,20 @@ pub struct BoardView {
     /// How far the overlay has faded in, from `0.0` (not visible) to `1.0`
     /// (settled). See `advance_overlay`.
     ///
-    /// One number for whichever surface is open rather than one per surface,
+    /// One spring for whichever surface is open rather than one per surface,
     /// because at most one is ever animating — [`Overlay`] again — and a
-    /// number per surface would be two of them permanently at rest doing
-    /// nothing. Not reset to `0.0` when the overlay changes: opening the
-    /// switcher while the palette is still fading in retargets this rather
-    /// than restarting it, which is what keeps the handoff from jumping.
-    pub overlay_presence: f32,
+    /// spring per surface would be two of them permanently at rest doing
+    /// nothing. Not reset when the overlay changes: opening the switcher
+    /// while the palette is still fading in retargets this rather than
+    /// restarting it, which is what keeps the handoff from jumping.
+    ///
+    /// A [`Sprung`] rather than the plain ramp it used to be, because these
+    /// surfaces slide as well as fade and a slide can be caught mid-flight:
+    /// Escape during the arrival keeps the value *and the velocity*, so the
+    /// panel bends back out along the path it came in on instead of
+    /// reversing with a kink. Renders read [`Sprung::value`], never the
+    /// target — the value is where the surface *is*.
+    pub overlay_presence: Sprung,
     /// Whether the overlay is on its way out.
     ///
     /// Closing does not clear `overlay` — it sets this instead, and
@@ -1172,6 +1214,27 @@ pub struct BoardView {
     /// and a key meant for the board underneath does not vanish into a panel
     /// that is on its way out anyway.
     overlay_leaving: bool,
+    /// The little controls on the settings page — a switch's knob, a
+    /// segmented row's lit choice — each a spring from the state it showed
+    /// to the state it now has, keyed by the control's own id.
+    ///
+    /// Planted by the press, not by the render: `control_at` answers the
+    /// resting state until a press has given the control somewhere to go,
+    /// which is what keeps a page opened onto a switch that is already on
+    /// from showing it *arriving* on. Bounded by the number of controls the
+    /// page has, so it is never cleared.
+    settings_motion: HashMap<String, Sprung>,
+    /// Whether the previous frame asked for this one.
+    ///
+    /// What tells [`advance`](Self::advance) the difference between a slow
+    /// frame and a fresh start. The window redraws for plenty of reasons that
+    /// are not motion — a hover, a key press, a status line — and while the
+    /// board is still, no frames are requested at all, so the gap since the
+    /// last one is *idle* time. Charging that gap to the first thing that
+    /// starts moving lands it at its target inside one invisible frame,
+    /// which is how every animation that began from a quiet board managed to
+    /// be one nobody had ever actually seen.
+    animating: bool,
     /// Which board switcher session is current.
     ///
     /// Bumped every time one opens, so that the background scan for boards
@@ -1337,7 +1400,9 @@ impl BoardView {
             fences_at: grid_at,
             images: Images::default(),
             overlay: Overlay::None,
-            overlay_presence: 0.0,
+            overlay_presence: Sprung::at(0.0),
+            settings_motion: HashMap::new(),
+            animating: false,
             overlay_leaving: false,
             switches: 0,
             taps: Taps::default(),
@@ -1540,6 +1605,22 @@ impl BoardView {
     /// than the one before it, and the last of them closes the window. None of
     /// that should happen because somebody pressed a key once to see what it
     /// did.
+    /// What the title bar should show about the update. See [`UpdateBadge`].
+    pub fn update_badge(&self) -> Option<UpdateBadge> {
+        match &self.updating {
+            Updating::Idle | Updating::Looking => None,
+            Updating::Offered { version, .. } => {
+                Some(UpdateBadge::Available { version: version.to_string() })
+            }
+            Updating::Fetching { done, total, .. } => Some(UpdateBadge::Downloading {
+                fraction: (*done as f32 / (*total).max(1) as f32).clamp(0.0, 1.0),
+            }),
+            Updating::Staged(staged) => {
+                Some(UpdateBadge::Ready { version: staged.version.to_string() })
+            }
+        }
+    }
+
     pub fn update_step(&mut self, cx: &mut Context<Self>) {
         match std::mem::take(&mut self.updating) {
             Updating::Idle => self.look_for_update(true, cx),
@@ -1618,7 +1699,10 @@ impl BoardView {
             // Worth saying whether or not anybody asked — this is the good
             // news the check exists for.
             Ok(update::Found::Ready { version, artifact, target }) => {
-                self.tell(format!("mbrd {version} is out — Ctrl U to download it"));
+                // The badge in the top bar is the durable half of this
+                // announcement — see `update_badge` — so the line here only
+                // has to break the news, not carry the instructions.
+                self.tell(format!("mbrd {version} is out — see the top bar"));
                 self.updating = Updating::Offered { version, artifact, target };
             }
             // Also worth saying unasked, and it is the end of the road: this
@@ -1718,7 +1802,7 @@ impl BoardView {
             Ok(staged) => {
                 let version = staged.version;
                 self.updating = Updating::Staged(staged);
-                self.tell(format!("mbrd {version} is ready — Ctrl U to install and restart"));
+                self.tell(format!("mbrd {version} is ready — restart from the top bar to install"));
             }
             Err(err) => {
                 self.updating = Updating::Idle;
@@ -1729,14 +1813,17 @@ impl BoardView {
 
     /// Move it into place and restart into it.
     fn apply_update(&mut self, staged: update::install::Staged, cx: &mut Context<Self>) {
-        // The one refusal that is about this board rather than about the
-        // update. Restarting discards whatever is in memory, and an updater
-        // that quietly threw away an afternoon would be the worst bug this app
-        // could have. The staged copy is kept, so saving and pressing again
-        // costs nothing.
-        if self.unsaved() {
+        // The board goes to disk before the restart discards what is in
+        // memory — the same write the close button does, for the same reason.
+        // It used to *refuse* here and send somebody off to save first, which
+        // was one refusal more than the moment needs: pressing "restart to
+        // update" already says yes to a restart, and the save is this app's
+        // job, not homework. The refusal survives only where the write
+        // fails — the staged copy is kept, so fixing the disk and pressing
+        // again costs nothing.
+        if !self.flush(cx) {
             self.updating = Updating::Staged(staged);
-            self.warn("save the board first — Ctrl S, then Ctrl U".into());
+            self.warn("could not save the board — the update is still ready, try again".into());
             return;
         }
 
@@ -2721,6 +2808,84 @@ impl BoardView {
         cx.notify();
     }
 
+    /// Set the grid's pitch.
+    ///
+    /// If snapping is on, the board follows the number: a board that says it
+    /// is snapped must be snapped to the step it now shows, so the cards are
+    /// taken onto the new lattice as a second, separately undoable step —
+    /// the same shape `toggle_setting` gives `ToggleSnap`, and for the same
+    /// reason: somebody who wants the shuffle back should not lose the
+    /// number with it.
+    pub fn set_grid_step(&mut self, step: f32, cx: &mut Context<Self>) {
+        let step = step.clamp(1.0, 4096.0);
+        if self.doc.board.settings.desktop.grid_step == step {
+            return;
+        }
+        self.doc.board.edit("Grid step", |board| {
+            board.settings.desktop.grid_step = step;
+        });
+        if self.doc.board.settings.desktop.snap {
+            let before: HashMap<String, (f32, f32)> = self
+                .doc
+                .board
+                .items
+                .iter()
+                .map(|item| (item.id.clone(), (item.x, item.y)))
+                .collect();
+            let moved = self.doc.board.edit("Snap to grid", |board| {
+                mbrd_core::snap::engage(board, mbrd_core::LayoutMode::Desktop, step)
+            });
+            if moved {
+                let after: Vec<(String, f32, f32)> = self
+                    .doc
+                    .board
+                    .items
+                    .iter()
+                    .map(|item| (item.id.clone(), item.x, item.y))
+                    .collect();
+                for (id, x, y) in after {
+                    if let Some(&(ox, oy)) = before.get(&id) {
+                        self.present_move(&id, ox - x, oy - y);
+                    }
+                }
+            }
+        }
+        self.say(format!("grid step {step}"));
+        cx.notify();
+    }
+
+    /// Set the gap the arrangement engine leaves between cards.
+    ///
+    /// Nothing moves when it changes — the number is read at the next
+    /// `Rearrange`, which is also where its effect can actually be seen.
+    pub fn set_spacing(&mut self, gap: f32, cx: &mut Context<Self>) {
+        let gap = gap.clamp(0.0, 512.0);
+        if self.doc.board.settings.desktop.spacing == gap {
+            return;
+        }
+        self.doc.board.edit("Card gap", |board| {
+            board.settings.desktop.spacing = gap;
+        });
+        self.say(format!("card gap {gap}"));
+        cx.notify();
+    }
+
+    /// Set how photos and videos sit in their cards, board-wide.
+    ///
+    /// `contain` or `cover`. A card can override it with `meta.fit`, and
+    /// those overrides are deliberately left alone: they were each chosen
+    /// against a particular picture, which changing the default is not a
+    /// reason to forget.
+    pub fn set_media_fit(&mut self, fit: &str, cx: &mut Context<Self>) {
+        if self.doc.board.media_fit == fit {
+            return;
+        }
+        let chosen = fit.to_string();
+        self.doc.board.edit("Media fit", move |board| board.media_fit = chosen);
+        self.say(format!("media {fit}"));
+        cx.notify();
+    }
+
     /// Drop a colour on the board.
     ///
     /// Grey, because there is no colour picker and inventing one would be a
@@ -2944,45 +3109,6 @@ impl BoardView {
     /// which board named them — and two boards in a project usually share
     /// photographs. Anything the new board does not want ages out of the cache
     /// on its own.
-    /// Clear the unstick on any note that was just dropped onto a card.
-    ///
-    /// `meta.loose` says "the author took this note off its host". Putting it
-    /// down on a card is the author saying otherwise, and leaving the flag
-    /// behind would make a note that is plainly lying on a photograph refuse
-    /// to travel with it, for a reason nothing on screen could explain.
-    fn restick(&mut self, moved: &[Grabbed], open: &Pending) {
-        let landed: Vec<String> = {
-            let items = &self.doc.board.items;
-            let pins = Pins::measure_ignoring_loose(items);
-            moved
-                .iter()
-                .filter(|held| {
-                    // By the index taken at the press — see [`Held`] — with
-                    // the scan as the fallback, same as the drag itself.
-                    let item = match items.get(held.index) {
-                        Some(item) if item.id == held.id => Some(item),
-                        _ => self.doc.board.item(&held.id),
-                    };
-                    item.is_some_and(stick::is_loose) && pins.host_of(&held.id).is_some()
-                })
-                .map(|held| held.id.clone())
-                .collect()
-        };
-        if landed.is_empty() {
-            return;
-        }
-        // Through the drag's own open step rather than a new one: the note
-        // landing where it landed *is* the move, and two entries in the ledger
-        // for one gesture would take two presses of undo to put back.
-        self.doc.board.during(open, |board| {
-            for id in &landed {
-                if let Some(item) = board.item_mut(id) {
-                    item.meta.remove("loose");
-                }
-            }
-        });
-    }
-
     /// Everything a drag on these cards should actually take hold of.
     ///
     /// Two rules, and both of them are what somebody would expect rather than
@@ -3329,6 +3455,275 @@ impl BoardView {
         moving
     }
 
+    /// Remember the picked arrangement and lay the whole board out in it.
+    ///
+    /// Picking a layout *applies* it rather than merely recording a
+    /// preference, because the menu row is a verb to the person pressing it:
+    /// "Masonry" means "make it masonry", not "next time somebody rearranges,
+    /// masonry". The stored id is what [`Command::ticked`] reads back.
+    pub fn set_arrangement(&mut self, name: Arrangement, cx: &mut Context<Self>) {
+        self.lay_out(Some(name), false, cx);
+    }
+
+    /// Lay the board — or just the selection — out again, with a fresh seed.
+    pub fn rearrange(&mut self, only_selection: bool, cx: &mut Context<Self>) {
+        self.lay_out(None, only_selection, cx);
+    }
+
+    /// The whole-board relayout: ask `core::arrange` for one position per
+    /// card and write the answer through the door as one step.
+    ///
+    /// The same shape as [`Self::arrange`] one floor up, with three rules
+    /// carried over from the original's `rearrange()` because each guards a
+    /// grouping somebody made by hand:
+    ///
+    /// - **A stuck note is not laid out.** It rides its host to the host's
+    ///   new slot; a note whose host is not in the set rides a host that does
+    ///   not move, and so does not move either.
+    /// - **A fenced card is not laid out either**, when its fence is in the
+    ///   set: the fence takes a slot at its own size and its contents keep
+    ///   their places inside it. Laid out flat, an arrangement would deal
+    ///   every fence a slot as though it were a card and scatter its cards to
+    ///   slots of their own — and since membership is measured, one press of
+    ///   Rearrange would take every grouping on the board apart.
+    /// - **Two things vary, and neither is enough alone.** The shuffle
+    ///   changes which card lands in which slot — without it a layout is a
+    ///   pure function of the list and feeding it the same board twice puts
+    ///   everything back where it was. The seed changes where the slots
+    ///   *are* — without it the board comes back in the identical shape with
+    ///   the cards swapped, which from any distance is the same picture.
+    fn lay_out(&mut self, pick: Option<Arrangement>, only_selection: bool, cx: &mut Context<Self>) {
+        let name = pick
+            .or_else(|| Arrangement::parse(&self.doc.board.arrangements.desktop))
+            .unwrap_or(Arrangement::Grid);
+        let items = &self.doc.board.items;
+        let pins = Pins::measure(items);
+        let fences = Fences::measure(items);
+
+        // Furniture is left out and left alone: the title card and the hints
+        // are exactly what a relayout is not about. It is also kept *off* —
+        // the title card goes in as an obstacle, so no slot is dealt where it
+        // stands. That is the original's anchoring reached without a lock:
+        // its title arrives anchored, and this build has no anchors yet.
+        let chosen: Vec<&Item> = items
+            .iter()
+            .filter(|i| !matches!(i.kind, ItemType::Title | ItemType::Ghost))
+            .filter(|i| !only_selection || self.selection.contains(&i.id))
+            .collect();
+        if chosen.is_empty() {
+            self.tell("nothing to lay out".into());
+            cx.notify();
+            return;
+        }
+        let in_set: HashSet<&str> = chosen.iter().map(|i| i.id.as_str()).collect();
+        let is_rider = |it: &Item| pins.host_of(&it.id).is_some();
+        let carried: Vec<&Item> = chosen
+            .iter()
+            .copied()
+            .filter(|i| !is_rider(i) && fences.owner_of(&i.id).is_some_and(|f| in_set.contains(f)))
+            .collect();
+        let carried_ids: HashSet<&str> = carried.iter().map(|i| i.id.as_str()).collect();
+        let free: Vec<&Item> = chosen
+            .iter()
+            .copied()
+            .filter(|i| !is_rider(i) && !carried_ids.contains(i.id.as_str()))
+            .collect();
+        if free.is_empty() {
+            // The whole set was followers. There is no arrangement of riders
+            // alone; they stay on their hosts.
+            self.tell("nothing to lay out".into());
+            cx.notify();
+            return;
+        }
+
+        let settings = &self.doc.board.settings.desktop;
+        let step = if settings.grid_step > 0.0 { settings.grid_step } else { 64.0 };
+        let snapped = settings.snap;
+        let spacing = settings.spacing;
+        // Time is as fresh as a seed needs to be — this is "look different",
+        // not cryptography — and the wrap to u32 keeps the whole clock.
+        let seed = mbrd_core::naming::now_millis() as u32;
+
+        // Which card lands in which slot. The layouts read the deal through
+        // the same PRNG family they vary their slots by, one draw apart.
+        let mut order: Vec<usize> = (0..free.len()).collect();
+        let mut rng = arranging::Mulberry::new(seed ^ 0x9E37_79B9);
+        arranging::shuffle(&mut order, &mut rng);
+
+        // On a snapped board a rearrangement is a *re-lay*, sizes included:
+        // placing cards on the lattice and leaving them at 320x240 is the
+        // thing snapping is for and does not do. Sized before the layout runs
+        // rather than after, because the arrangements read each card's `w`
+        // and `h` to decide how much room its slot needs. A fence keeps the
+        // size it was drawn at — rounding it to cells could pull an edge in
+        // past a card whose centre sat within half a cell of it, dropping the
+        // card out of the fence on a gesture that is not about membership.
+        let laid: Vec<Item> = order
+            .iter()
+            .map(|&i| {
+                let mut c = free[i].clone();
+                if snapped && c.kind != ItemType::Fence {
+                    c.w = geometry::clamp_size(geometry::snap(c.w, step));
+                    c.h = geometry::clamp_size(geometry::snap(c.h, step));
+                }
+                c
+            })
+            .collect();
+
+        // The whole board rebuilds about the origin; a selection rebuilds
+        // where it already is.
+        let center = if only_selection {
+            geometry::union(free.iter().copied())
+                .map(|r| r.centre())
+                .unwrap_or_else(|| point(0.0, 0.0))
+        } else {
+            point(0.0, 0.0)
+        };
+        let obstacles: Vec<Rect> =
+            items.iter().filter(|i| i.kind == ItemType::Title).map(Rect::of_item).collect();
+
+        let refs: Vec<&Item> = laid.iter().collect();
+        let spots = arranging::arrange(
+            &refs,
+            name,
+            &arranging::Opts {
+                center,
+                spacing,
+                // Snapping reserves whole cells so the per-card snap below
+                // cannot round two tight cards into an overlap — see
+                // `arrange::to_cells`.
+                cell_step: if snapped { step } else { 0.0 },
+                seed: Some(seed),
+                obstacles,
+            },
+        );
+
+        // Everything that moves, as one owned plan, so nothing borrows the
+        // board across the edit: id, where it lands, and the size it was
+        // laid out at where the lattice resized it.
+        let before: HashMap<String, (f32, f32)> =
+            chosen.iter().map(|i| (i.id.clone(), (i.x, i.y))).collect();
+        let mut plan: HashMap<String, (f32, f32)> = HashMap::new();
+        let mut resized: Vec<(String, f32, f32)> = Vec::new();
+        for (slot, &item_index) in order.iter().enumerate() {
+            let mut p = spots[slot];
+            if snapped {
+                // The spots came back clear even for centres each up to half
+                // a step from the lattice — that is what the whole-cell
+                // reservation above bought.
+                p.x = geometry::snap(p.x, step);
+                p.y = geometry::snap(p.y, step);
+            }
+            let it = free[item_index];
+            plan.insert(it.id.clone(), (p.x, p.y));
+            if snapped && it.kind != ItemType::Fence {
+                resized.push((it.id.clone(), laid[slot].w, laid[slot].h));
+            }
+        }
+
+        // Fences are at their new slots; carry their contents by the same
+        // translation, which is what keeps a region a region. In passes,
+        // because a fence inside a fence is carried too, and can only carry
+        // its own contents once it has been carried itself.
+        let mut pending: Vec<&Item> = carried.clone();
+        while !pending.is_empty() {
+            let mut next: Vec<&Item> = Vec::new();
+            let mut grew = false;
+            for it in pending {
+                let fence_id = fences.owner_of(&it.id).unwrap_or("");
+                let (Some(&(fx1, fy1)), Some(&(fx0, fy0))) =
+                    (plan.get(fence_id), before.get(fence_id))
+                else {
+                    next.push(it);
+                    continue;
+                };
+                plan.insert(it.id.clone(), (it.x + fx1 - fx0, it.y + fy1 - fy0));
+                grew = true;
+            }
+            if !grew {
+                // A fence that never resolved — its own fence left the plan
+                // somehow. Leave the stragglers where they stand rather than
+                // loop forever; a card that does not move is a smaller wrong
+                // than a hang.
+                break;
+            }
+            pending = next;
+        }
+
+        // Hosts are at their new slots; carry each rider by its host's
+        // translation, keeping the offset the author set. In passes, so a
+        // note stuck to a note follows only once its own host has moved. A
+        // rider whose host is not moving does not move either.
+        let riders: Vec<&Item> = chosen.iter().copied().filter(|i| is_rider(i)).collect();
+        let mut pending: Vec<&Item> = riders;
+        loop {
+            let mut next: Vec<&Item> = Vec::new();
+            let mut grew = false;
+            for note in pending {
+                let Some(host) = pins.host_of(&note.id) else { continue };
+                let still_moving = plan.contains_key(host);
+                let host_is_pending_rider =
+                    !still_moving && pins.host_of(host).is_some() && in_set.contains(host);
+                if host_is_pending_rider {
+                    next.push(note);
+                    continue;
+                }
+                if let (Some(&(hx1, hy1)), Some(&(hx0, hy0))) = (plan.get(host), before.get(host)) {
+                    plan.insert(note.id.clone(), (note.x + hx1 - hx0, note.y + hy1 - hy0));
+                    grew = true;
+                }
+            }
+            if !grew || next.is_empty() {
+                break;
+            }
+            pending = next;
+        }
+
+        let n = plan.len();
+        drop(chosen);
+        self.doc.board.edit("Rearrange", |board| {
+            if let Some(a) = pick {
+                board.arrangements.desktop = a.as_str().into();
+            }
+            for (id, w, h) in &resized {
+                if let Some(item) = board.item_mut(id) {
+                    item.w = *w;
+                    item.h = *h;
+                }
+            }
+            for (id, (x, y)) in &plan {
+                if let Some(item) = board.item_mut(id) {
+                    item.x = *x;
+                    item.y = *y;
+                }
+            }
+            // A card the engine just placed has been placed on purpose: its
+            // memory of where it sat before the lattice took it is describing
+            // a board that no longer exists, and releasing snap later must
+            // not scatter the fresh layout back to the old one.
+            if snapped {
+                for g in board.layouts.desktop.iter_mut() {
+                    if plan.contains_key(&g.id) {
+                        g.presnap = None;
+                    }
+                }
+            }
+        });
+        for (id, (x, y)) in &plan {
+            if let Some(&(ox, oy)) = before.get(id) {
+                self.present_move(id, ox - x, oy - y);
+            }
+        }
+        if !only_selection {
+            self.fit_all(cx);
+        }
+        self.say(match n {
+            1 => "rearranged 1 card".to_string(),
+            n => format!("rearranged {n} cards"),
+        });
+        cx.notify();
+    }
+
     /// Put a fence around what is selected.
     ///
     /// Nothing is recorded about which cards are in it, because nothing needs
@@ -3370,38 +3765,69 @@ impl BoardView {
         cx.notify();
     }
 
-    /// Whether anything selected is a note that could be taken off its host.
-    pub fn can_unstick(&self) -> bool {
-        let pins = Pins::measure(&self.doc.board.items);
-        self.selection.iter().any(|id| pins.host_of(id).is_some())
+    /// The notes in the selection, which are what [`Self::toggle_sticky`]
+    /// works on.
+    fn selected_notes(&self) -> Vec<String> {
+        self.selection
+            .iter()
+            .filter(|id| self.doc.board.item(id).is_some_and(|item| item.kind == ItemType::Note))
+            .cloned()
+            .collect()
     }
 
-    /// Take a sticky note off the card it is pinned to.
+    /// Whether the sticky toggle would reach anything.
+    pub fn can_toggle_sticky(&self) -> bool {
+        !self.selected_notes().is_empty()
+    }
+
+    /// What the sticky row's tick should show: whether *every* selected note
+    /// is sticky. `None` when no note is selected, so the row does not tick
+    /// over a selection it would not act on.
+    pub fn sticky_state(&self) -> Option<bool> {
+        let notes = self.selected_notes();
+        if notes.is_empty() {
+            return None;
+        }
+        Some(notes.iter().all(|id| self.doc.board.item(id).is_some_and(stick::is_sticky)))
+    }
+
+    /// Flip whether the selected notes pin to what they lie on.
     ///
-    /// The one thing about stickiness that is a decision rather than a
-    /// measurement, and therefore the one thing stored. It has to be: the usual
-    /// reason to unstick a note is to nudge it, so the note is normally still
-    /// lying on the card it was unstuck from and no geometry could tell you
-    /// otherwise.
-    pub fn unstick(&mut self, cx: &mut Context<Self>) {
-        let pins = Pins::measure(&self.doc.board.items);
-        let loose: Vec<String> =
-            self.selection.iter().filter(|id| pins.host_of(id).is_some()).cloned().collect();
-        if loose.is_empty() {
+    /// Off by default and stored only when the author asks — see
+    /// `core::stick` for why stickiness is a decision rather than a
+    /// measurement. A mixed selection goes to sticky, the way every
+    /// all-or-nothing toggle resolves ambiguity: the second press then means
+    /// the other thing for all of them.
+    ///
+    /// Turning it off also drops the `stuckTo` record: a record is a pin, and
+    /// the note no longer has one. Turning it *on* writes nothing but the
+    /// flag — where the note is lying is measured, as it always is.
+    pub fn toggle_sticky(&mut self, cx: &mut Context<Self>) {
+        let notes = self.selected_notes();
+        if notes.is_empty() {
             return;
         }
-        let n = loose.len();
-        self.doc.board.edit("Unstick", |board| {
-            for id in &loose {
+        let on = !self.sticky_state().unwrap_or(false);
+        let n = notes.len();
+        self.doc.board.edit(if on { "Sticky" } else { "Unstick" }, |board| {
+            for id in &notes {
                 if let Some(item) = board.item_mut(id) {
-                    item.meta.insert("loose".into(), serde_json::Value::Bool(true));
-                    item.meta.remove("stuckTo");
+                    if on {
+                        item.meta.insert("sticky".into(), serde_json::Value::Bool(true));
+                    } else {
+                        item.meta.remove("sticky");
+                        item.meta.remove("stuckTo");
+                    }
+                    // The old opt-out key has nothing left to say either way.
+                    item.meta.remove("loose");
                 }
             }
         });
-        self.say(match n {
-            1 => "unstuck".into(),
-            n => format!("unstuck {n}"),
+        self.say(match (on, n) {
+            (true, 1) => "sticky — it now travels with what it lies on".into(),
+            (true, n) => format!("{n} sticky"),
+            (false, 1) => "unstuck".into(),
+            (false, n) => format!("unstuck {n}"),
         });
         cx.notify();
     }
@@ -4353,6 +4779,67 @@ impl BoardView {
         if matches!(self.overlay, Overlay::Palette(_)) {
             self.close_overlay();
             self.taps.forget();
+        }
+    }
+
+    /// Open the settings page — or, from the titlebar button while it is
+    /// already up, put it away: a button that can only open is a button that
+    /// stops working the moment it has worked. See `settings.rs` for what is
+    /// on the page.
+    pub fn open_settings(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.overlay, Overlay::Settings(_)) && !self.overlay_leaving {
+            self.close_settings();
+            cx.notify();
+            return;
+        }
+        self.taps.forget();
+        self.open_overlay(Overlay::Settings(crate::settings::Page::open()));
+        cx.notify();
+    }
+
+    /// Show another of the page's sections. A no-op when the page is not up,
+    /// which cannot happen from anywhere this is called.
+    pub fn show_settings_section(
+        &mut self,
+        section: crate::settings::Section,
+        cx: &mut Context<Self>,
+    ) {
+        if let Overlay::Settings(page) = &mut self.overlay {
+            page.section = section;
+            cx.notify();
+        }
+    }
+
+    /// Where a settings control is drawn, between the states it can be in.
+    ///
+    /// `resting` is the answer until the control has been pressed — the
+    /// state itself, with nothing in flight. **This is the number to draw**,
+    /// same rule as every other spring.
+    pub fn control_at(&self, id: &str, resting: f32) -> f32 {
+        self.settings_motion.get(id).map_or(resting, |s| s.value())
+    }
+
+    /// Start a settings control moving: plant it where it *was* if this is
+    /// its first press, and aim it where it now is. A press mid-flight keeps
+    /// the value and the velocity it already has — the knob bends back out
+    /// of its own motion rather than jumping to an end and starting over.
+    pub fn move_control(&mut self, id: &str, from: f32, to: f32) {
+        let spring = self.settings_motion.entry(id.to_string()).or_insert_with(|| Sprung::at(from));
+        spring.retarget(to);
+    }
+
+    /// One frame of every settings control that is still travelling.
+    fn advance_controls(&mut self, dt: f32) -> bool {
+        let mut moving = false;
+        for spring in self.settings_motion.values_mut() {
+            moving |= spring.step(KNOB, dt, 0.01);
+        }
+        moving
+    }
+
+    pub fn close_settings(&mut self) {
+        if matches!(self.overlay, Overlay::Settings(_)) {
+            self.close_overlay();
         }
     }
 
@@ -6536,12 +7023,6 @@ impl BoardView {
                     (false, 1) => "Move".to_string(),
                     (false, n) => format!("Move {n}"),
                 };
-                // A drop that finds a host clears the unstick. That is the
-                // other half of `meta.loose` being a decision: the decision was
-                // "not this one", and putting the note down on a card is how
-                // you take it back. Written inside the same step as the move,
-                // because it is the same gesture.
-                self.restick(&start, &open);
                 if self.doc.board.finish(&label, open) {
                     self.say(match (copied, n) {
                         (true, 1) => "duplicated".to_string(),
@@ -6750,6 +7231,19 @@ impl BoardView {
                 }
             }
             cx.notify();
+            return;
+        }
+
+        // The settings page. It takes every press too, though for a
+        // different reason than the two text fields above: the board behind
+        // it is behind a scrim, and a shortcut that edited what nobody can
+        // properly see would be an edit nobody watched happen. Escape is the
+        // one key it answers. Same input-dead exception while leaving.
+        if matches!(self.overlay, Overlay::Settings(_)) && !self.overlay_leaving {
+            if key == "escape" {
+                self.close_settings();
+                cx.notify();
+            }
             return;
         }
 
@@ -7018,6 +7512,11 @@ impl BoardView {
     /// account for.
     fn advance(&mut self) -> bool {
         let now = Instant::now();
+        // A fresh start rather than a slow frame: nothing was in flight, so
+        // nothing is owed the time since the last redraw. See `animating`.
+        if !self.animating {
+            self.camera.wake(now);
+        }
         // Reduced motion is a frame long enough for everything to have already
         // finished. Every spring lands on its target, every fade reaches its
         // end, and each of them still *happens* — the camera goes where it was
@@ -7056,7 +7555,8 @@ impl BoardView {
         let overlay = self.advance_overlay(dt);
         let loader = self.advance_loader(dt);
         let presenting = self.advance_presenting(dt);
-        camera
+        let controls = self.advance_controls(dt);
+        self.animating = camera
             || anchors
             || playing
             || self.images.arriving()
@@ -7064,16 +7564,24 @@ impl BoardView {
             || overlay
             || loader
             || presenting
+            || controls;
+        self.animating
     }
 
     /// Bring the overlay's presence a frame nearer where it belongs, and drop
     /// it once it has finished leaving. See `Overlay` and `overlay_presence`.
+    ///
+    /// Retargeted here, every frame, rather than at the moments something
+    /// opens or closes — the spring does not care how often it is told where
+    /// to go, and one place that says so is one place `overlay_leaving` and
+    /// the motion cannot disagree.
     fn advance_overlay(&mut self, dt: f32) -> bool {
         if matches!(self.overlay, Overlay::None) {
             return false;
         }
-        let moving = step_presence(&mut self.overlay_presence, self.overlay_leaving, dt);
-        if self.overlay_leaving && self.overlay_presence <= 0.0 {
+        self.overlay_presence.retarget(if self.overlay_leaving { 0.0 } else { 1.0 });
+        let moving = self.overlay_presence.step(Spring::SURFACE, dt, PRESENCE_REST);
+        if self.overlay_leaving && !moving {
             self.overlay = Overlay::None;
             self.overlay_leaving = false;
         }
@@ -7379,27 +7887,26 @@ impl BoardView {
             matches!(self.gesture, Gesture::None).then(|| self.controls_at(self.pointer)).flatten();
         let press_control = self.pressed_control.clone();
 
-        // The prospective host for a single loose note being dragged on its
-        // own — the same measurement `restick` takes at the release, taken
-        // here every frame instead so the drop is not a decision made blind.
-        // Sticking changes ownership permanently, and the one gesture that
-        // does it used to give no warning before letting go.
+        // The prospective host for a single sticky note being dragged on its
+        // own — the measurement the release will make, taken here every frame
+        // instead so the drop is not a decision made blind. Sticking changes
+        // ownership permanently, and the one gesture that does it should warn
+        // before the hand lets go. A plain note gets no preview because its
+        // drop changes nothing: pinning is asked for, not measured on.
         //
-        // Only for one loose note: dragging a card together with a group, or
-        // with whatever is already stuck to it, is not a question of whether
-        // it would in turn stick to something else, and measuring against
-        // the whole moving set would answer a question nobody asked.
+        // Only for one note: dragging a card together with a group, or with
+        // whatever is already stuck to it, is not a question of whether it
+        // would in turn stick to something else, and measuring against the
+        // whole moving set would answer a question nobody asked.
         let restick_preview: Option<String> = match &self.gesture {
             Gesture::Moving { start, .. } if start.len() == 1 => {
                 let held = &start[0];
                 self.doc
                     .board
                     .item(&held.id)
-                    .filter(|item| item.kind == ItemType::Note && stick::is_loose(item))
+                    .filter(|item| item.kind == ItemType::Note && stick::is_sticky(item))
                     .and_then(|_| {
-                        Pins::measure_ignoring_loose(&self.doc.board.items)
-                            .host_of(&held.id)
-                            .map(str::to_string)
+                        Pins::measure(&self.doc.board.items).host_of(&held.id).map(str::to_string)
                     })
             }
             _ => None,
@@ -10140,6 +10647,9 @@ impl Render for BoardView {
             }
             Overlay::Palette(palette) => {
                 Some(crate::palette::render(palette, self, cx).into_any_element())
+            }
+            Overlay::Settings(page) => {
+                Some(crate::settings::render(page, self, cx).into_any_element())
             }
         };
 

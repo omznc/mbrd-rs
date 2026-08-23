@@ -38,7 +38,7 @@ use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 
-use crate::board_view::BoardView;
+use crate::board_view::{BoardView, UpdateBadge};
 use crate::command::Command;
 use crate::icons::{icon, Icon};
 use crate::tip::tip;
@@ -154,52 +154,60 @@ pub fn render(view: &BoardView, window: &Window, cx: &mut Context<BoardView>) ->
                 .gap(px(2.0))
                 .child(switcher_button(view, cx))
                 .child(reach(view, "commands", Command::Palette, Icon::Commands, cx))
-                .child(reach(view, "find", Command::Search, Icon::Find, cx)),
+                .child(reach(view, "find", Command::Search, Icon::Find, cx))
+                .child(reach(view, "settings", Command::Settings, Icon::Settings, cx)),
         )
-        .when(ours, |d| {
-            d.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .when(controls.minimize, |d| {
-                        d.child(control(
-                            "minimise",
-                            Icon::Minimise,
+        // The right-hand side: the update badge, then the window buttons where
+        // they are ours. The badge sits before the buttons on Linux and
+        // Windows and is simply the rightmost thing on a Mac, which is the
+        // same sentence both ways: as far right as this app's own chrome goes.
+        .child(div().flex().items_center().gap(px(10.0)).children(update_badge(view, cx)).when(
+            ours,
+            |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .when(controls.minimize, |d| {
+                            d.child(control(
+                                "minimise",
+                                Icon::Minimise,
+                                theme.muted,
+                                theme.muted,
+                                cx,
+                                |_view, window, _cx| window.minimize_window(),
+                            ))
+                        })
+                        .when(controls.maximize, |d| {
+                            d.child(control(
+                                "maximise",
+                                Icon::Maximise,
+                                theme.muted,
+                                theme.muted,
+                                cx,
+                                |_view, window, _cx| window.zoom_window(),
+                            ))
+                        })
+                        .child(control(
+                            "close",
+                            Icon::Close,
                             theme.muted,
-                            theme.muted,
+                            theme.accent,
                             cx,
-                            |_view, window, _cx| window.minimize_window(),
-                        ))
-                    })
-                    .when(controls.maximize, |d| {
-                        d.child(control(
-                            "maximise",
-                            Icon::Maximise,
-                            theme.muted,
-                            theme.muted,
-                            cx,
-                            |_view, window, _cx| window.zoom_window(),
-                        ))
-                    })
-                    .child(control(
-                        "close",
-                        Icon::Close,
-                        theme.muted,
-                        theme.accent,
-                        cx,
-                        // The board goes to disk before the window goes away.
-                        // This button does not route through the compositor, so
-                        // the `on_window_should_close` hook `main.rs` registers
-                        // never sees it — see `BoardView::flush`, which both
-                        // paths call and which is a no-op when the autosave
-                        // timer has already been round.
-                        |view, window, cx| {
-                            view.flush(cx);
-                            window.remove_window();
-                        },
-                    )),
-            )
-        })
+                            // The board goes to disk before the window goes away.
+                            // This button does not route through the compositor, so
+                            // the `on_window_should_close` hook `main.rs` registers
+                            // never sees it — see `BoardView::flush`, which both
+                            // paths call and which is a no-op when the autosave
+                            // timer has already been round.
+                            |view, window, cx| {
+                                view.flush(cx);
+                                window.remove_window();
+                            },
+                        )),
+                )
+            },
+        ))
         // Last, and painted over everything above it, which is the point: gpui
         // answers a Windows hit test with the *first* region marked under the
         // pointer, in paint order, so a caption declared here can never take a
@@ -373,6 +381,95 @@ fn reach(
             }),
         )
         .child(icon(mark, crate::icons::ICON_MD, theme.muted))
+}
+
+/// How wide the download's progress track is.
+///
+/// Wide enough to visibly move on an ordinary release and no wider — this is
+/// the corner of a titlebar, not a download manager.
+const PROGRESS_TRACK: f32 = 64.0;
+
+/// What the bar says about an update, when there is one to speak of.
+///
+/// `None` almost always — see `BoardView::update_badge` — which is what makes
+/// the spot worth glancing at when it is not. The three states are the three
+/// sentences of the whole flow: *update available* (click to download), the
+/// bar filling, and *restart to update* (click to save, install and restart).
+///
+/// Clicks land on [`BoardView::update_step`], the same door `Ctrl U` uses, so
+/// the badge cannot drift from what the key does: each is a face on the one
+/// state machine.
+fn update_badge(view: &BoardView, cx: &mut Context<BoardView>) -> Option<gpui::AnyElement> {
+    let badge = view.update_badge()?;
+    let theme = view.theme;
+
+    let pill = div()
+        .id("update")
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .px(px(9.0))
+        .h(px(22.0))
+        .rounded_full()
+        .text_size(px(11.0))
+        // Mouse-down and claimed, for the reason every button on this bar
+        // gives: the bar starts a window move on press, and on Windows the
+        // caption strip would otherwise take the press as a drag.
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _event, _window, cx| {
+                cx.stop_propagation();
+                this.update_step(cx);
+            }),
+        );
+
+    Some(match badge {
+        UpdateBadge::Available { version } => pill
+            .text_color(theme.accent)
+            .bg(theme.accent.opacity(0.10))
+            .hover(|s| s.bg(theme.accent.opacity(0.18)))
+            .active(|s| s.bg(theme.accent.opacity(0.26)))
+            .tooltip(tip(theme, format!("mbrd {version} is out"), "click to download"))
+            .child(div().size(px(6.0)).rounded_full().bg(theme.accent))
+            .child("update available")
+            .into_any_element(),
+
+        UpdateBadge::Downloading { fraction } => pill
+            .text_color(theme.muted)
+            .tooltip(tip(theme, "downloading the update", ""))
+            .child(
+                div()
+                    .w(px(PROGRESS_TRACK))
+                    .h(px(3.0))
+                    .rounded_full()
+                    .bg(theme.text.opacity(0.15))
+                    .child(
+                        div()
+                            // Never fully empty: a hairline of accent from the
+                            // first frame is what says "started" while the
+                            // first bytes are still on their way.
+                            .w(px((PROGRESS_TRACK * fraction).max(2.0)))
+                            .h_full()
+                            .rounded_full()
+                            .bg(theme.accent),
+                    ),
+            )
+            .child(format!("{:.0}%", fraction * 100.0))
+            .into_any_element(),
+
+        UpdateBadge::Ready { version } => pill
+            .text_color(theme.accent)
+            .bg(theme.accent.opacity(0.14))
+            .hover(|s| s.bg(theme.accent.opacity(0.22)))
+            .active(|s| s.bg(theme.accent.opacity(0.30)))
+            .tooltip(tip(
+                theme,
+                format!("mbrd {version} is ready"),
+                "click to save, install and restart",
+            ))
+            .child("restart to update")
+            .into_any_element(),
+    })
 }
 
 /// One of the three window buttons.
