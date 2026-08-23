@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The bundle macOS needs to treat this as an application rather than as a
+  program that happens to open a window. A bare Mach-O runs from a terminal,
+  but it has no name in the menu bar, no Dock identity, and cannot be
+  double-clicked out of Applications. __VERSION__ is substituted by the
+  release workflow from the workspace version.
+
+  There are deliberately no CFBundleDocumentTypes here. Declaring `.mbrd` would
+  make the Finder offer this app for a board and then hand the path over as an
+  Apple Event, which `main.rs` does not listen for — it reads `argv`. The file
+  would open the app and the app would show the demonstration board, which is
+  worse than not being offered at all. See RELEASING.md.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>mbrd</string>
+	<key>CFBundleDisplayName</key>
+	<string>mbrd</string>
+	<key>CFBundleExecutable</key>
+	<string>mbrd</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.omznc.mbrd</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>__VERSION__</string>
+	<key>CFBundleVersion</key>
+	<string>__VERSION__</string>
+	<!-- The floor gpui's own Metal shaders are compiled against. -->
+	<key>LSMinimumSystemVersion</key>
+	<string>10.15.7</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<!-- Not a background agent: without this the app can launch without ever
+	     coming to the front, which on a canvas you are meant to draw on reads
+	     as the app having failed to start. -->
+	<key>LSUIElement</key>
+	<false/>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+</dict>
+</plist>

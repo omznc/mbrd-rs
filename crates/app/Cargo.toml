@@ -1,0 +1,18 @@
+[package]
+name = "mbrd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A moodboard on an endless canvas."
+
+[[bin]]
+name = "mbrd"
+path = "src/main.rs"
+
+[dependencies]
+mbrd-core = { path = "../core" }
+anyhow.workspace = true
+gpui = "0.2.2"
+image.workspace = true
+serde_json.workspace = true
+sha2.workspace = true

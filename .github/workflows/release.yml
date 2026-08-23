@@ -1,0 +1,220 @@
+# Builds an executable for every desktop platform and attaches it to a GitHub
+# release.
+#
+# Triggered by pushing a tag: `git tag v0.2.0 && git push origin v0.2.0`. The
+# tag has to match the workspace version in Cargo.toml — the `notes` job checks
+# it and stops the run rather than publishing a release whose name and contents
+# disagree.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Useful for proving the matrix still builds without cutting a release.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # The version and the release body, worked out once. Its own job rather than
+  # a step in each build, because four jobs generating the body independently
+  # is four chances for them to disagree about what the release says, and
+  # because the draft has to exist before anything can upload into it.
+  notes:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # `scripts/changelog.mjs` walks back to the previous tag to find its
+          # range, and the default shallow clone has neither the tag nor the
+          # commits between.
+          fetch-depth: 0
+
+      - id: version
+        env:
+          REF: ${{ github.ref_name }}
+        run: |
+          # The first `version = ` in Cargo.toml is `[workspace.package]`'s,
+          # which is the one every crate inherits. Read rather than parsed
+          # with `cargo metadata`, which would want the registry to answer
+          # before it would tell us a number that is sitting in the file.
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "workspace version is $VERSION"
+
+          # Only on a tag. A manual run's ref name is the branch.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${REF#v}" != "$VERSION" ]; then
+            echo "::error::tag $REF does not match the workspace version $VERSION."
+            echo "::error::Bump it in Cargo.toml, or move the tag."
+            exit 1
+          fi
+
+      # Created here, empty, so the four build jobs have somewhere to upload
+      # and none of them has to race the others to make it. A draft, so it can
+      # be looked at — and so a half-finished matrix is not a download page.
+      - name: Open the draft release
+        if: github.ref_type == 'tag'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF: ${{ github.ref_name }}
+        run: |
+          {
+            node scripts/changelog.mjs "$REF"
+            echo
+            echo '---'
+            echo
+            cat .github/install-notes.md
+          } > release-notes.md
+
+          gh release create "$REF" --draft \
+            --title "mbrd $REF" \
+            --notes-file release-notes.md
+
+  build:
+    needs: notes
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon and Intel are separate downloads; a universal binary
+          # would double the size of both for the sake of one artifact. Both
+          # are built on the arm64 runner — Metal shaders compile to
+          # architecture-independent AIR, so the cross-compile is free.
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            arch: aarch64
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+            arch: x64
+          # Pinned deliberately: the binary links against whatever glibc the
+          # runner has, so building on the newest Ubuntu would refuse to start
+          # on anything older.
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            arch: x86_64
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            arch: x64
+            # Links the Visual C++ runtime in, so the exe runs on a machine
+            # that has never had a redistributable installed — which is the
+            # whole point of handing somebody a single file.
+            rustflags: -C target-feature=+crt-static
+
+    runs-on: ${{ matrix.platform }}
+    env:
+      VERSION: ${{ needs.notes.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # gpui's Linux backend, and the font stack under it. `libxkbcommon-x11`
+      # is needed whether or not X11 is in use — the dependency is not
+      # feature-gated upstream — and its absence surfaces as a link failure,
+      # not a compile one. See the README.
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libfontconfig-dev \
+            libfreetype6-dev \
+            libxcb1-dev \
+            pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: ${{ matrix.target }}
+
+      # gpui compiles its HLSL shaders with fxc.exe from the Windows SDK. It
+      # looks on PATH first, then at one hardcoded SDK version — neither of
+      # which is reliable on a runner whose SDK moves — so find it and say
+      # where it is. This is also the reason the Windows build cannot be
+      # cross-compiled from Linux: gpui's build script gates the whole shader
+      # step on the *host* being Windows, so a cross build skips it silently
+      # and then fails on the bindings that step was meant to write.
+      - name: Find the shader compiler
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" `
+                   -Recurse -Filter fxc.exe -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -like "*\x64\*" } |
+                 Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw "fxc.exe not found; no Windows SDK on this runner" }
+          Write-Host "using $($fxc.FullName)"
+          "GPUI_FXC_PATH=$($fxc.FullName)" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Build
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release -p mbrd --target ${{ matrix.target }}
+
+      # A `.app`, because a bare Mach-O has no name in the menu bar, no Dock
+      # identity and cannot be double-clicked; then a `.dmg`, because that is
+      # how a Mac application is handed over. The ad-hoc `codesign` is not
+      # security — it is what makes the bundle runnable at all on Apple
+      # Silicon, where an unsigned binary is killed on launch.
+      - name: Package the macOS app
+        if: runner.os == 'macOS'
+        run: |
+          APP="stage/mbrd.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" dist
+          sed "s/__VERSION__/$VERSION/g" packaging/macos/Info.plist \
+            > "$APP/Contents/Info.plist"
+          cp "target/${{ matrix.target }}/release/mbrd" "$APP/Contents/MacOS/mbrd"
+          chmod +x "$APP/Contents/MacOS/mbrd"
+          codesign --force --deep --sign - "$APP"
+
+          # The symlink is what makes the window that opens a drag-to-install
+          # rather than a folder with a mystery in it.
+          ln -s /Applications stage/Applications
+          hdiutil create -volname mbrd -srcfolder stage -ov -format UDZO \
+            "dist/mbrd_${VERSION}_${{ matrix.arch }}.dmg"
+
+      - name: Package the Linux binary
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist
+          tar -czf "dist/mbrd_${VERSION}_${{ matrix.arch }}-linux.tar.gz" \
+            -C "target/${{ matrix.target }}/release" mbrd
+
+      # No installer. One file, which is what somebody being sent a copy wants,
+      # and there is nothing to install alongside it.
+      - name: Package the Windows exe
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\mbrd.exe" `
+            "dist\mbrd_${env:VERSION}_${{ matrix.arch }}.exe"
+
+      - name: Size
+        shell: bash
+        run: ls -lh dist
+
+      - name: Attach to the release
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" dist/* --clobber
+
+      # A manual run publishes nothing, so the builds would die with the
+      # runner. Downloading them from here is how you check the app actually
+      # starts on a platform you don't own, before committing to a tag.
+      - name: Upload for inspection
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: mbrd-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error

@@ -1,0 +1,48 @@
+[workspace]
+members = ["crates/core", "crates/app"]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+anyhow = "1"
+# Pinned to the line gpui itself uses, so `image::Frame` here and
+# `image::Frame` inside `RenderImage` are the same type rather than two.
+image = "0.25"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# What a build sent to somebody else is compiled with. `strip` and `lto`
+# together take the biggest bite out of an executable that is mostly gpui;
+# `panic = "abort"` drops the unwinding tables, which is safe here because
+# nothing in the app or in gpui outside its test support catches a panic.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# What a development build is compiled with, and it is not the default.
+#
+# A canvas is one of the few kinds of program where an unoptimised build is not
+# merely slower but *differently behaved*: the per-frame work here — building
+# the spatial index, laying out a screenful, pushing quads — measures eight to
+# ten times its release cost at `opt-level = 0`, which turns a board that drags
+# smoothly into one that does not. Testing a gesture against a debug build is
+# then testing the wrong program.
+#
+# `1` rather than `3` for our own crates, because that is most of the win while
+# keeping the compile fast and the backtraces readable; `3` for dependencies,
+# which are compiled once and then cached, and which is where `gpui`, `image`
+# and the decoders live.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

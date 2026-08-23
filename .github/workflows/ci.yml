@@ -1,0 +1,45 @@
+# The gate before a tag. Deliberately Linux-only: this checks that the code is
+# correct, and the release workflow is what proves it builds everywhere.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      # Same list as the release build. See the comment there, and the README.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libfontconfig-dev \
+            libfreetype6-dev \
+            libxcb1-dev \
+            pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Both crates. `mbrd-core`'s tests are the ones the format depends on,
+      # and they need no window, no event loop and no graphics driver; the app
+      # crate's are the same kind of thing — geometry and hit-testing — rather
+      # than anything that opens a window. A headless runner can run all of it.
+      - name: Test
+        run: cargo test --workspace
