@@ -11,10 +11,16 @@ expensive if they are skipped.
 
 ## Done
 
-Pan, zoom-to-cursor, marquee select, drag to move, arrow nudge, delete to bin,
+Pan, zoom-to-cursor, marquee select, drag to move, arrow nudge, delete,
 new note, save. Client-side titlebar with window controls. The `.mbrd` format in
 both directions. **Phase 1: the mutation door and undo** — see below. 71 tests.
 See `README.md`.
+
+**Getting it onto other people's machines** — installers for all three
+platforms, an icon, desktop and Finder integration, and an updater that runs
+inside the app. Planned in `SHIPPING.md`, operated from `RELEASING.md`. It is
+not a phase in the list below because it is not about what the app *does*; it
+is the difference between a program and something somebody can have.
 
 ---
 
@@ -338,12 +344,26 @@ files.
 
 ## Phase 8 — Finding your way around
 
-- Search (`Ctrl`+`K`) across names, note text, link URLs and tags, and jump to a
-  result.
+- ~~Search (`Ctrl`+`K`) across names, note text, link URLs and tags, and jump to a
+  result.~~ **Done**, except tags — there are none yet. `Ctrl`+`F` and `Ctrl`+`K`
+  both open it, as does tapping `Ctrl` twice; a result is selected *and*
+  travelled to, because being told where a card is would be no use on a canvas
+  you then have to cross by hand. See `app/palette.rs`.
+- The command palette (`Shift` `Shift`) — `command.rs`'s whole table as a list
+  you type at, which is the only way to reach the third of it that has no key.
+  Done alongside the search, since they are one mechanism with two lists.
 - Tags, and filtering the board by them.
 - The tour: a saved route, walked with a camera move per stop.
 - The viewer: double-click to zoom to an item, and a full-screen look at one.
-- The bin as a place on the canvas you can drag things back out of.
+- The bin as a place on the canvas you can drag things back out of. **Dropped.**
+  A bin earns its keep by being somewhere you can take things back *out* of, and
+  nothing here ever built that — so what the format's `trash` section actually
+  did in this app was keep every deleted photograph's bytes in the file forever,
+  against a restore that was never coming. The bin now lives in memory for the
+  length of a session and is emptied at the file boundary; undo is the route
+  back, and it survives a reopen because the ledger does. See
+  `core/model.rs`'s `TrashEntry`. If this comes back it comes back as the
+  draggable place described here, not as a number in the corner.
 - The inventory sheet — what this board is made of, and what it weighs.
 
 ---
