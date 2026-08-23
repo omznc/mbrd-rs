@@ -31,6 +31,7 @@
 
 use gpui::{
     div, prelude::*, px, Context, CursorStyle, Decorations, MouseButton, ResizeEdge, Window,
+    WindowControlArea,
 };
 
 use std::path::Path;
@@ -130,6 +131,13 @@ pub fn render(view: &BoardView, window: &Window, cx: &mut Context<BoardView>) ->
         // avoid. The switcher and the buttons stop this from firing under them
         // by claiming the press themselves.
         .on_mouse_down(MouseButton::Left, |event, window, _cx| {
+            // Both of these are Windows' own, and it does them from the
+            // caption strip below rather than from here — see [`caption`].
+            // Doing them here as well would zoom the window twice on a
+            // double-click and leave it exactly where it started.
+            if cfg!(target_os = "windows") {
+                return;
+            }
             if event.click_count == 2 {
                 window.zoom_window();
             } else {
@@ -192,7 +200,43 @@ pub fn render(view: &BoardView, window: &Window, cx: &mut Context<BoardView>) ->
                     )),
             )
         })
+        // Last, and painted over everything above it, which is the point: gpui
+        // answers a Windows hit test with the *first* region marked under the
+        // pointer, in paint order, so a caption declared here can never take a
+        // press away from a button declared before it.
+        .when(cfg!(target_os = "windows"), |d| d.child(caption(window)))
         .into_any_element()
+}
+
+/// The part of the bar Windows is told is a caption. Windows only.
+///
+/// [`Window::start_window_move`], which the bar calls on press everywhere
+/// else, is a Linux thing: X11 and Wayland both implement it, macOS does not
+/// need it — an `appears_transparent` window keeps a real NSWindow titlebar
+/// under ours and drags from it — and on Windows gpui inherits the empty
+/// default, so the press did nothing at all and the window could not be moved.
+///
+/// What Windows wants instead is an answer to `WM_NCHITTEST`: the window says
+/// which parts of its client area are caption, and the OS drags, snaps and
+/// double-click-zooms from them exactly as it would from a native titlebar.
+/// [`WindowControlArea::Drag`] is how gpui asks for that, and letting the OS
+/// do all three is why the bar's own press handler stands down there.
+///
+/// This is a child of the bar rather than the bar itself because of the top
+/// edge. gpui only falls through to its own resize handling when *no* marked
+/// region is under the pointer, so a caption that reached the top of the
+/// window would be a window that could not be resized from the top. The strip
+/// left uncovered is that resize border — and only while there is one worth
+/// leaving: a maximised window cannot be resized, and the gap would be a dead
+/// line across the top of the bar.
+fn caption(window: &Window) -> impl IntoElement {
+    div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .top(px(if window.is_maximized() { 0.0 } else { RESIZE_GRAB }))
+        .window_control_area(WindowControlArea::Drag)
 }
 
 /// The project switcher: what board is open, and the way to open another.
@@ -354,13 +398,20 @@ fn control(
         .h(px(TITLEBAR_HEIGHT))
         .hover(move |s| s.bg(hover.opacity(0.18)))
         .active(move |s| s.bg(hover.opacity(0.34)))
-        // Mouse-down rather than click, and it matters here: the bar itself
-        // starts a window move on mouse-down, and an interactive child has to
-        // claim the press before that happens or every button press would drag
-        // the window a pixel first.
+        // Mouse-down rather than click, and claimed rather than left to
+        // bubble, and both matter here: the bar starts a window move on
+        // mouse-down, so a button that waited for the release would drag the
+        // window a pixel on the way to firing. On Windows the press that has
+        // to be claimed is the *OS*'s — these buttons sit inside the caption
+        // strip, and a press that reached it would put the window into a drag
+        // instead of pressing the button. `stop_propagation` is what tells
+        // gpui to answer the platform that the press was handled here.
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |view, _event, window, cx| action(view, window, cx)),
+            cx.listener(move |view, _event, window, cx| {
+                cx.stop_propagation();
+                action(view, window, cx)
+            }),
         )
         .child(icon(mark, crate::icons::ICON_MD, colour))
 }
