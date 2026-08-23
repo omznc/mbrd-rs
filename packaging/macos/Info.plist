@@ -7,11 +7,11 @@
   double-clicked out of Applications. __VERSION__ is substituted by the
   release workflow from the workspace version.
 
-  There are deliberately no CFBundleDocumentTypes here. Declaring `.mbrd` would
-  make the Finder offer this app for a board and then hand the path over as an
-  Apple Event, which `main.rs` does not listen for — it reads `argv`. The file
-  would open the app and the app would show the demonstration board, which is
-  worse than not being offered at all. See RELEASING.md.
+  CFBundleDocumentTypes declares `.mbrd`, and it may only do so because
+  `main.rs` now listens for the Apple Event the Finder sends — `on_open_urls`.
+  The two go together and must stay together: declaring the type without the
+  hook would make the Finder offer this app for a board and then have the app
+  show the demonstration board instead, which is worse than not being offered.
 -->
 <plist version="1.0">
 <dict>
@@ -20,6 +20,8 @@
 	<key>CFBundleDisplayName</key>
 	<string>mbrd</string>
 	<key>CFBundleExecutable</key>
+	<string>mbrd</string>
+	<key>CFBundleIconFile</key>
 	<string>mbrd</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.omznc.mbrd</string>
@@ -43,5 +45,49 @@
 	<false/>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
+	<!-- What a board is, so the Finder can offer this app for one. `Owner`
+	     rather than `Alternate` because this is the application that defines
+	     the format, and `Editor` because opening one here is not a preview. -->
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>mbrd board</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.omznc.mbrd.board</string>
+			</array>
+		</dict>
+	</array>
+	<!-- And what that identifier means, declared once here because nobody
+	     else defines it. Conforming to `public.data` and `public.archive` is
+	     honest: a `.mbrd` is a zip with a manifest in it. -->
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>com.omznc.mbrd.board</string>
+			<key>UTTypeDescription</key>
+			<string>mbrd board</string>
+			<key>UTTypeIconFile</key>
+			<string>mbrd</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+				<string>public.archive</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>mbrd</string>
+				</array>
+			</dict>
+		</dict>
+	</array>
 </dict>
 </plist>

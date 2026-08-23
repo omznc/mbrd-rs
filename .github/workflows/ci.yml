@@ -1,5 +1,10 @@
-# The gate before a tag. Deliberately Linux-only: this checks that the code is
-# correct, and the release workflow is what proves it builds everywhere.
+# The gate before a tag.
+#
+# The `check` job is deliberately Linux-only: it checks that the code is
+# correct, and the release workflow is what proves it builds everywhere. The
+# `package` job below is not Linux-only and cannot be — packaging is the part
+# that differs per platform, and it used to be the part nobody found out was
+# broken until a tag was already pushed.
 name: CI
 
 on:
@@ -43,3 +48,112 @@ jobs:
       # than anything that opens a window. A headless runner can run all of it.
       - name: Test
         run: cargo test --workspace
+
+  # Build the installers without publishing anything.
+  #
+  # Packaging is the half of a release that CI never used to touch: the
+  # `.dmg`, the AppImage and the NSIS script are all shell and none of them is
+  # exercised by `cargo test`. Before this job existed, a typo in any of them
+  # was found by pushing a tag and watching the release fail — at which point
+  # the tag has to be moved, which is the one thing a tag should not need.
+  #
+  # It does not sign anything and does not need the update key: what is being
+  # proved is that the artifacts build, not that they are trustworthy.
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libfontconfig-dev \
+            libfreetype6-dev \
+            libxcb1-dev \
+            pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: package-${{ matrix.target }}
+
+      # The icons are committed rather than generated, so the thing worth
+      # checking is that they are still *there* and still what the SVG says.
+      # An installer that silently ships without an icon is a release nobody
+      # notices until it is on somebody's desktop.
+      - name: Check the icons are present
+        shell: bash
+        run: |
+          for icon in packaging/icons/mbrd.icns \
+                      packaging/icons/mbrd.ico \
+                      packaging/icons/hicolor/256x256/apps/mbrd.png; do
+            [ -s "$icon" ] || { echo "::error::$icon is missing or empty"; exit 1; }
+          done
+          echo "icons present"
+
+      # Debug rather than release: this job is proving the *packaging* works,
+      # and a release build with fat LTO would treble the time it takes to
+      # find out that a `sed` in a shell script has a typo in it.
+      - name: Build
+        run: cargo build -p mbrd --target ${{ matrix.target }}
+
+      - name: Assemble the macOS bundle
+        if: runner.os == 'macOS'
+        run: |
+          APP="stage/mbrd.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          sed "s/__VERSION__/0.0.0/g" packaging/macos/Info.plist \
+            > "$APP/Contents/Info.plist"
+          cp "target/${{ matrix.target }}/debug/mbrd" "$APP/Contents/MacOS/mbrd"
+          cp packaging/icons/mbrd.icns "$APP/Contents/Resources/mbrd.icns"
+          codesign --force --deep --sign - "$APP"
+          # The plist is the file most likely to be broken by hand-editing,
+          # and a malformed one produces an app that launches to nothing.
+          plutil -lint "$APP/Contents/Info.plist"
+
+      - name: Check the desktop files
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y desktop-file-utils shared-mime-info
+          desktop-file-validate packaging/linux/mbrd.desktop
+          # Parses the MIME definition the same way `update-mime-database`
+          # will when the package is installed.
+          mkdir -p /tmp/mime/packages
+          cp packaging/linux/mbrd.xml /tmp/mime/packages/
+          update-mime-database /tmp/mime
+
+      - name: Check the installer script
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe")) {
+            choco install nsis --no-progress -y
+          }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target\${{ matrix.target }}\debug\mbrd.exe" "dist\mbrd.exe"
+          # `/WX` turns NSIS warnings into failures, which is the point: an
+          # unresolved plugin or a missing file is a warning by default and
+          # produces an installer that does the wrong thing quietly.
+          & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" /WX `
+            /DVERSION=0.0.0 packaging\windows\mbrd.nsi
+          if (-not (Test-Path "dist\mbrd_0.0.0_x64-setup.exe")) {
+            throw "the installer did not produce an executable"
+          }

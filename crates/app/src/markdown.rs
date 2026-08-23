@@ -121,7 +121,14 @@ pub fn lay_out(text: &str, columns: usize, rows: usize) -> Vec<Line> {
             .max(1);
 
         for (n, run) in fold(&block.body, room).into_iter().enumerate() {
-            if left < block.scale {
+            // `!out.is_empty()`, so the first line is always drawn however
+            // little room there is. Without it a note that opens with a
+            // heading — which costs more than one row — came back *empty* the
+            // moment the card was down to a single row, while the same note
+            // written without the `#` still showed its first line. A card
+            // going blank is not a level of detail, it is a card that has lost
+            // its contents, and the painter clips what overflows anyway.
+            if left < block.scale && !out.is_empty() {
                 clipped = true;
                 break 'outer;
             }
@@ -212,7 +219,10 @@ fn classify(raw: &str, columns: usize) -> Block {
     if (1..=3).contains(&hashes) && body.chars().nth(hashes) == Some(' ') {
         let rest: String = body.chars().skip(hashes + 1).collect();
         let mut block = Block::body(bolden(inline(&rest)));
-        block.scale = [1.5, 1.25, 1.1][hashes - 1];
+        // Wider than the ramp this replaces, whose bottom two steps — 1.25
+        // and 1.1 — sat close enough together that an H3 read as body text
+        // with a hash quietly in front of it rather than as its own level.
+        block.scale = [1.6, 1.3, 1.12][hashes - 1];
         block.indent = indent;
         return block;
     }
@@ -530,6 +540,21 @@ mod tests {
         assert!(out[0].scale > 1.0);
         assert_eq!(out[1].scale, 1.0);
         assert!(out[0].spans.iter().all(|s| s.style.bold), "a heading is bold throughout");
+    }
+
+    #[test]
+    fn a_note_that_opens_with_a_heading_still_says_something_in_one_row() {
+        // The card is down to a single body row, which is less than a heading
+        // costs. It used to come back empty — the whole note gone, on a card
+        // that was still plainly big enough to read a word off.
+        let out = lay_out("# Title\nand words", 40, 1);
+        assert_eq!(text(&out), ["Title…"], "a heading-first note went blank");
+    }
+
+    #[test]
+    fn a_note_clipped_after_its_first_line_still_says_it_was_clipped() {
+        let out = lay_out("# Title\nand words\nand more", 40, 2);
+        assert_eq!(text(&out), ["Title…"]);
     }
 
     #[test]

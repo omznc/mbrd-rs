@@ -9,7 +9,7 @@
 //! The layering the original enforces with a test is kept here by construction:
 //!
 //! ```text
-//! geometry, history, motion <- model <- {schema, viewport, naming} <- state <- mbrd
+//! geometry, guides, history, motion <- model <- {schema, viewport, naming} <- state <- mbrd
 //! ```
 //!
 //! and the UI crate sits above all of it. **Nothing in here may depend on the
@@ -37,16 +37,20 @@
 pub mod align;
 pub mod fence;
 pub mod geometry;
+pub mod guides;
 pub mod history;
 pub mod index;
 pub mod mbrd;
+pub mod media;
 pub mod model;
 pub mod motion;
 pub mod naming;
+pub mod peaks;
 pub mod rope;
 pub mod route;
 pub mod schema;
 pub mod snap;
+pub mod sound;
 pub mod state;
 pub mod stick;
 pub mod viewport;

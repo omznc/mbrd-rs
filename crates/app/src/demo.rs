@@ -40,7 +40,7 @@ pub fn board() -> Document {
         "items": [
             { "id": "hello", "type": "note", "x": -260, "y": 150, "w": 260, "h": 190, "z": 3,
               "name": "hello",
-              "meta": { "text": "# mbrd\n\ndrag empty space to pan, wheel to zoom.\npress n for a note, right-click for the rest.\ndouble-click to type." } },
+              "meta": { "text": "# mbrd\n\ndrag empty space to pan, wheel to zoom.\npress n for a note, right-click for the rest.\ndouble-click to type.\nctrl z takes anything back. shift shift for everything else." } },
             { "id": "photo1", "type": "image", "x": 90, "y": 170, "w": 300, "h": 220, "z": 2,
               "name": "kitchen-window.jpg",
               "asset": { "hash": kitchen, "embedded": true } },

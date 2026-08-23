@@ -1,29 +1,93 @@
-//! The window's own furniture, for compositors that decline to draw it.
+//! The app's own top bar, on every platform.
 //!
-//! On Wayland there is no guarantee anybody else will put a title and three
-//! buttons at the top of the window. The compositor advertises whether it does
-//! server-side decorations, and several of the common ones — GNOME's mutter
-//! among them — simply do not, so the application is handed a bare rectangle
-//! and is expected to draw its own.
+//! **This bar is always drawn.** Not the platform's — this one. A window whose
+//! chrome is a GNOME headerbar on one desk, an NSWindow titlebar on another and
+//! a Windows caption on a third is three different applications wearing the
+//! same icon, and the thing that lives at the top left of it — the board you
+//! have open, the way to open another, and the two ways to reach everything
+//! else — is part of the app rather than part of the window manager. So the
+//! bar, its title, its project switcher and the two buttons beside it are ours
+//! everywhere.
 //!
-//! So everything here is **conditional on what the compositor actually said**,
-//! read fresh each frame from [`gpui::Window::window_decorations`]. Under
-//! `Decorations::Server` this module draws nothing at all: a titlebar of our
-//! own underneath the compositor's would be two titlebars, which is the failure
-//! mode of hard-coding client-side decorations because they worked on one desk.
+//! What is *not* always ours is the three buttons on the right, and that is the
+//! one thing in here that varies by platform:
 //!
-//! The resize edges are here for the same reason. Server-side decorations carry
-//! their own drag targets; client-side ones do not, and a window that cannot be
-//! resized from its edges is not obviously a window.
+//! - **macOS** keeps its traffic lights. They are real `NSButton`s the system
+//!   draws over our bar and cannot be replaced, only hidden — and hiding them
+//!   is how you ship a Mac app nobody can close with the shortcut they know. So
+//!   we draw none of our own and leave [`LEFT_INSET`] of room for them.
+//! - **Windows** hides its caption via `TitlebarOptions::appears_transparent`,
+//!   so the three buttons are ours.
+//! - **Linux** is the one that has to be asked. The compositor advertises
+//!   whether it does server-side decorations, and several common ones — GNOME's
+//!   mutter among them — do not. Under `Decorations::Client` the buttons are
+//!   ours; under `Server` the compositor has drawn its own and ours would be a
+//!   second set.
+//!
+//! The resize edges follow the same rule as those buttons and for the same
+//! reason: server-side decorations carry their own drag targets, client-side
+//! ones do not, and a window that cannot be resized from its edges is not
+//! obviously a window.
 
 use gpui::{
-    div, prelude::*, px, App, Context, CursorStyle, Decorations, MouseButton, ResizeEdge, Window,
+    div, prelude::*, px, Context, CursorStyle, Decorations, MouseButton, ResizeEdge, Window,
 };
 
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
+
 use crate::board_view::BoardView;
+use crate::command::Command;
+use crate::icons::{icon, Icon};
+use crate::tip::tip;
 
 /// How tall the drawn titlebar is.
 pub const TITLEBAR_HEIGHT: f32 = 34.0;
+
+/// How much room to leave at the left before anything of ours is drawn.
+///
+/// On macOS this is the traffic lights, which the system draws *over* this bar
+/// at the position `main.rs` asks for. Everywhere else it is ordinary padding.
+/// Getting this wrong on a Mac puts the project switcher underneath the close
+/// button, which is the sort of thing that only shows up on the one machine
+/// nobody testing has.
+pub const LEFT_INSET: f32 = if cfg!(target_os = "macos") { 78.0 } else { 12.0 };
+
+// Checked where it cannot be got wrong quietly. Too little room on a Mac puts
+// the project switcher underneath the close button, and that is invisible on
+// every machine this is likely to be written on.
+const _: () = assert!(!cfg!(target_os = "macos") || LEFT_INSET > 60.0);
+
+/// Whether the three window buttons are this app's to draw.
+///
+/// See the module note: never on macOS, always on Windows, and on Linux only
+/// where the compositor said it was leaving them to us.
+fn buttons_are_ours(window: &Window) -> bool {
+    if cfg!(target_os = "macos") {
+        return false;
+    }
+    if cfg!(target_os = "linux") {
+        return matches!(window.window_decorations(), Decorations::Client { .. });
+    }
+    true
+}
+
+/// What the project switcher calls the board that is open.
+///
+/// The board's own title first, because that is what somebody named it; the
+/// file name next, because a board saved but never titled is still a board you
+/// recognise; and "untitled" last, which is the honest answer for one that is
+/// neither. The extension is dropped — `.mbrd` on every row of a list of
+/// nothing but `.mbrd` files is a column of noise.
+pub fn project_name(title: &str, path: Option<&Path>) -> String {
+    if !title.trim().is_empty() {
+        return title.to_string();
+    }
+    path.and_then(Path::file_stem)
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "untitled".into())
+}
 
 /// How wide the invisible grab strip along each edge is.
 ///
@@ -31,40 +95,40 @@ pub const TITLEBAR_HEIGHT: f32 = 34.0;
 /// only in principle.
 const RESIZE_GRAB: f32 = 5.0;
 
-/// The titlebar, or nothing at all where the compositor draws its own.
+/// The top bar. Always drawn; see the module note.
 ///
-/// Returns an `AnyElement` rather than branching inside a builder, because the
-/// two arms are genuinely different element types and erasing them here is
-/// cheaper than making the empty case pretend to be a titlebar.
+/// Returns an `AnyElement` because the right-hand side is present on some
+/// platforms and absent on others, and erasing the type here is cheaper than
+/// making the absent case pretend to be a row of buttons.
 pub fn render(view: &BoardView, window: &Window, cx: &mut Context<BoardView>) -> gpui::AnyElement {
-    if !matches!(window.window_decorations(), Decorations::Client { .. }) {
-        return div().into_any_element();
-    }
     let controls = window.window_controls();
+    let ours = buttons_are_ours(window);
     let theme = &view.theme;
-
-    let title = if view.doc.board.title.is_empty() {
-        "mbrd".to_string()
-    } else {
-        format!("{} — mbrd", view.doc.board.title)
-    };
 
     div()
         .id("titlebar")
         .flex()
         .items_center()
         .justify_between()
+        .gap(px(8.0))
         .h(px(TITLEBAR_HEIGHT))
         .flex_shrink_0()
-        .pl(px(14.0))
+        .pl(px(LEFT_INSET))
+        // Where the three buttons are ours they run to the window's edge, the
+        // way every titlebar's do. Where they are not, the bar needs an edge of
+        // its own on that side.
+        .when(!ours, |d| d.pr(px(12.0)))
         .bg(theme.chrome)
         .border_b_1()
         .border_color(theme.chrome_edge)
         .text_size(px(12.0))
         .text_color(theme.muted)
         // Dragging the bar moves the window, and a double-click maximises it.
-        // Both are conventions the compositor would have provided; a
-        // client-side titlebar that only looks like one is worse than none.
+        // Both are conventions the platform would otherwise have provided, and
+        // a bar of our own that only *looks* like one is worse than none: a
+        // window you cannot move is the failure this whole module exists to
+        // avoid. The switcher and the buttons stop this from firing under them
+        // by claiming the press themselves.
         .on_mouse_down(MouseButton::Left, |event, window, _cx| {
             if event.click_count == 2 {
                 window.zoom_window();
@@ -72,36 +136,215 @@ pub fn render(view: &BoardView, window: &Window, cx: &mut Context<BoardView>) ->
                 window.start_window_move();
             }
         })
-        .child(title)
+        // The board you have open, and the two ways to reach everything else.
+        // One group rather than three children of the bar, because the bar
+        // spreads its children apart and these three belong together.
         .child(
             div()
                 .flex()
                 .items_center()
-                .when(controls.minimize, |d| {
-                    d.child(control("minimise", "\u{2013}", theme.muted, cx, |window, _cx| {
-                        window.minimize_window()
-                    }))
-                })
-                .when(controls.maximize, |d| {
-                    d.child(control("maximise", "\u{25a1}", theme.muted, cx, |window, _cx| {
-                        window.zoom_window()
-                    }))
-                })
-                .child(control("close", "\u{00d7}", theme.accent, cx, |window, _cx| {
-                    window.remove_window()
-                })),
+                .gap(px(2.0))
+                .child(switcher_button(view, cx))
+                .child(reach(view, "commands", Command::Palette, Icon::Commands, cx))
+                .child(reach(view, "find", Command::Search, Icon::Find, cx)),
         )
+        .when(ours, |d| {
+            d.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .when(controls.minimize, |d| {
+                        d.child(control(
+                            "minimise",
+                            Icon::Minimise,
+                            theme.muted,
+                            theme.muted,
+                            cx,
+                            |_view, window, _cx| window.minimize_window(),
+                        ))
+                    })
+                    .when(controls.maximize, |d| {
+                        d.child(control(
+                            "maximise",
+                            Icon::Maximise,
+                            theme.muted,
+                            theme.muted,
+                            cx,
+                            |_view, window, _cx| window.zoom_window(),
+                        ))
+                    })
+                    .child(control(
+                        "close",
+                        Icon::Close,
+                        theme.muted,
+                        theme.accent,
+                        cx,
+                        // The board goes to disk before the window goes away.
+                        // This button does not route through the compositor, so
+                        // the `on_window_should_close` hook `main.rs` registers
+                        // never sees it — see `BoardView::flush`, which both
+                        // paths call and which is a no-op when the autosave
+                        // timer has already been round.
+                        |view, window, cx| {
+                            view.flush(cx);
+                            window.remove_window();
+                        },
+                    )),
+            )
+        })
         .into_any_element()
 }
 
+/// The project switcher: what board is open, and the way to open another.
+///
+/// Zed's, in shape and in placement, because the shape is right — the name of
+/// the thing you have open is the most useful label a title bar can carry, and
+/// making it the *button* means the way to swap it is where you were already
+/// looking. It opens the same [`crate::switcher::Switcher`] that `Ctrl P`
+/// does rather than a surface of its own; two board pickers that could
+/// disagree about what "recent" means is one more than this app needs.
+///
+/// **There used to be no dot, on purpose.** This button used to carry one to
+/// say the board had changes that were not on disk, which was the only
+/// unsaved-work indicator in the app. The board is written a second after the
+/// last change to it — see `BoardView::arm_autosave` — so that dot spent its
+/// life either absent or a second from being absent, and an indicator that is
+/// almost always off is one that has stopped being read by the time it means
+/// something.
+///
+/// The dot below is not that dot. It answers to `BoardView::save_failing`
+/// rather than to `unsaved()`, and a failing save is nothing like a second
+/// from being absent — it stands for as long as the disk keeps refusing the
+/// board, from a few seconds to the rest of the session, which is exactly the
+/// condition an indicator here can actually be read under. Off stays the
+/// ordinary state; this only lights up when it has something to say.
+fn switcher_button(view: &BoardView, cx: &mut Context<BoardView>) -> impl IntoElement {
+    let theme = view.theme;
+    let name = project_name(&view.doc.board.title, view.path.as_deref());
+    let failing = view.save_failing();
+
+    div()
+        .id("project")
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .px(px(8.0))
+        .py(px(3.0))
+        .rounded(px(5.0))
+        .text_color(theme.text)
+        .text_size(px(12.0))
+        .hover(|s| s.bg(theme.text.opacity(0.08)))
+        .active(|s| s.bg(theme.text.opacity(0.14)))
+        // Mouse-down rather than click, and before the bar's own handler gets
+        // it: the bar starts a window move on press, so a button that waited
+        // for the release would drag the window a pixel on the way to opening.
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _event, window, cx| {
+                cx.stop_propagation();
+                this.open_switcher(window, cx);
+            }),
+        )
+        // Says what the button is for rather than what it says, which is the
+        // one thing the label cannot: the name on it is the *board's*, and a
+        // board's name is no help to somebody wondering what pressing it does.
+        // While a save is failing that stops being the useful thing to say —
+        // the tooltip names the problem instead, since that is what anybody
+        // pausing over this button at that moment actually wants to know.
+        .when_else(
+            failing,
+            |d| d.tooltip(tip(theme, "save is failing", "check the disk and try again")),
+            |d| d.tooltip(tip(theme, Command::OpenBoard.label(), Command::OpenBoard.hint())),
+        )
+        .child(div().child(name))
+        // Only while `failed_at` stands — see `BoardView::save_failing`. A
+        // small accent dot rather than another line of text, because the
+        // status bar under the board already spelled out "could not save" in
+        // full when this began; the dot's whole job is to still be true after
+        // that line fades at `WARN_FOR`, which a save that is still failing
+        // easily outlasts.
+        .when(failing, |d| {
+            d.child(
+                div()
+                    .id("save-failing")
+                    .size(px(6.0))
+                    .rounded_full()
+                    .bg(theme.accent)
+                    .tooltip(tip(theme, "save is failing", "check the disk and try again")),
+            )
+        })
+        // The chevron a menu button has, which is what says this one opens
+        // something rather than merely reporting a name. Decorative rather
+        // than read — the board's own name beside it already says what this
+        // is — so it draws in `tertiary` rather than `muted`.
+        .child(icon(Icon::CaretDown, crate::icons::ICON_SM, theme.tertiary))
+}
+
+/// One of the two wordless buttons beside the switcher.
+///
+/// The command palette and the board search, which are the two things in this
+/// app that a keystroke was previously the only way to reach — and one of those
+/// keystrokes is a *double tap of Shift*, which is a lovely gesture and one
+/// nobody discovers by accident. A button is how somebody who has never read
+/// the roadmap finds out either exists.
+///
+/// Wordless because the bar is 34 tall and the board's name already lives on
+/// it; two more labels would push the name of the thing you are working on into
+/// the middle of the window. What replaces the words is the tooltip, and the
+/// tooltip carries the key — so the button is a way in for somebody who does
+/// not know the chord *and* the place they learn it, which is the only reason a
+/// button for something with a key is worth its room.
+///
+/// The command it runs, its name and its key all come from the one entry in
+/// `command.rs`. See that module's opening note: a second copy of a keystroke
+/// is a keystroke that will eventually be wrong.
+fn reach(
+    view: &BoardView,
+    id: &'static str,
+    command: Command,
+    mark: Icon,
+    cx: &mut Context<BoardView>,
+) -> impl IntoElement {
+    let theme = view.theme;
+
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(24.0))
+        .h(px(22.0))
+        .rounded(px(crate::theme::RADIUS_XS))
+        .hover(|s| s.bg(theme.text.opacity(0.08)))
+        .active(|s| s.bg(theme.text.opacity(0.14)))
+        .tooltip(tip(theme, command.label(), command.hint()))
+        // Mouse-down and stopped here, for the reason the switcher gives: the
+        // bar starts a window move on press, so a button that waited for the
+        // release would drag the window a pixel on the way to opening.
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _event, window, cx| {
+                cx.stop_propagation();
+                command.run(this, window, cx);
+            }),
+        )
+        .child(icon(mark, crate::icons::ICON_MD, theme.muted))
+}
+
+/// One of the three window buttons.
+///
+/// `mark` is what the picture is drawn in and `hover` is what the wash behind
+/// it is drawn in, and they are two arguments because on the close button they
+/// differ: every window in the world lights that one red, and none of them
+/// draws its cross red all the time.
 fn control(
     id: &'static str,
-    glyph: &'static str,
+    mark: Icon,
+    colour: gpui::Hsla,
     hover: gpui::Hsla,
     cx: &mut Context<BoardView>,
-    action: impl Fn(&mut Window, &mut App) + 'static,
+    action: impl Fn(&mut BoardView, &mut Window, &mut Context<BoardView>) + 'static,
 ) -> impl IntoElement {
-    let _ = cx;
     div()
         .id(id)
         .flex()
@@ -109,15 +352,17 @@ fn control(
         .justify_center()
         .w(px(44.0))
         .h(px(TITLEBAR_HEIGHT))
-        .text_size(px(14.0))
         .hover(move |s| s.bg(hover.opacity(0.18)))
         .active(move |s| s.bg(hover.opacity(0.34)))
         // Mouse-down rather than click, and it matters here: the bar itself
         // starts a window move on mouse-down, and an interactive child has to
         // claim the press before that happens or every button press would drag
         // the window a pixel first.
-        .on_mouse_down(MouseButton::Left, move |_event, window, cx| action(window, cx))
-        .child(glyph)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |view, _event, window, cx| action(view, window, cx)),
+        )
+        .child(icon(mark, crate::icons::ICON_MD, colour))
 }
 
 /// The eight invisible grab strips around the window.
@@ -214,4 +459,46 @@ pub fn resize_handles(window: &Window) -> Vec<gpui::AnyElement> {
     );
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_bar_names_the_board_by_what_somebody_called_it() {
+        let path = PathBuf::from("/a/kitchen.mbrd");
+        assert_eq!(project_name("Kitchen rebuild", Some(&path)), "Kitchen rebuild");
+    }
+
+    #[test]
+    fn a_board_never_titled_is_named_by_its_file() {
+        // Without the extension: a list of nothing but `.mbrd` files has a
+        // column of `.mbrd` in it, which tells you nothing.
+        let path = PathBuf::from("/a/kitchen.mbrd");
+        assert_eq!(project_name("", Some(&path)), "kitchen");
+        // And whitespace is not a title. Somebody who cleared the field left it
+        // untitled, whatever the string says.
+        assert_eq!(project_name("   ", Some(&path)), "kitchen");
+    }
+
+    #[test]
+    fn everything_the_bar_offers_can_say_what_it_does_and_what_key_does_it() {
+        // The three buttons at the top left are wordless or named after the
+        // board rather than after what they do, so the tooltip is the whole of
+        // what they say — and it is built out of the command table. An entry
+        // that lost its hint would leave a button that teaches nobody the key,
+        // which is the only reason a button for something with a key is here.
+        for command in [Command::OpenBoard, Command::Palette, Command::Search] {
+            assert!(!command.label().is_empty(), "{command:?} has no name to show");
+            assert!(!command.hint().is_empty(), "{} advertises no key", command.label());
+        }
+    }
+
+    #[test]
+    fn a_board_that_is_neither_says_so_rather_than_being_blank() {
+        // The state a fresh window is in. An empty button is a button nobody
+        // can see is a button.
+        assert_eq!(project_name("", None), "untitled");
+    }
 }

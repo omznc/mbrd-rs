@@ -27,6 +27,10 @@ pub const BOARD_TITLE_MAX: usize = 32;
 /// Past this many items a board stops being a board.
 pub const MAX_ITEMS: usize = 20_000;
 /// How many deleted items the bin keeps before the oldest fall out.
+///
+/// A ceiling on a thing that now lives only in memory and only until the app
+/// closes — see [`TrashEntry`] — so this bounds what one long session can hold
+/// on to rather than what a file may carry.
 pub const TRASH_LIMIT: usize = 60;
 /// Every entry costs a route to work out and a subpath to draw.
 pub const MAX_CONNECTIONS: usize = 2_000;
@@ -305,6 +309,16 @@ pub struct BoardSettings {
     /// that had them switched on with nothing between the cards.
     pub web: bool,
     pub hud: bool,
+    /// Whether a dragged card lines itself up with its neighbours, and draws a
+    /// rule to say what it lined up with. See [`crate::guides`].
+    ///
+    /// The sibling of `snap` and never on with it: a card cannot be on the
+    /// lattice and flush with its neighbour at the same time, so the grid wins
+    /// where both are asked for. Kept as its own flag rather than folded into
+    /// `snap` because the two are opposite tastes — one is for a board being
+    /// built to a measure, the other for a board being arranged by eye — and
+    /// somebody who wants neither has to be able to say so.
+    pub guides: bool,
     /// Only ever had one value. Kept because older files carry it.
     pub grid_style: String,
     /// World units between minor grid lines, before zoom quantisation.
@@ -333,6 +347,7 @@ impl Default for BoardSettings {
             snap: false,
             web: true,
             hud: false,
+            guides: true,
             grid_style: "dots".into(),
             grid_step: 64.0,
             mobile_columns: 6,
@@ -389,7 +404,11 @@ impl Default for MobileHeader {
 /// triple. This object comes out of a file somebody else wrote, and in the
 /// original a string that reached a stroke would be a string that reached the
 /// CSSOM. Modelling them as enums is how that stays true here.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// Not `Eq`, and the reason is [`label_at`](Self::label_at): where along a line
+/// its label sits is a fraction, and a fraction is the one thing here that is
+/// a measurement rather than a name.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ConnMeta {
     pub dir: ConnDir,
     pub style: ConnStyle,
@@ -397,13 +416,49 @@ pub struct ConnMeta {
     pub weight: ConnWeight,
     /// Whitespace collapsed, 60 characters.
     pub label: Option<String>,
+    /// Where the label sits along the line, from `0.0` at the first card to
+    /// `1.0` at the second. Measured along the line's own length rather than
+    /// across the gap, so it stays put as the line bends.
+    ///
+    /// Stored because it is a choice somebody made: the middle is where a
+    /// label goes when nobody has said, and it is the wrong place often enough
+    /// — over a card it crosses, on top of another line's label — that being
+    /// able to slide it is the difference between a label and a label you can
+    /// use.
+    pub label_at: f32,
+}
+
+/// Where a label sits when nobody has moved it.
+pub const LABEL_MIDDLE: f32 = 0.5;
+
+impl Default for ConnMeta {
+    fn default() -> Self {
+        Self {
+            dir: ConnDir::default(),
+            style: ConnStyle::default(),
+            color: ConnColor::default(),
+            weight: ConnWeight::default(),
+            label: None,
+            label_at: LABEL_MIDDLE,
+        }
+    }
 }
 
 impl ConnMeta {
     /// Whether this is a plain line. Defaults are omitted on the way out, not
     /// written, so an ordinary board's connections stay two-element arrays.
+    ///
+    /// Spelled out rather than compared against [`Self::default`] so that
+    /// `label_at` can be left out of it: with no label there is nothing at
+    /// that position, and a line that once carried a label somebody slid
+    /// should go back to being a two-element array when the words come off.
     pub fn is_default(&self) -> bool {
-        *self == Self::default()
+        let d = Self::default();
+        self.dir == d.dir
+            && self.style == d.style
+            && self.color == d.color
+            && self.weight == d.weight
+            && self.label.is_none()
     }
 }
 
@@ -417,6 +472,16 @@ macro_rules! named_enum {
         }
 
         impl $name {
+            /// Every value, in the order they are declared above.
+            ///
+            /// Generated from the same variant list that defines the enum, so
+            /// a value added to the format is in here the moment it exists.
+            /// That is the whole point of it being here rather than written
+            /// out again at each place that wants the set: a menu row and a
+            /// palette both build themselves by mapping over this, and neither
+            /// can fall behind what the format defines.
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+
             pub fn as_str(&self) -> &'static str {
                 match self { $(Self::$variant => $text),+ }
             }
@@ -465,8 +530,23 @@ impl Connection {
 
 /// One thing in the bin: the item as it was, and when it went in.
 ///
-/// A binned item keeps its asset. That is deliberate — a bin that cannot
-/// restore anything after a save is not a bin.
+/// **The bin lasts as long as the app is open and no longer.** It is not
+/// written to the file — see `mbrd::to_bytes`, which empties it on the way out
+/// — so nothing binned survives a save, and a board opened with one in it loses
+/// it the first time this app writes the file.
+///
+/// That is a retreat from what this section is in the format, and it is an
+/// honest one. A bin earns its keep by being a place you can take things back
+/// out of, and this app has no such place: `Del` bins, nothing unbins, and the
+/// only route back is undo. What was left was a section of the file that
+/// quietly kept every deleted photograph's bytes alive forever, priced as
+/// though a restore were coming. Undo is the recovery route, it works within a
+/// session and across a reopen — the ledger is written and the bytes a step
+/// still names are written with it — and it does not need this.
+///
+/// Kept in memory rather than deleted outright because `delete_selection` puts
+/// an item here in one move, and one place holding the item as it was is what
+/// makes that a single undo step rather than a small pile of bookkeeping.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrashEntry {
     pub item: Item,
@@ -597,22 +677,36 @@ impl Board {
         self.items.iter_mut().find(|it| it.id == id)
     }
 
-    /// Every asset hash the board still points at, live **or binned**.
+    /// Every asset hash a **live** card on this board points at.
     ///
-    /// This is the reference set the packer writes from, and getting it wrong
-    /// deletes somebody's photograph — so it deliberately unions both, and any
-    /// third place that can hold an item (an undo ledger, say) has to be added
-    /// here rather than checked separately at the call site.
+    /// This is the reference set the packer treats as required, and getting it
+    /// wrong deletes somebody's photograph — so any other place that can hold
+    /// an item and must survive a save has to be added here rather than
+    /// checked separately at the call site.
+    ///
+    /// The bin is deliberately **not** one of those places. It is a
+    /// within-a-session thing now — see [`TrashEntry`] — and its cards do not
+    /// reach the file at all, so requiring their bytes would be requiring bytes
+    /// for something nothing is going to read back. What a step of the undo
+    /// ledger still names is answered separately, by
+    /// [`BoardState::optional_hashes`](crate::state::BoardState::optional_hashes),
+    /// and that is what actually carries a deleted picture far enough for an
+    /// undo to find it.
     pub fn referenced_hashes(&self) -> Vec<String> {
-        let mut seen = Vec::new();
+        // A set for the dedup rather than a scan of what is already collected:
+        // this runs on the autosave timer, and on a board where every card
+        // carries a picture the scan was quadratic in the cards.
+        let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen: Vec<String> = Vec::new();
         let mut push = |hash: Option<&str>| {
             if let Some(h) = hash {
-                if !seen.iter().any(|s: &String| s == h) {
+                if !known.contains(h) {
+                    known.insert(h.to_string());
                     seen.push(h.to_string());
                 }
             }
         };
-        for item in self.items.iter().chain(self.trash.iter().map(|t| &t.item)) {
+        for item in &self.items {
             push(item.asset.as_ref().and_then(ItemAsset::hash));
             // `meta.cover` is an asset hash too — album art, or a video's
             // poster. Missing it here would drop the picture from the file

@@ -27,7 +27,7 @@
 //! plus enough of a long tail that an unrecognised file still arrives as a
 //! named card rather than as nothing. See the roadmap's Phase 3.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
@@ -57,6 +57,11 @@ pub struct Ready {
     pub name: String,
     /// A note's words, where the file is text rather than bytes.
     pub text: Option<String>,
+    /// Whether the file carries a sound track, where that could be read.
+    ///
+    /// `None` means nobody managed to look, which the card reads as "assume
+    /// there is sound" — see [`mbrd_core::sound`].
+    pub sound: Option<bool>,
 }
 
 impl Ready {
@@ -89,6 +94,13 @@ pub fn ready(name: &str, bytes: Vec<u8>) -> Ready {
     // idea of "text" turns out to be wrong about a particular file.
     let text = matches!(kind, ItemType::Note).then(|| words(&bytes)).flatten();
 
+    // Asked here rather than at the first play, because it is the difference
+    // between a video card wearing a mute button and not, and a card should not
+    // grow a control the first time it is pressed. Audio answers for itself and
+    // a still picture is silent by construction, so only video needs looking
+    // into — and that is a walk of the track list, not a decode.
+    let sound = matches!(kind, ItemType::Video).then(|| mbrd_core::sound::sniff(&bytes)).flatten();
+
     Ready {
         kind,
         described,
@@ -97,7 +109,67 @@ pub fn ready(name: &str, bytes: Vec<u8>) -> Ready {
         natural,
         name: name.to_string(),
         text,
+        sound,
     }
+}
+
+/// Everything a drop points at, as a list of files to read.
+///
+/// A folder brings what is *directly* in it and nothing deeper. Walking a tree
+/// is not something a drop should start: somebody who drops their home
+/// directory by accident should get a handful of cards and a shrug, not a board
+/// with a hundred thousand items on it.
+///
+/// Sorted, so that the block a folder arrives as is in the order the folder is
+/// in rather than in whatever order the filesystem happened to answer. That
+/// also makes the layout below reproducible, which is what lets the same drop
+/// twice look the same twice.
+///
+/// Off the drawing thread, please — see [`crate::board_view::BoardView::take_files`].
+/// A directory listing is a syscall per entry and the directory may be on a
+/// network mount.
+pub fn walk(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            files.extend(
+                std::fs::read_dir(path)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_file()),
+            );
+        } else {
+            files.push(path.clone());
+        }
+    }
+    files.sort();
+    files
+}
+
+/// How many cards wide a block of `count` of them is laid out to be.
+///
+/// Square-ish, so a folder of twenty photographs arrives as a block you can see
+/// rather than a stack you have to unpick.
+pub fn across(count: usize) -> f32 {
+    (count as f32).sqrt().ceil().max(1.0)
+}
+
+/// Where the `nth` card of a block goes, given the block's centre and width.
+///
+/// Split out from the placing so that a drop still arriving can work out where
+/// each card goes as it turns up, without knowing what the ones behind it are.
+/// That is the whole of what makes a folder land card by card rather than all
+/// at once — see [`crate::board_view::BoardView::take_files`].
+pub fn spot(at: mbrd_core::geometry::Point, across: f32, nth: usize) -> mbrd_core::geometry::Point {
+    let column = nth as f32 % across;
+    let row = (nth as f32 / across).floor();
+    let spread = ARRIVAL_SIZE * 1.1;
+    mbrd_core::geometry::point(
+        at.x + (column - (across - 1.0) / 2.0) * spread,
+        at.y - (row - (across - 1.0) / 2.0) * spread,
+    )
 }
 
 /// Build the card, centred where it was dropped.
@@ -117,6 +189,12 @@ pub fn card(ready: &Ready, id: String, at: mbrd_core::geometry::Point, z: f32) -
     if let Some(text) = &ready.text {
         item.meta.insert("text".into(), serde_json::Value::String(text.clone()));
     }
+    // A measurement, not a decision: it says what the file is, so it is written
+    // only where it was actually read and re-derivable if it ever is not.
+    if let Some(sound) = ready.sound {
+        mbrd_core::media::set_has_sound(&mut item, sound);
+    }
+
     item.asset = Some(ItemAsset::Embedded { hash: ready.hash.clone(), family: None });
     item
 }
@@ -424,6 +502,71 @@ mod tests {
         assert!(as_url("see https://example.invalid for more").is_none());
         assert!(as_url("https://").is_none());
         assert!(as_url("just a thought").is_none());
+    }
+
+    /// A directory this test owns, named after the test.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mbrd-import-test-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temporary directory");
+        dir
+    }
+
+    #[test]
+    fn a_folder_brings_what_is_in_it_and_not_what_is_under_it() {
+        let dir = scratch("one-level");
+        std::fs::write(dir.join("b.png"), b"?").unwrap();
+        std::fs::write(dir.join("a.png"), b"?").unwrap();
+        std::fs::create_dir(dir.join("deeper")).unwrap();
+        std::fs::write(dir.join("deeper/c.png"), b"?").unwrap();
+
+        let found = walk(std::slice::from_ref(&dir));
+        // Sorted, so the block a folder arrives as is in the folder's order
+        // rather than in whatever order the filesystem answered in.
+        assert_eq!(found, vec![dir.join("a.png"), dir.join("b.png")]);
+    }
+
+    #[test]
+    fn a_file_dropped_by_itself_is_taken_as_it_is() {
+        let dir = scratch("bare-file");
+        let file = dir.join("only.png");
+        std::fs::write(&file, b"?").unwrap();
+        assert_eq!(walk(std::slice::from_ref(&file)), vec![file]);
+        // A path that is neither is nobody's problem here: it becomes a file
+        // that cannot be read, which is a line in the status bar, not a panic.
+        assert_eq!(walk(&[dir.join("gone.png")]), vec![dir.join("gone.png")]);
+    }
+
+    #[test]
+    fn one_card_lands_on_the_point_it_was_dropped_at() {
+        let at = mbrd_core::geometry::point(120.0, -40.0);
+        let spot = spot(at, across(1), 0);
+        assert_eq!((spot.x, spot.y), (at.x, at.y));
+    }
+
+    #[test]
+    fn a_block_fills_across_before_it_fills_down() {
+        // Nine cards is three across, so the fourth starts the second row —
+        // left of the third and below the first.
+        let at = mbrd_core::geometry::point(0.0, 0.0);
+        let across = across(9);
+        assert_eq!(across, 3.0);
+        let (first, third, fourth) =
+            (spot(at, across, 0), spot(at, across, 2), spot(at, across, 3));
+        assert!(third.x > first.x && (third.y - first.y).abs() < 0.01);
+        // World y points up, so the row below is the lower number.
+        assert!((fourth.x - first.x).abs() < 0.01 && fourth.y < first.y);
+    }
+
+    #[test]
+    fn a_block_is_centred_on_where_it_was_dropped() {
+        let at = mbrd_core::geometry::point(500.0, 250.0);
+        let across = across(4);
+        let spots: Vec<_> = (0..4).map(|n| spot(at, across, n)).collect();
+        let mid_x = spots.iter().map(|s| s.x).sum::<f32>() / 4.0;
+        let mid_y = spots.iter().map(|s| s.y).sum::<f32>() / 4.0;
+        assert!((mid_x - at.x).abs() < 0.01, "{mid_x}");
+        assert!((mid_y - at.y).abs() < 0.01, "{mid_y}");
     }
 
     #[test]

@@ -22,7 +22,7 @@
 //! rebuilt — and is, whenever a board is closed.
 
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use mbrd_core::geometry::{Point as WorldPoint, Rect};
 use mbrd_core::model::{Board, ConnMeta, Connection};
@@ -46,6 +46,11 @@ const SETTLE_BUDGET: usize = 256;
 const MARGIN: f32 = 400.0;
 
 /// One line, ready to draw.
+///
+/// `Clone` for [`Wires::plan`]'s own sake: the steady-state cache hands back
+/// a clone of the last answer rather than the `Vec<Wire>` itself, since the
+/// caller owns whatever it does with the one it is given.
+#[derive(Clone)]
 pub struct Wire {
     pub a: String,
     pub b: String,
@@ -71,11 +76,32 @@ impl Wire {
         }
     }
 
-    /// The middle of the line, which is where a label goes.
-    pub fn middle(&self) -> WorldPoint {
+    /// Where this line's label sits.
+    ///
+    /// The middle unless somebody has slid it — see
+    /// [`ConnMeta::label_at`](mbrd_core::model::ConnMeta::label_at). Measured
+    /// along the line's own length, so a label stays the same distance into
+    /// the line as the line bends around whatever turns up between its cards.
+    pub fn label_spot(&self) -> WorldPoint {
+        self.at(self.meta.label_at).0
+    }
+
+    /// How far along the line a point is, from `0.0` to `1.0`.
+    ///
+    /// The inverse of [`Self::at`], and a real one rather than a near one: a
+    /// drag reads this from the pointer and writes it straight back into
+    /// `label_at`, so any disagreement between the two is a label that jumps
+    /// out from under the hand holding it.
+    pub fn how_far_along(&self, p: WorldPoint) -> f32 {
         match &self.line {
-            Line::Curve(rope) => rope.middle(),
-            Line::Around(path) => walk(path, 0.5).0,
+            // A rope's own parameter, which is what `at` takes. Its samples are
+            // evenly spaced in it, so one sample is one step whatever length of
+            // curve it happens to cover.
+            Line::Curve(rope) => nearest(rope.samples().as_slice(), p, false),
+            // A route is walked by length — see `walk` — so this is measured by
+            // length too. The wrong one of the two would drop a label dragged
+            // over an elbow's short arm half a line from the pointer.
+            Line::Around(path) => nearest(path, p, true),
         }
     }
 
@@ -90,6 +116,46 @@ impl Wire {
             Line::Around(path) => walk(path, t),
         }
     }
+}
+
+/// The fraction of the way along a polyline that lies nearest a point.
+///
+/// Nearest **on** the line, not nearest vertex. A route has a handful of
+/// vertices and nothing at all between them, so answering with one would let a
+/// label be dropped only onto the corners the line bends at.
+fn nearest(points: &[WorldPoint], p: WorldPoint, by_length: bool) -> f32 {
+    let step = |a: WorldPoint, b: WorldPoint| if by_length { span_between(a, b) } else { 1.0 };
+    let total: f32 = points.windows(2).map(|w| step(w[0], w[1])).sum();
+    if total <= f32::EPSILON {
+        return mbrd_core::model::LABEL_MIDDLE;
+    }
+    let mut run = 0.0;
+    let mut best = (f32::MAX, mbrd_core::model::LABEL_MIDDLE);
+    for pair in points.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let (dx, dy) = (b.x - a.x, b.y - a.y);
+        let square = dx * dx + dy * dy;
+        // Where along this one segment the point falls, clamped to its ends —
+        // the pointer is wherever the hand is, which includes a long way off
+        // the line entirely.
+        let t = if square <= f32::EPSILON {
+            0.0
+        } else {
+            (((p.x - a.x) * dx + (p.y - a.y) * dy) / square).clamp(0.0, 1.0)
+        };
+        let foot = WorldPoint { x: a.x + dx * t, y: a.y + dy * t };
+        let away = span_between(foot, p);
+        if away < best.0 {
+            best = (away, (run + step(a, b) * t) / total);
+        }
+        run += step(a, b);
+    }
+    best.1
+}
+
+/// How far apart two points are.
+fn span_between(a: WorldPoint, b: WorldPoint) -> f32 {
+    ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt()
 }
 
 /// How far a point is from a segment.
@@ -159,13 +225,56 @@ const RESHAPING: Duration = Duration::from_millis(180);
 struct Cached {
     a: Rect,
     b: Rect,
+    /// The board this shape was worked out against.
+    ///
+    /// The two boxes above say where its own cards were, and for a long time
+    /// that was the whole of the freshness test — which quietly assumed that
+    /// the only thing that can change a line is one of the two things it is
+    /// tied to. It is not: drop a card across the middle of a settled line and
+    /// nothing about either end has moved, so the line went on being drawn
+    /// straight through the new card until somebody nudged one of its ends.
+    at: u64,
     line: Line,
-    /// The shape this one replaced, and when — while it is still on screen.
+    /// The shape this one replaced, and how far the new one has come in,
+    /// `0.0..=1.0` — while it is still on screen.
     ///
     /// Only ever the plain curve, because the plain curve is what was actually
     /// being drawn during the gesture. Keeping the *routed* line it had before
     /// the drag would crossfade from a shape nobody has seen since the press.
-    leaving: Option<(Line, Instant)>,
+    ///
+    /// The progress is advanced by [`Wires::tick`] from the frame's own `dt`
+    /// rather than read off the wall clock at plan time. Reading `Instant`
+    /// here used to mean reduced motion's one enormous `dt` — which does not
+    /// touch a clock — could not land a reshape in a single frame the way
+    /// every other animation on the board does; this was the one straggler
+    /// still waiting on real time to actually pass.
+    leaving: Option<(Line, f32)>,
+}
+
+/// Everything a call to [`Wires::plan`] answered, and everything its answer
+/// depended on.
+///
+/// `plan` used to redo the whole of its work — the item scan, the routing,
+/// the sort — on every single frame, whether or not a board had done
+/// anything since the last one. Most frames it had not: a card sitting still
+/// asks nothing of this file. What is here is the steady state's entire
+/// answer, kept so it can be handed back instead of worked out again the
+/// moment nothing that could have changed it has.
+struct Snapshot {
+    /// The board this plan was worked out against. See [`Cached::at`] for why
+    /// this is the whole board's revision rather than anything finer.
+    revision: u64,
+    /// The window the plan chose an order and a set of visible lines for.
+    visible: Rect,
+    /// One flag per connection, in `board.connections` order, from the same
+    /// `lit` the caller passed in that frame.
+    ///
+    /// Selection and hover are not carried on the board, so they are not
+    /// covered by `revision` — this is the one input `plan` takes that a
+    /// board revision does not already answer for. Checked by calling `lit`
+    /// again rather than by hashing the closure, which cannot be done at all.
+    lit: Vec<bool>,
+    wires: Vec<Wire>,
 }
 
 #[derive(Default)]
@@ -174,6 +283,22 @@ pub struct Wires {
     /// Whether any line was mid-change last time this ran, so the frame clock
     /// knows to keep asking.
     fading: bool,
+    /// Whether the last pass left routing work for a later frame because
+    /// [`SETTLE_BUDGET`] ran out with more of the board still waiting its
+    /// turn.
+    ///
+    /// Tracked apart from `fading`: a line waiting on the budget has nothing
+    /// to crossfade yet, but the plan is not finished either, and a frame
+    /// where nothing else changed still has to keep going until it is —
+    /// otherwise the budget would let a board arriving at a bend simply stop
+    /// partway there.
+    catching_up: bool,
+    /// The last full answer, and what it was worked out against — see
+    /// [`Snapshot`]. `None` whenever the last pass could not vouch for its own
+    /// staleness test, which is any pass made while `catching_up` or `fading`
+    /// was left true: a cached answer nobody will admit is stale is worse
+    /// than no cache at all.
+    cache: Option<Snapshot>,
 }
 
 /// Two boxes are the same box if nothing about them moved a thousandth.
@@ -189,6 +314,9 @@ impl Wires {
     /// is about to mean something else.
     pub fn forget(&mut self) {
         self.settled.clear();
+        self.cache = None;
+        self.fading = false;
+        self.catching_up = false;
     }
 
     /// How many lines are remembered. For the tests, which assert on when the
@@ -203,6 +331,27 @@ impl Wires {
         self.fading
     }
 
+    /// Bring every crossfade in progress `dt` seconds nearer done.
+    ///
+    /// Called from `BoardView::advance` with the frame's own `dt` — see
+    /// [`Cached::leaving`] for the bug this replaced: reading `Instant` at
+    /// plan time meant reduced motion's one enormous `dt`, which never
+    /// touches a clock, could not land a reshape in a single frame the way
+    /// every other animation on the board does. Guarded on `self.fading` so
+    /// the ordinary frame, where nothing is crossfading, costs one comparison
+    /// rather than a walk of every settled line.
+    pub fn tick(&mut self, dt: f32) {
+        if !self.fading || dt <= 0.0 {
+            return;
+        }
+        let step = dt / RESHAPING.as_secs_f32();
+        for cached in self.settled.values_mut() {
+            if let Some((_, t)) = &mut cached.leaving {
+                *t = (*t + step).min(1.0);
+            }
+        }
+    }
+
     /// What to draw this frame.
     ///
     /// `settled` is false while a gesture is in flight, and is the whole of the
@@ -212,9 +361,19 @@ impl Wires {
     /// `obstacles` is asked about the neighbourhood of one line at a time
     /// rather than handed the board, so the cost of a line is the cost of what
     /// is near it — the spatial index is on the other side of that closure.
+    ///
+    /// `revision` is what tells a settled line that the board it was worked
+    /// out against is not the board any more. It is deliberately the whole
+    /// board's revision rather than anything finer: a line does not know which
+    /// cards it would have to watch, since the set of cards that could get in
+    /// its way is exactly what the router works out. Asking again is cheap —
+    /// `route::line` tests the plain curve first and only searches when
+    /// something is genuinely across it — and it is bounded by
+    /// [`SETTLE_BUDGET`] either way.
     pub fn plan(
         &mut self,
         board: &Board,
+        revision: u64,
         visible: Rect,
         settled: bool,
         lit: impl Fn(&Connection) -> bool,
@@ -222,7 +381,33 @@ impl Wires {
     ) -> Vec<Wire> {
         if board.connections.is_empty() {
             self.settled.clear();
+            self.cache = None;
             return Vec::new();
+        }
+
+        // Steady state: the board has not moved, the window has not moved,
+        // nothing selected or hovered has changed, and there is no unfinished
+        // business — a route still waiting on the budget, or a shape still
+        // crossfading — that has to keep running to make progress on its own.
+        // Everything below this line is what cost nine hundred microseconds a
+        // frame on a full board of lines that had not changed since the frame
+        // before: the item scan, the hashing, the sort, the routing. None of
+        // it has anything new to say, so it is not run — the last answer is
+        // cloned instead.
+        //
+        // Cheap checks first, so a board that is genuinely moving — where
+        // this can never pay off — does not pay for the `lit` walk below to
+        // find that out.
+        if settled && !self.fading && !self.catching_up {
+            if let Some(cache) = &self.cache {
+                let still = cache.revision == revision
+                    && same(&cache.visible, &visible)
+                    && board.connections.len() == cache.lit.len()
+                    && board.connections.iter().zip(cache.lit.iter()).all(|(c, &was)| lit(c) == was);
+                if still {
+                    return cache.wires.clone();
+                }
+            }
         }
 
         // Every card a line names, and where it is. One walk, because a `find`
@@ -257,45 +442,56 @@ impl Wires {
         let room = visible.inflate(MARGIN);
         let middle = visible.centre();
         // Nearest the middle of the window first, so that if the budget runs
-        // out it runs out at the edges.
-        let mut order: Vec<usize> =
-            (0..live.len()).filter(|n| span(&live[*n].1, &live[*n].2).intersects(&room)).collect();
-        order.sort_by(|p, q| {
-            let d = |n: usize| {
+        // out it runs out at the edges. The distance is worked out once per
+        // line here rather than inside the comparator below — a comparator
+        // recomputes it on every pair it is asked about, which for a sort is
+        // several times per line rather than once.
+        let mut order: Vec<(f32, usize)> = (0..live.len())
+            .filter(|&n| span(&live[n].1, &live[n].2).intersects(&room))
+            .map(|n| {
                 let c = span(&live[n].1, &live[n].2).centre();
-                (c.x - middle.x).powi(2) + (c.y - middle.y).powi(2)
-            };
-            d(*p).total_cmp(&d(*q))
-        });
+                ((c.x - middle.x).powi(2) + (c.y - middle.y).powi(2), n)
+            })
+            .collect();
+        order.sort_by(|p, q| p.0.total_cmp(&q.0));
 
-        let now = Instant::now();
         let mut spent = 0;
         let mut fading = false;
         let mut out = Vec::with_capacity(order.len());
-        for n in order {
+        for (_, n) in order {
             let (conn, a, b) = &live[n];
             let key = (conn.a.clone(), conn.b.clone());
             let (line, leaving) = match self.settled.get_mut(&key) {
-                Some(had) if same(&had.a, a) && same(&had.b, b) => {
+                Some(had) if same(&had.a, a) && same(&had.b, b) && had.at == revision => {
                     // Still the shape it was. The only thing that can have
                     // changed since last frame is how far through its change
-                    // it is, and reaching the end of that is what takes the
-                    // old shape off the books.
+                    // it is — advanced by `Wires::tick`, not by reading the
+                    // clock here — and reaching the end of that is what takes
+                    // the old shape off the books.
                     let through = match &had.leaving {
-                        Some((_, since)) => {
-                            let t = since.elapsed().div_duration_f32(RESHAPING);
-                            if t >= 1.0 {
-                                had.leaving = None;
-                                None
-                            } else {
-                                Some(t)
-                            }
+                        Some((_, t)) if *t >= 1.0 => {
+                            had.leaving = None;
+                            None
                         }
+                        Some((_, t)) => Some(*t),
                         None => None,
                     };
                     let leaving =
                         through.and_then(|t| had.leaving.as_ref().map(|(was, _)| (was.clone(), t)));
                     (had.line.clone(), leaving)
+                }
+                // Its own ends have not moved; the board around it has. Worth
+                // asking the router again, but there is no budget for it this
+                // frame — so what is on screen stays on screen. A line whose
+                // cards are both exactly where they were, snapping straight
+                // because something was dropped somewhere else, would be a
+                // worse answer than a bend that is one frame out of date.
+                Some(had)
+                    if same(&had.a, a)
+                        && same(&had.b, b)
+                        && (!settled || spent >= SETTLE_BUDGET) =>
+                {
+                    (had.line.clone(), None)
                 }
                 _ if !settled || spent >= SETTLE_BUDGET => {
                     // Trailing: the plain curve, with nothing asked about what
@@ -312,22 +508,33 @@ impl Wires {
                     //
                     // Only the routing arm below fills the cache, which is
                     // exactly what makes this the right question to ask.
-                    let known = had.is_some();
+                    let was = had.map(|c| c.line.clone());
+                    let known = was.is_some();
                     spent += 1;
                     let walls: Vec<Rect> = obstacles(span(a, b).inflate(MARGIN))
                         .into_iter()
                         .filter(|r| !same(r, a) && !same(r, b))
                         .collect();
                     let line = route::line(a, b, &walls);
-                    // Only a detour is a visible change. A settle that produces
-                    // the plain curve produces exactly what was already being
+                    // Only a detour is a visible change, and only a detour this
+                    // line was not already drawing. A settle that produces the
+                    // plain curve produces exactly what was already being
                     // drawn, and crossfading a shape with itself would be two
-                    // half-strength lines for a fifth of a second.
-                    let leaving = (known && matches!(line, Line::Around(_)))
-                        .then(|| (Line::Curve(Rope::auto(*a, *b)), now));
+                    // half-strength lines for a fifth of a second — which is
+                    // what every line on the board would now do on every edit,
+                    // since an edit is what sends them all back through here.
+                    let leaving =
+                        (known && was.as_ref() != Some(&line) && matches!(line, Line::Around(_)))
+                            .then(|| (Line::Curve(Rope::auto(*a, *b)), 0.0));
                     self.settled.insert(
                         key,
-                        Cached { a: *a, b: *b, line: line.clone(), leaving: leaving.clone() },
+                        Cached {
+                            a: *a,
+                            b: *b,
+                            at: revision,
+                            line: line.clone(),
+                            leaving: leaving.clone(),
+                        },
                     );
                     (line, leaving.map(|(was, _)| (was, 0.0)))
                 }
@@ -343,6 +550,15 @@ impl Wires {
             });
         }
         self.fading = fading;
+        // Whether the budget ran out with `settled` true — a gesture ending
+        // is `!settled`, which is the ordinary trailing curve and never
+        // "waiting", so only a genuinely exhausted budget counts. A pass that
+        // used every last bit of it and still finished everything is
+        // mistaken for one more frame of catching up than it needed; the
+        // alternative — checking whether anything was actually deferred — is
+        // the same walk over `self.settled` this function just did the work
+        // to avoid, so a slightly late all-clear is the cheaper of the two.
+        self.catching_up = settled && spent >= SETTLE_BUDGET;
 
         // Anything whose line was deleted, or whose cards are gone, stops being
         // remembered. Without this the cache is a leak with the same lifetime
@@ -356,6 +572,19 @@ impl Wires {
         // Lit lines last, so that what a selected card is joined to is drawn
         // over the lines it is not.
         out.sort_by_key(|w| w.lit);
+
+        // Only a plan that is not itself mid-change is one whose freshness
+        // test — see [`Snapshot`] — can be trusted by a future frame. A plan
+        // taken while still fading or still catching up is stale by
+        // construction the moment it is produced, and caching it would only
+        // give a later frame a wrong reason to stop redoing this work.
+        self.cache = (settled && !self.fading && !self.catching_up).then(|| Snapshot {
+            revision,
+            visible,
+            lit: board.connections.iter().map(&lit).collect(),
+            wires: out.clone(),
+        });
+
         out
     }
 }
@@ -418,8 +647,17 @@ mod tests {
         Rect::new(-10_000.0, -10_000.0, 10_000.0, 10_000.0)
     }
 
+    /// One pass, at a revision the caller chooses.
+    ///
+    /// The revision is the test's way of saying "the board changed", which in
+    /// the app is `BoardState`'s own counter — a plain `Board` has none, so
+    /// every test that mutates one has to bump this by hand.
+    fn plan_at(wires: &mut Wires, board: &Board, revision: u64, settled: bool) -> Vec<Wire> {
+        wires.plan(board, revision, everything(), settled, |_| false, |_| Vec::new())
+    }
+
     fn plan(wires: &mut Wires, board: &Board, settled: bool) -> Vec<Wire> {
-        wires.plan(board, everything(), settled, |_| false, |_| Vec::new())
+        plan_at(wires, board, 1, settled)
     }
 
     #[test]
@@ -438,6 +676,7 @@ mod tests {
         let asked = std::cell::Cell::new(0);
         let out = wires.plan(
             &board,
+            1,
             everything(),
             false,
             |_| false,
@@ -452,17 +691,18 @@ mod tests {
     }
 
     #[test]
-    fn a_line_survives_everything_except_its_own_ends_moving() {
-        let mut board = board_with(&[(0.0, 0.0), (600.0, 0.0), (0.0, 400.0)], &[(0, 1)]);
+    fn a_settled_line_is_not_worked_out_again_for_nothing() {
+        // The performance rule: a frame on a board where nothing has happened
+        // asks the router nothing at all.
+        let board = board_with(&[(0.0, 0.0), (600.0, 0.0), (0.0, 400.0)], &[(0, 1)]);
         let mut wires = Wires::default();
         plan(&mut wires, &board, true);
         assert_eq!(wires.len(), 1);
 
-        // A card that is not one of the two ends moved. The line stands.
-        board.items[2].x = 900.0;
         let asked = std::cell::Cell::new(0);
         wires.plan(
             &board,
+            1,
             everything(),
             true,
             |_| false,
@@ -472,20 +712,43 @@ mod tests {
             },
         );
         assert_eq!(asked.get(), 0, "a line was worked out again for nothing");
+    }
 
-        // An end moves: worked out again, once.
-        board.items[1].x = 700.0;
-        wires.plan(
-            &board,
-            everything(),
-            true,
-            |_| false,
-            |_| {
-                asked.set(asked.get() + 1);
-                Vec::new()
-            },
-        );
-        assert_eq!(asked.get(), 1);
+    #[test]
+    fn a_card_dropped_across_a_settled_line_makes_it_think_again() {
+        // This used to assert the opposite, and the opposite was a bug you
+        // could see: put a third card down on top of a line between two
+        // others and the line went on running straight through it until one
+        // of its own ends was nudged. Neither end had moved, so nothing about
+        // the line's own geometry had changed — which is exactly why the
+        // freshness test could not be about its own geometry alone.
+        let mut board = board_with(&[(0.0, 0.0), (900.0, 0.0), (0.0, 400.0)], &[(0, 1)]);
+        let mut wires = Wires::default();
+        let out = plan_at(&mut wires, &board, 1, true);
+        assert!(matches!(out[0].line, Line::Curve(_)), "nothing is in the way yet");
+
+        // The third card lands on the line. Its own two ends have not moved.
+        board.items[2].x = 450.0;
+        board.items[2].y = 0.0;
+        let wall = Rect::centred(450.0, 0.0, 220.0, 500.0);
+        let out = wires.plan(&board, 2, everything(), true, |_| false, |_| vec![wall]);
+        assert!(matches!(out[0].line, Line::Around(_)), "it stayed drawn through the card");
+    }
+
+    #[test]
+    fn a_line_whose_shape_did_not_change_does_not_crossfade_when_the_board_does() {
+        // Every line on the board goes back through the router on any edit,
+        // so the "has it changed shape" test has to be about the shape and
+        // not merely about having been asked — or an edit anywhere would set
+        // every line on the board crossfading with itself.
+        let board = board_with(&[(0.0, 0.0), (900.0, 0.0)], &[(0, 1)]);
+        let wall = Rect::centred(450.0, 0.0, 220.0, 500.0);
+        let mut wires = Wires::default();
+        wires.plan(&board, 1, everything(), true, |_| false, |_| vec![wall]);
+        let out = wires.plan(&board, 2, everything(), true, |_| false, |_| vec![wall]);
+        assert!(matches!(out[0].line, Line::Around(_)));
+        assert!(out[0].leaving.is_none(), "it crossfaded out of the shape it already was");
+        assert!(!wires.fading());
     }
 
     #[test]
@@ -493,7 +756,7 @@ mod tests {
         let board = board_with(&[(0.0, 0.0), (900.0, 0.0)], &[(0, 1)]);
         let wall = Rect::centred(450.0, 0.0, 220.0, 500.0);
         let mut wires = Wires::default();
-        let out = wires.plan(&board, everything(), true, |_| false, |_| vec![wall]);
+        let out = wires.plan(&board, 1, everything(), true, |_| false, |_| vec![wall]);
         assert!(matches!(out[0].line, Line::Around(_)), "a rope was drawn through a card");
     }
 
@@ -509,18 +772,18 @@ mod tests {
         // The board, open and settled. This is what puts the line in the cache
         // — the trailing arm never does — and a board cannot be opened
         // half-way through somebody's drag.
-        wires.plan(&board, everything(), true, |_| false, |_| vec![wall]);
+        wires.plan(&board, 1, everything(), true, |_| false, |_| vec![wall]);
 
         // A drag: the ends move, nothing is routed, and the plain curve trails.
         board.items[1].x = 901.0;
-        let out = wires.plan(&board, everything(), false, |_| false, |_| vec![wall]);
+        let out = wires.plan(&board, 2, everything(), false, |_| false, |_| vec![wall]);
         assert!(matches!(out[0].line, Line::Curve(_)), "it routed during a gesture");
         assert!(out[0].leaving.is_none(), "nothing has changed shape yet");
 
         // The release. Now it routes, and the curve it is replacing is still
         // there to fade out of.
         board.items[1].x = 902.0;
-        let out = wires.plan(&board, everything(), true, |_| false, |_| vec![wall]);
+        let out = wires.plan(&board, 3, everything(), true, |_| false, |_| vec![wall]);
         assert!(matches!(out[0].line, Line::Around(_)));
         let Some((was, through)) = &out[0].leaving else {
             panic!("the elbow appeared with nothing to come out of");
@@ -531,6 +794,29 @@ mod tests {
     }
 
     #[test]
+    fn reduced_motion_lands_a_reshape_in_a_single_tick() {
+        // The bug this replaced: the crossfade used to read `Instant::elapsed`,
+        // so reduced motion's one enormous `dt` — which never touches a clock
+        // — could not land it instantly the way every other animation on the
+        // board does. Ticking once with a `dt` far larger than `RESHAPING` is
+        // exactly what `BoardView::advance` does under reduced motion, and it
+        // has to be enough on its own, in one call, for the very next `plan`.
+        let mut board = board_with(&[(0.0, 0.0), (900.0, 0.0)], &[(0, 1)]);
+        let wall = Rect::centred(450.0, 0.0, 220.0, 500.0);
+        let mut wires = Wires::default();
+        wires.plan(&board, 1, everything(), true, |_| false, |_| vec![wall]);
+        board.items[1].x = 901.0;
+        wires.plan(&board, 2, everything(), false, |_| false, |_| vec![wall]);
+        board.items[1].x = 902.0;
+        wires.plan(&board, 3, everything(), true, |_| false, |_| vec![wall]);
+        assert!(wires.fading(), "set up wrong: nothing is crossfading");
+
+        wires.tick(10.0);
+        let out = wires.plan(&board, 3, everything(), true, |_| false, |_| vec![wall]);
+        assert!(out[0].leaving.is_none(), "reduced motion did not land the reshape in one tick");
+    }
+
+    #[test]
     fn a_line_opened_already_bent_does_not_crossfade_out_of_nothing() {
         // Opening a board routes every line on the first pass. There is no
         // previous frame for those to have come from, and fading them in from
@@ -538,7 +824,7 @@ mod tests {
         let board = board_with(&[(0.0, 0.0), (900.0, 0.0)], &[(0, 1)]);
         let wall = Rect::centred(450.0, 0.0, 220.0, 500.0);
         let mut wires = Wires::default();
-        let out = wires.plan(&board, everything(), true, |_| false, |_| vec![wall]);
+        let out = wires.plan(&board, 1, everything(), true, |_| false, |_| vec![wall]);
         assert!(matches!(out[0].line, Line::Around(_)));
         assert!(out[0].leaving.is_none(), "it faded in on a board that just opened");
         assert!(!wires.fading());
@@ -551,11 +837,11 @@ mod tests {
         // twice at half strength for a fifth of a second.
         let mut board = board_with(&[(0.0, 0.0), (900.0, 0.0)], &[(0, 1)]);
         let mut wires = Wires::default();
-        wires.plan(&board, everything(), true, |_| false, |_| Vec::new());
+        wires.plan(&board, 1, everything(), true, |_| false, |_| Vec::new());
         board.items[1].x = 901.0;
-        wires.plan(&board, everything(), false, |_| false, |_| Vec::new());
+        wires.plan(&board, 2, everything(), false, |_| false, |_| Vec::new());
         board.items[1].x = 902.0;
-        let out = wires.plan(&board, everything(), true, |_| false, |_| Vec::new());
+        let out = wires.plan(&board, 3, everything(), true, |_| false, |_| Vec::new());
         assert!(matches!(out[0].line, Line::Curve(_)));
         assert!(out[0].leaving.is_none());
     }
@@ -574,7 +860,7 @@ mod tests {
         let board = board_with(&[(9000.0, 9000.0), (9600.0, 9000.0)], &[(0, 1)]);
         let mut wires = Wires::default();
         let window = Rect::new(-800.0, -450.0, 800.0, 450.0);
-        assert!(wires.plan(&board, window, true, |_| false, |_| Vec::new()).is_empty());
+        assert!(wires.plan(&board, 1, window, true, |_| false, |_| Vec::new()).is_empty());
     }
 
     #[test]
@@ -593,9 +879,88 @@ mod tests {
             lit: false,
             leaving: None,
         };
-        let mid = wire.middle();
+        let mid = wire.at(0.5).0;
         assert!((mid.x - 10.0).abs() < 0.01, "{mid:?}");
         assert!((mid.y - 490.0).abs() < 1.0, "{mid:?}");
+    }
+
+    /// An L with one very short arm, so that "halfway along" and "at the
+    /// corner" are different answers and a test can tell which one it got.
+    fn elbow() -> Wire {
+        Wire {
+            a: "a".into(),
+            b: "b".into(),
+            line: Line::Around(vec![
+                WorldPoint { x: 0.0, y: 0.0 },
+                WorldPoint { x: 10.0, y: 0.0 },
+                WorldPoint { x: 10.0, y: 990.0 },
+            ]),
+            meta: ConnMeta::default(),
+            lit: false,
+            leaving: None,
+        }
+    }
+
+    #[test]
+    fn a_label_nobody_has_moved_sits_where_the_middle_is() {
+        let wire = elbow();
+        assert_eq!(wire.label_spot(), wire.at(mbrd_core::model::LABEL_MIDDLE).0);
+    }
+
+    #[test]
+    fn a_label_slid_to_one_end_sits_on_that_end() {
+        let mut wire = elbow();
+        wire.meta.label_at = 0.0;
+        let at = wire.label_spot();
+        assert!(at.x.abs() < 0.01 && at.y.abs() < 0.01, "{at:?}");
+
+        wire.meta.label_at = 1.0;
+        let at = wire.label_spot();
+        assert!((at.x - 10.0).abs() < 0.01 && (at.y - 990.0).abs() < 0.01, "{at:?}");
+    }
+
+    #[test]
+    fn where_a_label_was_dropped_is_where_it_is_picked_up_from() {
+        // The drag reads `how_far_along` and writes it straight back into
+        // `label_at`, so the two have to agree within a sample: a label that
+        // jumped a little every time it was grabbed would be unusable.
+        let mut wire = elbow();
+        for want in [0.1, 0.25, 0.5, 0.75, 0.9] {
+            wire.meta.label_at = want;
+            let back = wire.how_far_along(wire.label_spot());
+            assert!((back - want).abs() < 0.05, "{want} came back as {back}");
+        }
+    }
+
+    #[test]
+    fn a_label_dragged_past_either_end_of_a_line_stops_at_it() {
+        // The pointer goes wherever the hand goes, including a long way off
+        // the line. What comes back is still somewhere on the line.
+        let wire = elbow();
+        let far = wire.how_far_along(WorldPoint { x: -5000.0, y: -5000.0 });
+        assert_eq!(far, 0.0);
+        let far = wire.how_far_along(WorldPoint { x: 5000.0, y: 5000.0 });
+        assert_eq!(far, 1.0);
+    }
+
+    #[test]
+    fn a_label_on_a_line_of_no_length_does_not_divide_by_it() {
+        let mut wire = elbow();
+        wire.line = Line::Around(vec![WorldPoint { x: 7.0, y: 7.0 }; 3]);
+        let back = wire.how_far_along(WorldPoint { x: 100.0, y: 0.0 });
+        assert_eq!(back, mbrd_core::model::LABEL_MIDDLE);
+    }
+
+    #[test]
+    fn a_label_measured_along_an_elbow_goes_by_length_and_not_by_corners() {
+        // Two thirds of the way along an L whose long arm is ninety-nine
+        // hundredths of it is two thirds of the way *up the long arm* — not
+        // two vertices in, which on a routed line means at the corner.
+        let wire = elbow();
+        let at = wire.at(2.0 / 3.0).0;
+        assert!((at.x - 10.0).abs() < 0.01, "{at:?}");
+        // Six hundred and sixty-six along, ten of which the short arm spent.
+        assert!((at.y - 656.67).abs() < 0.5, "{at:?}");
     }
 
     #[test]
@@ -603,7 +968,7 @@ mod tests {
         let board = board_with(&[(0.0, 0.0), (600.0, 0.0)], &[(0, 1)]);
         let mut wires = Wires::default();
         let out = plan(&mut wires, &board, true);
-        let mid = out[0].middle();
+        let mid = out[0].label_spot();
         assert!(out[0].near(mid, 4.0));
         assert!(!out[0].near(WorldPoint { x: mid.x, y: mid.y + 400.0 }, 4.0));
     }

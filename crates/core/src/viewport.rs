@@ -21,10 +21,25 @@ use crate::geometry::{point, Point, Rect};
 /// stores a **raw scale**, and a reader that multiplies it by a hundred to get
 /// the percentage is making an assumption that is only accidentally true.
 pub const BASE_ZOOM: f32 = 1.0;
-/// 10%, as printed.
-pub const MIN_ZOOM: f32 = 0.1 * BASE_ZOOM;
-/// 500%, as printed.
-pub const MAX_ZOOM: f32 = 5.0 * BASE_ZOOM;
+/// The ends of the zoom range, which are far enough apart to be no end at all.
+///
+/// A millionfold between them: a screenful at the floor spans some six million
+/// world units, which is three hundred times the largest card the model allows
+/// ([`MAX_SIZE`](crate::model::MAX_SIZE)), and a hundred-unit card at the
+/// ceiling is a wall of colour twenty-five thousand pixels across. Nobody
+/// reaches either by scrolling.
+///
+/// They are limits rather than nothing at all, and the reason is arithmetic
+/// rather than taste. Everything here is `f32`, and `to_screen` multiplies a
+/// world distance by the zoom: past these the products stop being separable at
+/// the scale of a pixel, and a board that cannot tell two neighbouring cards
+/// apart has not zoomed in, it has broken. Powers of two, so the log-space
+/// spring that drives the camera lands on them exactly.
+///
+/// 0.024%, as printed.
+pub const MIN_ZOOM: f32 = BASE_ZOOM / 4096.0;
+/// 25600%, as printed.
+pub const MAX_ZOOM: f32 = 256.0 * BASE_ZOOM;
 
 /// How big a view is, in screen pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -219,6 +234,17 @@ mod tests {
         v.fit(Some(Rect::new(-50.0, -50.0, 50.0, 50.0)), 80.0, BASE_ZOOM);
         assert_eq!(v.pan, point(0.0, 0.0));
         assert_eq!(v.zoom, BASE_ZOOM);
+    }
+
+    #[test]
+    fn a_board_far_larger_than_the_window_still_fits_inside_it() {
+        // A million units across. The old ten-percent floor could frame six
+        // thousand of them and then stop, which is the whole reason the ends
+        // of the range moved.
+        let mut v = vp();
+        v.fit(Some(Rect::new(-500_000.0, -500_000.0, 500_000.0, 500_000.0)), 80.0, MAX_ZOOM);
+        assert!(v.zoom > MIN_ZOOM, "it bottomed out at {}", v.zoom);
+        assert!(v.visible().width() >= 1_000_000.0, "it does not all fit: {:?}", v.visible());
     }
 
     #[test]

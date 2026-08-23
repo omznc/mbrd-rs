@@ -28,13 +28,24 @@ pub fn write(path: &Path, doc: &Document) -> Result<()> {
     Ok(())
 }
 
-/// Read a `.mbrd` off the disk.
+/// Read a `.mbrd` off the disk, saying how far it has got.
 ///
 /// Whole, into memory, before anything is parsed. A board is tens of megabytes
 /// at the outside and the alternative — reading the archive in place — means
 /// holding a file handle open for as long as the board is, which is what turns
 /// "somebody moved the file" into a crash an hour later.
-pub fn read(path: &Path) -> Result<Document> {
+///
+/// For the opening line — see [`mbrd_core::mbrd::read_watched`], which is where
+/// the numbers come from and what they mean. Nothing is reported for the file
+/// read itself, which is the one part of this with no entries to count; on a
+/// board large enough for that to be visible it is a fraction of the inflating
+/// and hashing that follows.
+///
+/// The one way into this app that reads a board off disk — `main.rs`'s
+/// `argv` handling and the Finder's `on_open_urls` both fold into
+/// `BoardView::open_board`, which calls this rather than a bare, unwatched
+/// read, so there has only ever needed to be the one function here.
+pub fn read_watched(path: &Path, watch: impl FnMut(u64, u64)) -> Result<Document> {
     let bytes = std::fs::read(path).context("reading the file")?;
-    mbrd_core::mbrd::read(Cursor::new(bytes)).context("reading the board")
+    mbrd_core::mbrd::read_watched(Cursor::new(bytes), watch).context("reading the board")
 }

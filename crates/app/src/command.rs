@@ -47,20 +47,126 @@ pub enum Command {
     Redo,
     Paste,
     Save,
+    /// A fresh empty board, in the folder `dirs::boards` names.
+    NewBoard,
     Recentre,
     FitBoard,
+    /// Zoom in one notch, centred on the middle of the view.
+    ///
+    /// The wheel's own zoom goes through `Camera::zoom_by` about wherever the
+    /// pointer is; this is the same call about the middle of the view instead,
+    /// which is what a key press has to aim with — see `BoardView::zoom_in`.
+    /// The reason this exists at all: an infinite canvas with no scrollbars
+    /// gives a keyboard-only visitor no way to look closer at anything
+    /// without it.
+    ZoomIn,
+    /// The other half of [`Self::ZoomIn`].
+    ZoomOut,
     ToggleGrid,
     ToggleAxes,
     ToggleSnap,
     ToggleWeb,
+    /// Whether a drag shows what it is lining up with. See `core/guides.rs`.
+    ToggleGuides,
     OpenBoard,
+    /// Everything the app can be asked to do, as a list you type at.
+    ///
+    /// The other face of this module. The context menu shows what applies to
+    /// what is in your hand; this shows the whole table and lets you name what
+    /// you want — which is the only way to reach a command whose menu you
+    /// would have to know to look under, and the only way to find one that has
+    /// no key at all.
+    ///
+    /// Opened by tapping Shift twice rather than by a chord, because every
+    /// chord worth having is taken and a double-tap costs no key at all.
+    Palette,
+    /// Find something on the board by name and go to it.
+    ///
+    /// A board has no edges, so a card you cannot see is a card you have no
+    /// way to reach except by remembering which direction you left it in.
+    /// This is the answer to that, and it is why choosing a result *moves the
+    /// camera* rather than merely selecting: being told where a thing is is no
+    /// use on a canvas you then have to fly across by hand.
+    Search,
+    /// Whether the interface is allowed to move. A preference, not a board
+    /// setting — see `prefs.rs` for why the two are kept apart.
+    ///
+    /// Named for the state it is normally in, like [`Self::DontScaleText`]: it
+    /// is on unless somebody turns it off, so the row reads as a switch you
+    /// untick rather than an instruction you follow.
+    ToggleMotion,
+    /// Whether to *look* for new versions. Not whether one can be installed,
+    /// which is a fact about how this build was installed rather than a choice.
+    ToggleUpdateChecks,
+    /// Find out whether a newer version exists, and then — pressed again —
+    /// install it and restart into it.
+    ///
+    /// One command rather than three, because the three are the same intent a
+    /// step apart and a menu with `Check`, `Download` and `Install` on it is a
+    /// menu where two rows are always wrong. What it does depends on how far
+    /// the last press got; see `BoardView::update_step`.
+    CheckForUpdates,
     /// Join everything selected with the fewest lines that reach all of it.
     Connect,
     /// Put a labelled rectangle around what is selected. Membership is
     /// measured from where the cards are, so there is nothing else to do.
+    ///
+    /// Called `AddFence` and labelled "Group", and both names are right: the
+    /// *thing* is a fence, which is what the format has always called it, and
+    /// the *act* is grouping, which is what somebody pressing `Ctrl G` means.
     AddFence,
+    /// Take the fence away and leave what was inside it.
+    ///
+    /// The other half of grouping, and the reason binning a group takes its
+    /// contents with it: there is already a word for keeping them.
+    Ungroup,
     /// Take a sticky note off the card it is pinned to.
     Unstick,
+    /// Whether this card's words keep their size as the board moves under
+    /// them. **On unless somebody turns it off**, which is why it is named
+    /// for the state it is normally in rather than for the change it makes.
+    ///
+    /// A row that is ticked by default is a row you can find by looking for
+    /// what to turn off, which is how somebody arrives at this one: the thing
+    /// they noticed was words that appeared to change size, and the thing they
+    /// go looking for is the switch that stops it. `Scale text`, unticked, was
+    /// the same setting spelled as the thing to turn *on*, and nobody reads a
+    /// menu that way.
+    ///
+    /// Per card rather than per board, because the two answers are both right
+    /// and which one is right is a fact about the card: a note you wrote to
+    /// read is a label on a map and wants to stay the size it is, and a note
+    /// you wrote to *be* the card — a title across a section, a word on a
+    /// swatch — is part of the picture and wants to grow with it.
+    DontScaleText,
+    /// Whether this note's height follows what is written on it.
+    ///
+    /// **Off unless somebody turns it on**, which is the other way round from
+    /// [`Self::DontScaleText`] above and deliberately so: a card you can drag
+    /// to a size and have it stay there is what a card is, and a note that
+    /// resized itself the moment you typed into it would be a surprise on a
+    /// board full of ones that do not. So the fixed size is the default and
+    /// this is the thing you ask for.
+    ///
+    /// Per card, for the reason the row above it is: a note written to fit a
+    /// gap in a layout wants the size it was given, and a note written to be
+    /// read wants to be as tall as its words. Both are right.
+    FitText,
+    /// Play or pause every selected card that has a play button.
+    ///
+    /// Play, pause and mute used to be reachable only by a mouse landing on
+    /// the strip drawn under a hovered card — see `BoardView::press_control`
+    /// and `controls_at` — which put a control this app draws on the card
+    /// itself out of reach of anybody not holding a mouse. This runs through
+    /// `press_control` exactly the way a click does, so a keystroke changes
+    /// the board and the undo strip the same way a press on the button would.
+    PlayPause,
+    /// Mute or unmute every selected card that has a mute button.
+    ///
+    /// The other half of [`Self::PlayPause`]'s fix, and unkeyed on purpose —
+    /// see [`Self::hint`] — because the letters worth spending are gone and
+    /// this is reached through the palette or a card's own menu instead.
+    ToggleMute,
 
     // Arranging. Every one of them carries the axis or the edge it is about,
     // for the reason the connection commands do: a menu builds its row by
@@ -106,16 +212,30 @@ impl Command {
             Self::Redo => "Redo",
             Self::Paste => "Paste",
             Self::Save => "Save",
+            Self::NewBoard => "New board",
             Self::Recentre => "Recenter",
             Self::FitBoard => "Fit board",
+            Self::ZoomIn => "Zoom in",
+            Self::ZoomOut => "Zoom out",
             Self::ToggleGrid => "Grid",
             Self::ToggleAxes => "Axes",
             Self::ToggleSnap => "Snap to grid",
             Self::ToggleWeb => "Connections",
+            Self::ToggleGuides => "Alignment guides",
             Self::OpenBoard => "Open board…",
+            Self::Palette => "All commands…",
+            Self::Search => "Find on board…",
+            Self::ToggleMotion => "Animation",
+            Self::ToggleUpdateChecks => "Look for new versions",
+            Self::CheckForUpdates => "Check for updates…",
             Self::Connect => "Connect",
-            Self::AddFence => "Add fence",
+            Self::AddFence => "Group",
+            Self::Ungroup => "Ungroup",
             Self::Unstick => "Unstick note",
+            Self::DontScaleText => "Don't scale text",
+            Self::FitText => "Dynamic size",
+            Self::PlayPause => "Play / pause",
+            Self::ToggleMute => "Mute",
             Self::Align(edge) => match edge {
                 Edge::Left => "Align left",
                 Edge::CentreX => "Align centers",
@@ -130,7 +250,7 @@ impl Command {
             },
             Self::Separate => "Push apart",
 
-            Self::ConnLabel => "Label…",
+            Self::ConnLabel => "Label",
             Self::ConnDelete => "Remove connection",
             // Named after the colour rather than after what it does to it —
             // the menu ticks the one that is on, so a row reads as a choice
@@ -161,6 +281,23 @@ impl Command {
         }
     }
 
+    /// The label as it should be drawn on a row, with a step's name folded
+    /// in for `Undo` and `Redo` — "Undo nudge" rather than bare "Undo" — so
+    /// the row says what pressing it is about to take back rather than only
+    /// whether anything can.
+    ///
+    /// The menu used to compute this itself and the palette used to call
+    /// [`Self::label`] straight, which meant the menu said "Undo nudge" and
+    /// the palette said "Undo" for the same command in the same instant. One
+    /// place that both call is the only way the two cannot drift apart again.
+    pub fn label_in(self, view: &BoardView) -> String {
+        match self {
+            Self::Undo => step_label("Undo", view.undo_step()),
+            Self::Redo => step_label("Redo", view.redo_step()),
+            _ => self.label().to_string(),
+        }
+    }
+
     /// The key that does it, spelled the way a menu should show it.
     ///
     /// `""` for a command no key reaches, and that is a real answer rather than
@@ -186,16 +323,40 @@ impl Command {
             Self::Redo => "Ctrl Shift Z",
             Self::Paste => "Ctrl V",
             Self::Save => "Ctrl S",
+            Self::NewBoard => "Ctrl N",
             Self::Recentre => "0",
             Self::FitBoard => "F",
+            Self::ZoomIn => "Ctrl +",
+            Self::ZoomOut => "Ctrl -",
             Self::ToggleGrid => "G",
             Self::ToggleAxes => "X",
             Self::ToggleSnap => "S",
             Self::ToggleWeb => "W",
             Self::OpenBoard => "Ctrl P",
+            // A tap of a modifier is not a keystroke, and this is the one
+            // hint in the table that a key press cannot satisfy — see
+            // `every_key_a_command_advertises_is_a_key_that_reaches_it`,
+            // which exempts it by name rather than by rule.
+            Self::Palette => "Shift Shift",
+            Self::Search => "Ctrl F",
+            Self::CheckForUpdates => "Ctrl U",
             Self::Connect => "J",
-            Self::AddFence => "E",
+            Self::AddFence => "Ctrl G",
+            Self::Ungroup => "Ctrl Shift G",
             Self::Unstick => "U",
+            Self::PlayPause => "Space",
+            // No key: the letters worth spending are gone, and unlike play or
+            // pause this is not the one control every media player binds a
+            // key to — reached through the palette or a card's own menu
+            // instead.
+            Self::ToggleMute => "",
+            // No key: the single letters worth spending are gone, and this is
+            // a switch you set once rather than one you reach for.
+            Self::DontScaleText
+            | Self::ToggleGuides
+            | Self::FitText
+            | Self::ToggleMotion
+            | Self::ToggleUpdateChecks => "",
             Self::Align(_) | Self::Distribute(_) | Self::Separate => "",
 
             Self::ConnLabel
@@ -225,7 +386,13 @@ impl Command {
             "w" if plain => Self::ToggleWeb,
             "0" if plain => Self::Recentre,
             "j" if plain => Self::Connect,
+            // `E` as well as `Ctrl G`: the menu advertises the one everybody
+            // arrives already knowing, and the single letter is the one this
+            // board's own keyboard has always used.
             "e" if plain => Self::AddFence,
+            // Shift first, or the plain-group arm would swallow both.
+            "g" if mods.secondary() && mods.shift => Self::Ungroup,
+            "g" if mods.secondary() => Self::AddFence,
             "u" if plain => Self::Unstick,
             "]" if plain => Self::BringToFront,
             "[" if plain => Self::SendToBack,
@@ -239,12 +406,35 @@ impl Command {
             "delete" | "backspace" => Self::Delete,
             "a" if mods.secondary() => Self::SelectAll,
             "s" if mods.secondary() => Self::Save,
+            // Plain `n` is a note; the modified form was free, and is what
+            // every other application means by it.
+            "n" if mods.secondary() => Self::NewBoard,
             "v" if mods.secondary() => Self::Paste,
+            // A second door onto the palette, unadvertised: `Shift Shift` is
+            // the one spelling meant to be learned and stays the hint, but a
+            // double-tap is a gesture sticky keys, an on-screen keyboard and
+            // voice input all have trouble producing, and this app should not
+            // be closed to any of them. Shift first, or the plain `Ctrl P`
+            // arm below would swallow it — same order as `Ungroup` above.
+            "p" if mods.secondary() && mods.shift => Self::Palette,
             "p" if mods.secondary() => Self::OpenBoard,
+            // Two spellings for one thing: `Ctrl F` is what a hand reaches for
+            // and `Ctrl K` is what this app's own roadmap promised. Neither is
+            // the alias — they are both simply it.
+            "f" | "k" if mods.secondary() => Self::Search,
+            // Plain `u` is Unstick; the modified form was free.
+            "u" if mods.secondary() => Self::CheckForUpdates,
             // Shift first, or the plain-undo arm would swallow both.
             "z" if mods.secondary() && mods.shift => Self::Redo,
             "z" if mods.secondary() => Self::Undo,
             "y" if mods.secondary() => Self::Redo,
+            // `+` as well as `=`: on most keyboards `+` is the shifted glyph
+            // on the same physical key as `=`, and depending on the layout
+            // gpui may report either one. Either spelling reaches the same
+            // command.
+            "=" | "+" if mods.secondary() => Self::ZoomIn,
+            "-" if mods.secondary() => Self::ZoomOut,
+            "space" if plain => Self::PlayPause,
             _ => return None,
         })
     }
@@ -282,10 +472,29 @@ impl Command {
             // Three, for spacing: with two, the gap between them is the only
             // gap there is and it is already even.
             Self::Distribute(_) => view.selection.len() >= 3,
+            Self::Ungroup => view.can_ungroup(),
             Self::Unstick => view.can_unstick(),
+            Self::DontScaleText => view.text_unscaled().is_some(),
+            Self::FitText => view.text_fitted().is_some(),
+            // A note or a swatch selected alone has neither, and a menu that
+            // offered a play button on one would be a menu that did nothing
+            // when pressed.
+            Self::PlayPause | Self::ToggleMute => view.has_media_selected(),
             Self::Undo => view.undo_step().is_some(),
             Self::Redo => view.redo_step().is_some(),
             Self::SelectAll => view.doc.board.items.iter().any(|i| i.kind.is_content()),
+            // Dimmed rather than hidden in a build that has no update key —
+            // which is every build except a released one. A row that vanishes
+            // depending on how the binary was compiled is a menu that changes
+            // shape for reasons nobody watching it can see.
+            Self::CheckForUpdates => crate::update::possible(),
+            // Always. A palette you can only open when something is selected
+            // is a palette you cannot use to find out what you could select.
+            Self::Palette => true,
+            // Even on an empty board: the answer "nothing by that name" is a
+            // real answer, and a search that greys out when there is nothing
+            // to find is one you have to already know the answer to open.
+            Self::Search => true,
             _ => true,
         }
     }
@@ -303,10 +512,17 @@ impl Command {
             Self::ToggleAxes => Some(settings.axes),
             Self::ToggleSnap => Some(settings.snap),
             Self::ToggleWeb => Some(settings.web),
+            Self::ToggleGuides => Some(settings.guides),
+            // The two that are about the person rather than about the board,
+            // which is why they read from `prefs` and not from `settings`.
+            Self::ToggleMotion => Some(view.prefs.motion),
+            Self::ToggleUpdateChecks => Some(view.prefs.update),
             Self::ConnColour(colour) => Some(view.rope_meta()?.color == colour),
             Self::ConnArrow(dir) => Some(view.rope_meta()?.dir == dir),
             Self::ConnStyleAs(style) => Some(view.rope_meta()?.style == style),
             Self::ConnWeightAs(weight) => Some(view.rope_meta()?.weight == weight),
+            Self::DontScaleText => view.text_unscaled(),
+            Self::FitText => view.text_fitted(),
             _ => None,
         }
     }
@@ -330,16 +546,30 @@ impl Command {
             Self::Redo => view.redo(cx),
             Self::Paste => view.paste(cx),
             Self::Save => view.save(cx),
+            Self::NewBoard => view.new_board(cx),
             Self::Recentre => view.go_home(cx),
             Self::FitBoard => view.fit_all(cx),
+            Self::ZoomIn => view.zoom_in(cx),
+            Self::ZoomOut => view.zoom_out(cx),
             Self::ToggleGrid => view.toggle_setting(Self::ToggleGrid, cx),
             Self::ToggleAxes => view.toggle_setting(Self::ToggleAxes, cx),
             Self::ToggleSnap => view.toggle_setting(Self::ToggleSnap, cx),
             Self::ToggleWeb => view.toggle_setting(Self::ToggleWeb, cx),
+            Self::ToggleGuides => view.toggle_setting(Self::ToggleGuides, cx),
+            Self::ToggleMotion => view.toggle_pref(Self::ToggleMotion, cx),
+            Self::ToggleUpdateChecks => view.toggle_pref(Self::ToggleUpdateChecks, cx),
             Self::OpenBoard => view.open_switcher(window, cx),
+            Self::Palette => view.open_palette(crate::palette::Mode::Commands, cx),
+            Self::Search => view.open_palette(crate::palette::Mode::Search, cx),
+            Self::CheckForUpdates => view.update_step(cx),
             Self::Connect => view.connect_selection(cx),
             Self::AddFence => view.add_fence(cx),
+            Self::Ungroup => view.ungroup(cx),
             Self::Unstick => view.unstick(cx),
+            Self::DontScaleText => view.toggle_text_scaling(cx),
+            Self::FitText => view.toggle_fit_text(cx),
+            Self::PlayPause => view.play_pause_selection(cx),
+            Self::ToggleMute => view.toggle_mute_selection(cx),
             Self::Align(edge) => view.arrange(Self::Align(edge), cx),
             Self::Distribute(axis) => view.arrange(Self::Distribute(axis), cx),
             Self::Separate => view.arrange(Self::Separate, cx),
@@ -354,6 +584,127 @@ impl Command {
             Self::ConnStyleAs(style) => view.dress("Restyle", cx, |meta| meta.style = style),
             Self::ConnWeightAs(weight) => view.dress("Reweight", cx, |meta| meta.weight = weight),
         }
+    }
+
+    /// Other words somebody might type looking for this.
+    ///
+    /// A palette that matches only the label is a palette you have to already
+    /// know the wording of. "Open board…" is the board switcher, and somebody
+    /// hunting for it types *project* or *switch* — neither of which is in its
+    /// name, so the one command they wanted was the one thing they could not
+    /// find. That was reported as "there's no project switcher".
+    ///
+    /// Deliberately sparse. Every word here is a word that makes some *other*
+    /// command harder to find, so this is for the cases where the label is
+    /// genuinely not what the thing is called — not a thesaurus.
+    pub fn keywords(self) -> &'static str {
+        match self {
+            Self::OpenBoard => "project switcher switch recent file document",
+            Self::Search => "find goto jump locate",
+            Self::Palette => "commands actions",
+            Self::Recentre => "home origin centre",
+            Self::FitBoard => "zoom everything",
+            Self::ZoomIn => "enlarge magnify closer",
+            Self::ZoomOut => "shrink magnify further",
+            Self::PlayPause => "video audio play pause stop",
+            Self::ToggleMute => "video audio sound unmute silence",
+            Self::Delete => "remove trash",
+            Self::AddSwatch => "colour swatch",
+            Self::Tint => "colour recolour",
+            Self::AddFence => "group frame",
+            Self::Connect => "rope line link join",
+            Self::ConnLabel => "rename",
+            Self::Separate => "overlap unstack",
+            Self::ToggleWeb => "ropes lines",
+            Self::ToggleGuides => "smart guides rulers",
+            // Spelled both ways: the setting is *called* Animation and the
+            // thing somebody is looking for is usually "reduced motion".
+            Self::ToggleMotion => "reduced motion accessibility animate",
+            Self::ToggleUpdateChecks => "updates version automatic",
+            Self::CheckForUpdates => "upgrade version new",
+            Self::DontScaleText => "font size zoom",
+            Self::Save => "write disk",
+            Self::NewBoard => "create empty fresh blank",
+            _ => "",
+        }
+    }
+
+    /// Every command there is, values and all.
+    ///
+    /// What the palette lists, and the first list in this module that is
+    /// actually the whole of them. The `ALL` this replaced was the *keyed*
+    /// commands, and its doc comment claimed to be exhaustive while quietly
+    /// missing `ToggleWeb`, `Connect` and `Unstick` — because a list that is
+    /// only ever iterated over cannot notice what was never put into it. The
+    /// two tests that read it both iterated.
+    ///
+    /// Two things keep this one honest, and neither is enough alone:
+    ///
+    /// 1. The six value-carrying commands are **mapped over the format's own
+    ///    lists** rather than spelled out. A colour the format gains is a
+    ///    command here the moment it exists, with nothing to remember.
+    /// 2. The nullary ones are spelled out, and
+    ///    `every_command_there_is_is_in_the_list_of_them` matches on all of
+    ///    them with no catch-all — so adding a variant fails to *compile*
+    ///    until it is named, and then fails the count until it is added here.
+    ///
+    /// Order is the order the palette offers them in with an empty query, so
+    /// it is roughly "what you reach for" rather than the enum's order.
+    pub fn all() -> Vec<Self> {
+        let mut out = vec![
+            Self::AddNote,
+            Self::AddSwatch,
+            Self::AddFence,
+            Self::Ungroup,
+            Self::Connect,
+            Self::Rename,
+            Self::Duplicate,
+            Self::Copy,
+            Self::Cut,
+            Self::Paste,
+            Self::Delete,
+            Self::Tint,
+            Self::DontScaleText,
+            Self::FitText,
+            Self::PlayPause,
+            Self::ToggleMute,
+            Self::Unstick,
+            Self::BringToFront,
+            Self::SendToBack,
+            Self::Separate,
+            Self::SelectAll,
+            Self::ClearSelection,
+            Self::Undo,
+            Self::Redo,
+            Self::Save,
+            Self::NewBoard,
+            Self::OpenBoard,
+            Self::Search,
+            Self::Palette,
+            Self::FitBoard,
+            Self::Recentre,
+            Self::ZoomIn,
+            Self::ZoomOut,
+            Self::ToggleGrid,
+            Self::ToggleAxes,
+            Self::ToggleSnap,
+            Self::ToggleWeb,
+            Self::ToggleGuides,
+            Self::ToggleMotion,
+            Self::ToggleUpdateChecks,
+            Self::CheckForUpdates,
+            Self::ConnLabel,
+            Self::ConnDelete,
+        ];
+        // The value-carrying six, each mapped over the list the *format*
+        // keeps. See `Edge::ALL` and `model::named_enum`.
+        out.extend(Edge::ALL.map(Self::Align));
+        out.extend(Axis::ALL.map(Self::Distribute));
+        out.extend(ConnColor::ALL.iter().copied().map(Self::ConnColour));
+        out.extend(ConnDir::ALL.iter().copied().map(Self::ConnArrow));
+        out.extend(ConnStyle::ALL.iter().copied().map(Self::ConnStyleAs));
+        out.extend(ConnWeight::ALL.iter().copied().map(Self::ConnWeightAs));
+        out
     }
 }
 
@@ -443,22 +794,36 @@ impl Entry {
 /// Three verbs that were three rows on every list; one row now, on all of
 /// them. Adding is a thing you do occasionally and read past constantly, which
 /// is exactly what a submenu is for.
-const ADD: [Entry; 3] = [
-    Entry::Does(Command::AddNote),
-    Entry::Does(Command::AddSwatch),
-    Entry::Does(Command::AddFence),
-];
+const ADD: [Entry; 2] = [Entry::Does(Command::AddNote), Entry::Does(Command::AddSwatch)];
 
-/// What is drawn, and the two ways of getting back to it.
-const VIEW: [Entry; 7] = [
+/// What is drawn, and the four ways of getting back to it.
+const VIEW: [Entry; 13] = [
     Entry::Does(Command::ToggleGrid),
     Entry::Does(Command::ToggleSnap),
     Entry::Does(Command::ToggleAxes),
     Entry::Does(Command::ToggleWeb),
+    Entry::Does(Command::ToggleGuides),
     Entry::Rule,
     Entry::Does(Command::FitBoard),
     Entry::Does(Command::Recentre),
+    Entry::Does(Command::ZoomIn),
+    Entry::Does(Command::ZoomOut),
+    Entry::Rule,
+    // Last, and behind its own rule. Everything above this is about the board
+    // in front of you; this one is about the application, and it is the only
+    // row on any list that is.
+    Entry::Does(Command::CheckForUpdates),
+    Entry::More("Settings", &SETTINGS),
 ];
+
+/// The two choices that are about the person rather than about the board.
+///
+/// Its own list rather than four more rows on `VIEW`, because the distinction
+/// is the one `prefs.rs` is built on and a menu that mixed them would erase it:
+/// everything on `VIEW` is a property of the board in front of you and travels
+/// inside the `.mbrd`, and neither of these does.
+const SETTINGS: [Entry; 2] =
+    [Entry::Does(Command::ToggleMotion), Entry::Does(Command::ToggleUpdateChecks)];
 
 /// Everything about where several cards are in relation to each other.
 const ARRANGE: [Entry; 10] = [
@@ -514,8 +879,11 @@ const WEIGHTS: [Entry; 3] = [
 /// Reaching it *lets go* of whatever was selected — see `on_mouse_down` —
 /// because a menu about the board over a board with three cards selected would
 /// be a menu whose every entry meant something other than what it said.
-pub const BOARD_MENU: [Entry; 8] = [
+pub const BOARD_MENU: [Entry; 9] = [
     Entry::More("Add", &ADD),
+    // With nothing in hand this fences off an empty space, which is the way
+    // round somebody who wants to lay a board out before filling it works.
+    Entry::Does(Command::AddFence),
     Entry::Does(Command::Paste),
     Entry::Does(Command::SelectAll),
     Entry::Rule,
@@ -529,7 +897,7 @@ pub const BOARD_MENU: [Entry; 8] = [
 ///
 /// Selection-only commands first, because a right-click that landed on a card
 /// is usually about that card; the board-wide ones are below the rule.
-pub const CARD_MENU: [Entry; 21] = [
+pub const CARD_MENU: [Entry; 27] = [
     Entry::Does(Command::Rename),
     Entry::Does(Command::Duplicate),
     Entry::Rule,
@@ -539,7 +907,16 @@ pub const CARD_MENU: [Entry; 21] = [
     Entry::Does(Command::Delete),
     Entry::Rule,
     Entry::More("Add", &ADD),
+    Entry::Does(Command::AddFence),
+    Entry::Does(Command::Ungroup),
     Entry::Does(Command::Tint),
+    Entry::Does(Command::DontScaleText),
+    Entry::Does(Command::FitText),
+    // Dimmed on anything that is not a video or an audio card — see
+    // `Command::available` — the same way `DontScaleText` and `FitText`
+    // above them are dimmed off a card that is not a note.
+    Entry::Does(Command::PlayPause),
+    Entry::Does(Command::ToggleMute),
     Entry::Does(Command::Unstick),
     Entry::Does(Command::BringToFront),
     Entry::Does(Command::SendToBack),
@@ -580,8 +957,10 @@ pub const ROPE_MENU: [Entry; 7] = [
 /// list — rename, tint, the note's own commands — is about one of them, and all
 /// of this is about the relationship between them, which does not exist when
 /// there is only one.
-pub const MANY_MENU: [Entry; 13] = [
+pub const MANY_MENU: [Entry; 15] = [
     Entry::Does(Command::Connect),
+    Entry::Does(Command::AddFence),
+    Entry::Does(Command::Ungroup),
     Entry::Does(Command::Duplicate),
     Entry::Rule,
     Entry::Does(Command::Cut),
@@ -595,6 +974,15 @@ pub const MANY_MENU: [Entry; 13] = [
     Entry::More("Add", &ADD),
     Entry::Does(Command::ClearSelection),
 ];
+
+/// "Undo" plus the name of the step it would take back, where there is one.
+/// See [`Command::label_in`], the only caller.
+fn step_label(verb: &str, step: Option<String>) -> String {
+    match step {
+        Some(name) => format!("{verb} {}", name.to_lowercase()),
+        None => verb.to_string(),
+    }
+}
 
 /// Which list a right-click should show.
 ///
@@ -615,37 +1003,121 @@ pub fn menu_for(view: &BoardView) -> &'static [Entry] {
 mod tests {
     use super::*;
 
-    /// Every command, for the exhaustiveness checks below. Adding a variant
-    /// without adding it here fails the first test rather than going unnoticed.
-    const ALL: [Command; 22] = [
-        Command::AddNote,
-        Command::AddSwatch,
-        Command::Tint,
-        Command::BringToFront,
-        Command::SendToBack,
-        Command::Rename,
-        Command::Duplicate,
-        Command::Copy,
-        Command::Cut,
-        Command::Delete,
-        Command::SelectAll,
-        Command::ClearSelection,
-        Command::Undo,
-        Command::Redo,
-        Command::Paste,
-        Command::Save,
-        Command::Recentre,
-        Command::FitBoard,
-        Command::ToggleGrid,
-        Command::ToggleAxes,
-        Command::ToggleSnap,
-        Command::OpenBoard,
-    ];
+    /// Every command there is, named once more — and this time the compiler
+    /// insists.
+    ///
+    /// The list this replaced was a hand-written `ALL` whose doc comment said
+    /// "adding a variant without adding it here fails the first test rather
+    /// than going unnoticed". It did not, and had not for some time: nothing
+    /// asserted the list was complete, both tests that read it merely iterated
+    /// over it, and a variant that was never added was one no test ever saw.
+    /// `ToggleWeb`, `Connect` and `Unstick` had all quietly fallen out.
+    ///
+    /// Two guards, and neither is enough alone. The match below has **no
+    /// catch-all**, so adding a variant fails to compile here until it is
+    /// named; the count then fails until it is added to [`Command::all`] too.
+    /// The first makes you look, the second makes you place it.
+    #[test]
+    fn every_command_there_is_is_in_the_list_of_them() {
+        for command in Command::all() {
+            match command {
+                Command::AddNote
+                | Command::AddSwatch
+                | Command::Tint
+                | Command::BringToFront
+                | Command::SendToBack
+                | Command::Rename
+                | Command::Duplicate
+                | Command::Copy
+                | Command::Cut
+                | Command::Delete
+                | Command::SelectAll
+                | Command::ClearSelection
+                | Command::Undo
+                | Command::Redo
+                | Command::Paste
+                | Command::Save
+                | Command::NewBoard
+                | Command::Recentre
+                | Command::FitBoard
+                | Command::ZoomIn
+                | Command::ZoomOut
+                | Command::ToggleGrid
+                | Command::ToggleAxes
+                | Command::ToggleSnap
+                | Command::ToggleWeb
+                | Command::ToggleGuides
+                | Command::ToggleMotion
+                | Command::ToggleUpdateChecks
+                | Command::OpenBoard
+                | Command::Palette
+                | Command::Search
+                | Command::CheckForUpdates
+                | Command::Connect
+                | Command::AddFence
+                | Command::Ungroup
+                | Command::Unstick
+                | Command::DontScaleText
+                | Command::FitText
+                | Command::PlayPause
+                | Command::ToggleMute
+                | Command::Align(_)
+                | Command::Distribute(_)
+                | Command::Separate
+                | Command::ConnLabel
+                | Command::ConnDelete
+                | Command::ConnColour(_)
+                | Command::ConnArrow(_)
+                | Command::ConnStyleAs(_)
+                | Command::ConnWeightAs(_) => {
+                    assert!(Command::all().contains(&command));
+                }
+            }
+        }
+        // 43 nullary, plus the six that carry values mapped over the format's
+        // own lists: 6 edges, 2 axes, 5 colours, 4 arrows, 3 styles, 3 weights.
+        assert_eq!(
+            Command::all().len(),
+            43 + 6 + 2 + 5 + 4 + 3 + 3,
+            "a command was added to the enum and not to Command::all",
+        );
+    }
+
+    /// Nothing is offered twice by the palette.
+    ///
+    /// Cheap to get wrong now that the value-carrying commands are mapped over
+    /// the format's lists rather than spelled out: a list added to `all()`
+    /// twice would draw every colour twice and nothing would complain.
+    #[test]
+    fn no_command_is_in_the_list_twice() {
+        let all = Command::all();
+        for (i, command) in all.iter().enumerate() {
+            assert!(!all[i + 1..].contains(command), "{} is listed twice", command.label());
+        }
+    }
+
+    /// The commands that a key actually reaches — which is not all of them.
+    ///
+    /// A third of the table has no key on purpose: five colours and four
+    /// arrows would spend nine letters of the alphabet on choices nobody would
+    /// learn. Those return `""` from `hint`, and the two tests below are about
+    /// keys, so they filter rather than pretend.
+    fn keyed() -> Vec<Command> {
+        Command::all().into_iter().filter(|c| !c.hint().is_empty()).collect()
+    }
 
     #[test]
     fn every_key_a_command_advertises_is_a_key_that_reaches_it() {
-        for command in ALL {
+        for command in keyed() {
             let hint = command.hint();
+            // The one hint no key press can satisfy, because it is not a key
+            // press: `Shift Shift` is a modifier tapped twice, watched for in
+            // `taps.rs`. Exempted by name rather than by rule, so that a
+            // second one cannot be added without this line being read.
+            if command == Command::Palette {
+                assert_eq!(hint, "Shift Shift");
+                continue;
+            }
             let key = hint.rsplit(' ').next().unwrap().to_lowercase();
             let mut mods = if hint.contains("Ctrl") {
                 Modifiers::secondary_key()
@@ -664,9 +1136,29 @@ mod tests {
 
     #[test]
     fn no_two_commands_claim_the_same_key() {
-        for (i, a) in ALL.iter().enumerate() {
-            for b in &ALL[i + 1..] {
+        let keyed = keyed();
+        for (i, a) in keyed.iter().enumerate() {
+            for b in &keyed[i + 1..] {
                 assert_ne!(a.hint(), b.hint(), "{} and {} share a key", a.label(), b.label());
+            }
+        }
+    }
+
+    /// Every command a menu offers is a command the palette offers too.
+    ///
+    /// The palette is the whole table and a menu is a view onto it, so a
+    /// command that reached a menu without reaching `all()` would be one the
+    /// palette could never find.
+    #[test]
+    fn the_palette_offers_everything_the_menus_do() {
+        let all = Command::all();
+        for list in [&BOARD_MENU[..], &CARD_MENU[..], &ROPE_MENU[..], &MANY_MENU[..]] {
+            for command in everything(list) {
+                assert!(
+                    all.contains(&command),
+                    "{} is on a menu and not in all()",
+                    command.label()
+                );
             }
         }
     }

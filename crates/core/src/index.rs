@@ -105,15 +105,26 @@ pub struct Grid {
     wide: Vec<u32>,
     /// Each item's box, in the order they were given. Parallel to the slice.
     boxes: Vec<Rect>,
+    /// The raw `(x, y, w, h, rot)` each entry in `boxes` was filed from — the
+    /// fields [`Rect::of_item`] reads. [`Grid::refile`] compares these floats
+    /// directly to find what moved, rather than calling `of_item` again for
+    /// every item on the board just to throw the answer away when it agrees.
+    geom: Vec<(f32, f32, f32, f32, f32)>,
+}
+
+/// The fields [`Rect::of_item`] reads, as the plain tuple `refile` compares.
+fn geom_of(item: &Item) -> (f32, f32, f32, f32, f32) {
+    (item.x, item.y, item.w, item.h, item.rot)
 }
 
 impl Grid {
     /// File a list of items. `O(n)` and one pass.
     pub fn build(items: &[Item]) -> Self {
         let boxes: Vec<Rect> = items.iter().map(Rect::of_item).collect();
+        let geom: Vec<(f32, f32, f32, f32, f32)> = items.iter().map(geom_of).collect();
         let cell = cell_for(&boxes);
 
-        let mut grid = Self { cell, cells: HashMap::new(), wide: Vec::new(), boxes };
+        let mut grid = Self { cell, cells: HashMap::new(), wide: Vec::new(), boxes, geom };
         for i in 0..grid.boxes.len() as u32 {
             grid.file(i);
         }
@@ -150,25 +161,32 @@ impl Grid {
             return false;
         }
 
-        // Which boxes are not where they were filed.
-        let mut moved: Vec<u32> = Vec::new();
+        // Which boxes are not where they were filed. Compared against the raw
+        // geometry `of_item` reads, not `of_item`'s own answer — a rotated
+        // item's box costs a `sin`/`cos` to work out, and a board where
+        // nothing moved should not pay that for every item just to be told so.
+        let mut moved: Vec<(u32, Rect)> = Vec::new();
         for (i, item) in items.iter().enumerate() {
-            if Rect::of_item(item) != self.boxes[i] {
+            let g = geom_of(item);
+            if g != self.geom[i] {
                 if moved.len() == REFILE_MOST {
                     return false;
                 }
-                moved.push(i as u32);
+                // Worked out once, here, and reused below rather than a
+                // second time at the point the box is written back.
+                moved.push((i as u32, Rect::of_item(item)));
             }
         }
 
         // Every removal before any insertion, so that an item moving into the
         // square another is moving out of cannot depend on which of the two is
         // handled first.
-        for &i in &moved {
+        for &(i, _) in &moved {
             self.pull(i);
         }
-        for &i in &moved {
-            self.boxes[i as usize] = Rect::of_item(&items[i as usize]);
+        for (i, rect) in moved {
+            self.boxes[i as usize] = rect;
+            self.geom[i as usize] = geom_of(&items[i as usize]);
             self.file(i);
         }
         true
@@ -353,11 +371,26 @@ fn cell_for(boxes: &[Rect]) -> f32 {
 
 /// Fold a sorted, disjoint slice into a sorted vector, in place.
 fn merge_sorted(out: &mut Vec<u32>, extra: &[u32]) {
+    // Two ascending runs with nothing in common, merged from the back rather
+    // than appended and sorted — a sort would have to rediscover that they
+    // are already two runs, and no allocation beyond the one `reserve` is
+    // needed to do the merge in place.
+    let old_len = out.len();
+    out.reserve(extra.len());
     out.extend_from_slice(extra);
-    // Two ascending runs with nothing in common, so this is a merge rather
-    // than a sort. `sort` is the one that knows that: it finds the runs and
-    // walks them together in one pass. `sort_unstable` would start over.
-    out.sort();
+    let mut i = old_len as isize - 1;
+    let mut j = extra.len() as isize - 1;
+    let mut k = out.len() as isize - 1;
+    while j >= 0 {
+        if i >= 0 && out[i as usize] > extra[j as usize] {
+            out[k as usize] = out[i as usize];
+            i -= 1;
+        } else {
+            out[k as usize] = extra[j as usize];
+            j -= 1;
+        }
+        k -= 1;
+    }
 }
 
 #[cfg(test)]

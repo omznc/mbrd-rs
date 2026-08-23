@@ -129,7 +129,29 @@ pub struct Document {
 /// here. A reader that refuses a board it could mostly have opened loses work
 /// that a slightly lossy open would have kept.
 pub fn read<R: Read + Seek>(reader: R) -> Result<Document> {
+    read_watched(reader, |_, _| {})
+}
+
+/// [`read`], saying how far it has got.
+///
+/// `watch` is handed the bytes unpacked so far and the bytes the archive says
+/// it holds, once per entry. It exists because **opening is the one thing in
+/// this app that can take seconds without anybody having asked for seconds**: a
+/// board of photographs is most of a gigabyte to inflate and to hash, and a
+/// window that says nothing for that long is indistinguishable from one that
+/// has stopped answering.
+///
+/// The total comes off the central directory, which is parsed before the first
+/// entry is touched, so knowing it costs nothing. It is `0` for an archive that
+/// declines to say — one written with data descriptors, which this writer never
+/// produces — and a caller given a total of nought should show that it is
+/// working rather than how far along it is.
+pub fn read_watched<R: Read + Seek>(
+    reader: R,
+    mut watch: impl FnMut(u64, u64),
+) -> Result<Document> {
     let mut zip = ZipArchive::new(reader).context("not a readable ZIP archive")?;
+    let expected = u64::try_from(zip.decompressed_size().unwrap_or(0)).unwrap_or(u64::MAX);
 
     let mut board_json: Option<Value> = None;
     let mut manifest_json: Option<Value> = None;
@@ -161,6 +183,9 @@ pub fn read<R: Read + Seek>(reader: R) -> Result<Document> {
 
         let mut bytes = Vec::with_capacity(entry.size().min(1 << 20) as usize);
         entry.read_to_end(&mut bytes)?;
+        // After the read rather than before it, so the number describes work
+        // that has happened rather than work about to.
+        watch(total, expected);
 
         if name == "board.json" {
             board_json = serde_json::from_slice(&bytes).ok();
@@ -339,12 +364,31 @@ pub fn write<W: Write + Seek>(writer: W, doc: &Document, now: &str) -> Result<()
     crate::fence::stamp(&mut board.items);
     crate::stick::stamp(&mut board.items);
 
+    // **The bin does not go in the file.** It is a within-a-session thing here
+    // — see `model::TrashEntry`, which is where the reasoning is written down —
+    // and this is the one line that makes that true, because it is the one
+    // place the board stops being edited and starts being written.
+    //
+    // Emptied rather than left out, so that the section is still there and
+    // still an array. A `.mbrd` without a `trash` key would be a `.mbrd` an
+    // older reader has to guess about, and the answer it should guess is
+    // exactly "empty".
+    //
+    // What this costs is a bin somebody filled in another app, which is gone
+    // the first time this one saves. What it buys is that deleting a
+    // photograph and saving actually removes the photograph, rather than
+    // keeping its bytes indefinitely against a restore that this app has no
+    // way to perform.
+    board.trash.clear();
+
     zip.start_file("board.json", deflated)?;
     let filed = state::to_value(&board, doc.board.timeline());
     zip.write_all(serde_json::to_string_pretty(&filed)?.as_bytes())?;
 
-    // Only hashes still referenced by a live item or a binned one are written,
-    // so deleting things and saving actually shrinks the file.
+    // Only hashes a live item still names are required, so deleting things and
+    // saving actually shrinks the file. A binned one is not among them — the
+    // bin is not written at all, and what an undo step still wants is answered
+    // below, where a missing one is walked past rather than fatal.
     for hash in doc.board.required_hashes() {
         let asset = doc
             .assets
@@ -564,6 +608,31 @@ mod tests {
     use super::*;
     use crate::model::{Item, ItemAsset};
 
+    #[test]
+    fn a_read_says_how_far_it_has_got_and_finishes_at_the_whole_archive() {
+        // The numbers the opening loader is drawn from. A reading that never
+        // reached the total would leave the bar short of the end on every
+        // board, which is the one way a progress bar can lie that people
+        // notice.
+        let doc = doc_with_a_photo_and_a_note();
+        let bytes = to_bytes(&doc, "2024-01-01T00:00:00Z").expect("packs");
+
+        let mut seen: Vec<(u64, u64)> = Vec::new();
+        let back = read_watched(Cursor::new(bytes), |done, total| seen.push((done, total)))
+            .expect("reads");
+        assert_eq!(back.board.items.len(), doc.board.items.len());
+
+        assert!(!seen.is_empty(), "a board with entries in it should report on them");
+        let total = seen[0].1;
+        assert!(total > 0, "this writer stores sizes, so the total is knowable");
+        assert!(seen.iter().all(|(_, t)| *t == total), "the total should not move");
+
+        // Never backwards, never past the end, and it arrives.
+        assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0), "progress went backwards: {seen:?}");
+        assert!(seen.iter().all(|(done, _)| *done <= total), "past the end: {seen:?}");
+        assert_eq!(seen.last().map(|(done, _)| *done), Some(total), "{seen:?}");
+    }
+
     fn doc_with_a_photo_and_a_note() -> Document {
         let bytes = b"not really a jpeg".to_vec();
         let hash = hash_bytes(&bytes);
@@ -753,5 +822,67 @@ mod tests {
         assert_eq!(slugify("Kitchen Window!! (final)"), "kitchen-window-final");
         assert_eq!(slugify("  --  "), "");
         assert!(!slugify("a -- b").contains("--"));
+    }
+
+    #[test]
+    fn the_bin_does_not_reach_the_file() {
+        // The bin lasts as long as the app is open and no longer. See
+        // `model::TrashEntry` for why a section of the format is deliberately
+        // dropped on the way out.
+        let mut doc = doc_with_a_photo_and_a_note();
+        doc.board.edit_at("To the bin", 1, |board| {
+            let item = board.items.remove(0);
+            board.trash.insert(0, crate::model::TrashEntry { item, at: 1 });
+        });
+        assert_eq!(doc.board.trash.len(), 1, "it should be in the bin in memory");
+
+        let bytes = to_bytes(&doc, "2026-07-25T10:04:11.882Z").unwrap();
+        let back = read(Cursor::new(bytes)).unwrap();
+
+        assert!(back.board.trash.is_empty(), "the bin was written to the file");
+        assert_eq!(back.board.items.len(), 1, "the note should be all that is left");
+    }
+
+    #[test]
+    fn a_binned_picture_is_still_there_for_an_undo_to_find() {
+        // The other half of the same decision, and the half that makes it safe:
+        // the deleted photograph's bytes leave the *required* set and are
+        // carried by the ledger instead — optionally, for as long as a step
+        // still names them. Undo is the recovery route now, so it has to work
+        // across a save.
+        let mut doc = doc_with_a_photo_and_a_note();
+        let photo = doc.board.items[0].id.clone();
+        doc.board.edit_at("To the bin", 1, |board| {
+            let item = board.items.remove(0);
+            board.trash.insert(0, crate::model::TrashEntry { item, at: 1 });
+        });
+
+        let bytes = to_bytes(&doc, "2026-07-25T10:04:11.882Z").unwrap();
+        let mut back = read(Cursor::new(bytes)).unwrap();
+
+        assert_eq!(back.assets.len(), 1, "the ledger still wants the picture's bytes");
+        assert_eq!(back.board.undo().as_deref(), Some("To the bin"), "the step did not survive");
+        assert!(
+            back.board.items.iter().any(|it| it.id == photo),
+            "an undo could not bring the picture back",
+        );
+    }
+
+    #[test]
+    fn a_picture_only_the_bin_names_leaves_the_file() {
+        // What emptying the bin at the boundary is *for*, isolated from the
+        // ledger: this board has no history at all, so the bin is the only
+        // thing naming the photograph — and a picture nothing on the board
+        // names should not be carried.
+        let doc = doc_with_a_photo_and_a_note();
+        let mut board: Board = (*doc.board).clone();
+        let item = board.items.remove(0);
+        board.trash.push(crate::model::TrashEntry { item, at: 1 });
+        let doc = Document { board: BoardState::new(board), ..doc };
+
+        let bytes = to_bytes(&doc, "2026-07-25T10:04:11.882Z").unwrap();
+        let back = read(Cursor::new(bytes)).unwrap();
+        assert!(back.board.trash.is_empty());
+        assert!(back.assets.is_empty(), "the deleted photograph is still in the file");
     }
 }

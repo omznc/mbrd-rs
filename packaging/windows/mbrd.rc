@@ -1,0 +1,5 @@
+// The Windows executable's icon, linked in by `crates/app/build.rs`.
+//
+// `1` rather than a named identifier because Explorer shows the icon with the
+// lowest numeric id as the file's icon, and being first is the entire job.
+1 ICON "../icons/mbrd.ico"

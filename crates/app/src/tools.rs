@@ -19,6 +19,7 @@
 use gpui::{div, prelude::*, px, Context, Modifiers, MouseButton};
 
 use crate::board_view::BoardView;
+use crate::icons::{icon, Icon};
 
 /// What a press on the board means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -42,6 +43,21 @@ impl Tool {
     /// in the order somebody works — move around, join things up, write
     /// something down.
     pub const ALL: [Tool; 4] = [Tool::Select, Tool::Pan, Tool::Connect, Tool::Note];
+
+    /// The picture on its button.
+    ///
+    /// A pointer, a hand, two joined segments and a page — the four every
+    /// canvas in the world uses for these, which is the point: the picture is
+    /// worth having only where it is one somebody has already learned, and
+    /// where it is not the word beside it is doing the work anyway.
+    pub fn icon(self) -> Icon {
+        match self {
+            Tool::Select => Icon::Select,
+            Tool::Pan => Icon::Pan,
+            Tool::Connect => Icon::Connect,
+            Tool::Note => Icon::Note,
+        }
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -100,11 +116,19 @@ impl Tool {
 
 /// The strip, top left, floating over the board.
 ///
-/// Words rather than pictures, for two reasons. The honest one is that a
-/// wordless icon for "connect" is a thing you learn rather than read. The other
-/// is that this window already draws its own titlebar and its own menu because
-/// the platform's could not be relied on; a row of dingbats would be a fifth
-/// thing relying on whatever glyphs the font on this machine happens to carry.
+/// Words **and** pictures, which is a change from words alone. The original
+/// argument against pictures was two-part: a wordless icon for "connect" is a
+/// thing you learn rather than read, and a row of dingbats would be a fifth
+/// thing in this app relying on whatever glyphs the font on this machine
+/// happens to carry — the titlebar and the menu are drawn here rather than
+/// asked for precisely because the platform's could not be relied on.
+///
+/// The second half of that is now false: `icons.rs` compiles the pictures into
+/// the binary, so they are as reliable as the rectangles beside them. The first
+/// half was never an argument for *no* picture, only against a picture on its
+/// own — so the word stays and the icon joins it, which is the arrangement that
+/// reads at a glance for somebody who knows the tool and still reads at all for
+/// somebody who does not.
 ///
 /// Small and out of the way on purpose. The one strip of chrome along the
 /// bottom is there because a permanent panel is a permanent piece of the board
@@ -121,11 +145,11 @@ pub fn render(view: &BoardView, cx: &mut Context<BoardView>) -> impl IntoElement
         .items_center()
         .gap(px(2.0))
         .p(px(3.0))
-        .rounded(px(8.0))
+        .rounded(px(crate::theme::RADIUS_MD))
         .bg(theme.chrome)
         .border_1()
         .border_color(theme.chrome_edge)
-        .shadow_lg()
+        .shadow(crate::theme::shadow_medium())
         .text_size(px(11.0))
         // The canvas beneath listens on mouse-down, so without this a press on
         // the strip would also start a gesture on the board behind it — which
@@ -157,8 +181,13 @@ pub fn render(view: &BoardView, cx: &mut Context<BoardView>) -> impl IntoElement
                         this.choose_tool(tool, cx);
                     }),
                 )
+                .child(icon(tool.icon(), 13.0, if chosen { theme.text } else { theme.muted }))
                 .child(tool.label())
-                .child(div().text_size(px(9.0)).text_color(theme.muted).child(tool.hint()))
+                // Nine points read as a footnote rather than a key somebody
+                // could actually aim their eye at; ten is the floor this app
+                // otherwise holds to for anything meant to be read rather than
+                // merely noticed.
+                .child(div().text_size(px(10.0)).text_color(theme.muted).child(tool.hint()))
         }))
 }
 

@@ -133,3 +133,62 @@ fn a_screenful_of_lines_settles_inside_a_frame() {
         "routing a screenful took {took:?}, which is a visible pause when the hand comes off"
     );
 }
+
+/// Opening a full board has to be proportional to the board.
+///
+/// The floor that matters most, because it is the one the app pays on the
+/// thread that draws and the one a person experiences as the window not coming
+/// up. It was quadratic once, in four places at once — every one of them a
+/// membership question asked of a list instead of a set, and the worst of them a
+/// scan of the whole geometry memo per card that copied each record it walked
+/// past. A full board took the best part of a minute to open. See
+/// `schema::normalize_layout`.
+///
+/// Measured in *shape* rather than against a stopwatch: ten times the cards
+/// should cost about ten times, and the assertion has room for a slow machine
+/// and a debug build while still catching a return to the board squared.
+#[test]
+fn a_full_board_opens_in_proportion_to_its_size() {
+    use mbrd_core::{schema, BoardState};
+
+    fn filed(items: usize) -> serde_json::Value {
+        // Through the real writer, so the memo, the ledger and the asset
+        // references are all present. A hand-built board.json misses `layouts`
+        // entirely, which is exactly where the worst of it was hiding.
+        let mut board = schema::normalize(&serde_json::json!({ "title": "big", "items": [] }));
+        board.items = a_full_board().into_iter().take(items).collect();
+        for (n, item) in board.items.iter_mut().enumerate() {
+            item.id = format!("i{n}");
+            item.name = format!("photograph number {n}.jpg");
+        }
+        BoardState::new(board).to_value()
+    }
+
+    let small = filed(2_000);
+    let large = filed(20_000);
+
+    let started = Instant::now();
+    let board = schema::normalize(&small);
+    let small_took = started.elapsed();
+    assert_eq!(board.items.len(), 2_000);
+
+    let started = Instant::now();
+    let board = schema::normalize(&large);
+    let large_took = started.elapsed();
+    assert_eq!(board.items.len(), 20_000);
+    assert_eq!(board.layouts.desktop.len(), 20_000, "the memo should be read back whole");
+
+    println!("normalize · 2000 items {small_took:?} · 20000 items {large_took:?}");
+
+    // Ten times the cards, and generously under thirty times the work. The
+    // quadratic version was ten times the cards for a hundred times the work,
+    // which this catches with room to spare either way.
+    assert!(
+        large_took < small_took * 30,
+        "twenty thousand cards took {large_took:?} against two thousand at {small_took:?} \
+         — that is the board squared coming back"
+    );
+    // And an absolute ceiling, loose enough for a debug build on a slow
+    // machine: nobody should ever wait a second for this again.
+    assert!(large_took < Duration::from_secs(4), "a full board normalized in {large_took:?}");
+}

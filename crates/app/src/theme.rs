@@ -6,7 +6,9 @@
 //! that draws asks the theme rather than naming a colour, so the day a palette
 //! is derived from the board there is one struct to fill in instead of a grep.
 
-use gpui::{rgb, rgba, Hsla};
+use std::sync::Arc;
+
+use gpui::{point, px, rgb, rgba, BoxShadow, FontFeatures, Hsla};
 
 /// `Copy` because it is a bag of colours that every drawing path wants a
 /// private look at, and passing it by reference would tie the painter to the
@@ -32,8 +34,23 @@ pub struct Theme {
     pub selected_edge: Hsla,
 
     pub text: Hsla,
-    /// Labels, counts, the status bar — anything secondary.
+    /// Labels, counts, the status bar, a placeholder, a tooltip's key —
+    /// anything secondary that a person is still expected to *read*.
+    ///
+    /// Solid, on purpose. This used to be `text` at 47% alpha, which reads
+    /// fine on the chrome it was drawn on and turns into something else
+    /// entirely the moment a call site multiplies it by another opacity for a
+    /// wash: 47% of 16% is 7.5%, not 16%, and the two ended up drawing on top
+    /// of each other in more than one place with nobody having asked for the
+    /// weaker number. A solid colour is one a caller can dim on purpose and
+    /// nothing dims it by accident.
     pub muted: Hsla,
+    /// Decorative marks that are not read as words: the titlebar's chevron,
+    /// the little icon beside a status-bar count. Quieter than [`Self::muted`]
+    /// deliberately — those are marks that repeat what the text beside them
+    /// already says, so they are allowed to sit under the contrast floor a
+    /// sentence needs. Never put a word in this colour.
+    pub tertiary: Hsla,
     pub accent: Hsla,
 
     /// Per-type card tints, so a board reads as a board at a glance rather than
@@ -44,6 +61,20 @@ pub struct Theme {
     pub audio: Hsla,
     pub link: Hsla,
     pub fence: Hsla,
+
+    /// A quote's bar and a rule's line, drawn on a card. Not [`Self::muted`],
+    /// even though both used to be the same field: a quote is a *different*
+    /// kind of quiet from a secondary label, and a colour tuned for the
+    /// chrome behind [`Self::muted`] does not promise anything about sitting
+    /// on the note tints underneath this one — which is why this is checked
+    /// against the pad's own background rather than borrowed from a field
+    /// that was.
+    pub quote: Hsla,
+    /// A markdown link, drawn on a card. Not [`Self::accent`] — the accent is
+    /// what a *selected* card wears, and a link that borrowed it read as a
+    /// selection sitting on an unrelated note. Accent's hue family, so a link
+    /// still reads as "the same idea, elsewhere" without claiming to be one.
+    pub note_link: Hsla,
 
     /// The five colours a connection may be named.
     ///
@@ -59,6 +90,16 @@ pub struct Theme {
     /// The marks that appear beside a card you are pointing at. Faint on
     /// purpose: an offer, not a control.
     pub anchor: Hsla,
+    /// The rules that appear while a card is being dragged, saying what it has
+    /// lined up with. See `core::guides`.
+    ///
+    /// Deliberately **not** the accent: the accent means "selected" everywhere
+    /// else on this board, and a guide is a measurement rather than a thing you
+    /// have hold of. Deliberately not a colour of its own either — the palette
+    /// is warm and a saturated hue in the middle of it would read as another
+    /// card. So it is the text colour, drawn as a hairline, which is only ever
+    /// on screen while a hand is down.
+    pub guide: Hsla,
 }
 
 impl Default for Theme {
@@ -76,7 +117,14 @@ impl Default for Theme {
             selected_edge: rgb(0xb4553a).into(),
 
             text: rgb(0xe8e2d0).into(),
-            muted: rgba(0xe8e2d077).into(),
+            // ~7:1 on the chrome (#1b1c15) — comfortably past the 4.5:1 a
+            // sentence needs, with room to spare for the tints a card wash
+            // draws it over.
+            muted: rgb(0xa8a293).into(),
+            // ~4.6:1 on the chrome — past the floor, and no further: a mark
+            // this quiet is only ever beside the words that already say what
+            // it means.
+            tertiary: rgb(0x84806f).into(),
             accent: rgb(0xb4553a).into(),
 
             note: rgb(0x4a422a).into(),
@@ -85,6 +133,12 @@ impl Default for Theme {
             audio: rgb(0x2c3d33).into(),
             link: rgb(0x33334a).into(),
             fence: rgba(0xb4553a14).into(),
+
+            // ≥4.5:1 over every note tint (the darkest is #4a422a), not just
+            // over the chrome — a quote and a link are drawn on a card, never
+            // on the chrome behind it.
+            quote: rgb(0xb8b2a2).into(),
+            note_link: rgb(0xd98a6e).into(),
 
             // Bright enough to read against the ground at a glance and dull
             // enough not to compete with the cards they join — a rope is how
@@ -95,6 +149,14 @@ impl Default for Theme {
             rope_leaf: rgb(0x6f9455).into(),
             rope_danger: rgb(0xbf4a4a).into(),
             anchor: rgba(0xe8e2d059).into(),
+            // The same weight as the marks beside a card, and for the same
+            // reason that note gives: this is an offer rather than a control.
+            // Stronger than the axes it crosses, which sit at `22` and are
+            // permanent furniture you have learned to look past — but a guide
+            // appears over somebody's photographs while their hand is down, and
+            // anything louder than this stops being feedback and starts being
+            // a stripe painted across their board.
+            guide: rgba(0xe8e2d059).into(),
         }
     }
 }
@@ -112,6 +174,69 @@ pub const NOTE_TINT_COUNT: u32 = 4;
 
 /// What a swatch draws as when its `hex` is missing or is not a colour.
 const SWATCH_FALLBACK: Hsla = Hsla { h: 0.0, s: 0.0, l: 0.55, a: 1.0 };
+
+/// The corner radii, named rather than picked fresh at every call site.
+///
+/// Four numbers rather than the six ad-hoc ones they replace, and nested
+/// *concentrically* where one shape sits inside another: a row inset six
+/// pixels into a panel takes the panel's radius less the inset, not a radius
+/// of its own guessed to look about right. A palette row and a switcher row
+/// both being [`RADIUS_SM`] inside a [`RADIUS_LG`] panel is that arithmetic
+/// done once rather than eyeballed twice.
+pub const RADIUS_XS: f32 = 4.0;
+pub const RADIUS_SM: f32 = 6.0;
+pub const RADIUS_MD: f32 = 8.0;
+pub const RADIUS_LG: f32 = 12.0;
+
+/// A shadow, tuned for the ground this app draws on rather than borrowed from
+/// Tailwind's default scale.
+///
+/// Tailwind's shadows are ten-percent black, which is arithmetic that assumes
+/// a white page underneath and is close to arithmetically invisible over
+/// `#14150f` — every floating surface in this app was being held off the
+/// canvas by its one-pixel hairline alone. Three sizes rather than one,
+/// because a twenty-six pixel tooltip and a five-hundred-and-sixty pixel
+/// modal are not the same weight of thing hanging over the board, and casting
+/// them the same shadow said they were.
+fn shadow(y: f32, blur: f32, spread: f32, alpha: f32) -> Vec<BoxShadow> {
+    vec![BoxShadow {
+        color: Hsla { h: 0.0, s: 0.0, l: 0.0, a: alpha },
+        offset: point(px(0.0), px(y)),
+        blur_radius: px(blur),
+        spread_radius: px(spread),
+    }]
+}
+
+/// The tooltip's shadow — light, because a tip is gone half a second after it
+/// arrived and does not need to argue for its place above the board.
+pub fn shadow_small() -> Vec<BoxShadow> {
+    shadow(2.0, 8.0, -2.0, 0.45)
+}
+
+/// The menu's shadow, and the tool strip's — chrome that sits over the board
+/// for as long as somebody is using it, and wants to look like it is a shade
+/// closer to them than the cards underneath.
+pub fn shadow_medium() -> Vec<BoxShadow> {
+    shadow(6.0, 20.0, -4.0, 0.55)
+}
+
+/// The palette's shadow, the switcher's, the loader's — the surfaces heavy
+/// enough to have put a scrim behind them already, and that want to read as
+/// genuinely lifted off the board rather than merely drawn on top of it.
+pub fn shadow_large() -> Vec<BoxShadow> {
+    shadow(16.0, 48.0, -8.0, 0.60)
+}
+
+/// Digits that hold their width as they change.
+///
+/// Without this every `1` in a reading is narrower than every `0` beside it,
+/// so a number that is not otherwise moving still shivers sideways as its
+/// digits turn over — the zoom percentage in the status bar and the elapsed
+/// time on a card that plays are the app's only two live numbers, and both of
+/// them are read at a glance precisely because they hold still.
+pub fn numeric() -> FontFeatures {
+    FontFeatures(Arc::new(vec![("tnum".to_string(), 1)]))
+}
 
 /// A card's tint, where it has one in range.
 fn tint_of(item: &mbrd_core::Item) -> Option<u32> {

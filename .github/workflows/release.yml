@@ -141,6 +141,18 @@ jobs:
       # cross-compiled from Linux: gpui's build script gates the whole shader
       # step on the *host* being Windows, so a cross build skips it silently
       # and then fails on the bindings that step was meant to write.
+      - name: Install NSIS
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe")) {
+            choco install nsis --no-progress -y
+          }
+          # `FindProcDLL`, which `mbrd.nsi` uses to refuse to install over a
+          # running copy. Not part of the base NSIS install.
+          choco install nsis-plugin-findprocdll --no-progress -y `
+            --ignore-package-exit-codes || Write-Host "findprocdll unavailable; continuing"
+
       - name: Find the shader compiler
         if: matrix.platform == 'windows-latest'
         shell: pwsh
@@ -156,6 +168,12 @@ jobs:
       - name: Build
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
+          # The key the updater verifies against, baked in. A repository
+          # *variable*, not a secret — it is a public key, and hiding it would
+          # only hide it from the people who might want to check a release
+          # against it. A build without it cannot install anything at all; see
+          # crates/app/src/update/mod.rs.
+          MBRD_UPDATE_KEY: ${{ vars.MBRD_UPDATE_PUBLIC_KEY }}
         run: cargo build --release -p mbrd --target ${{ matrix.target }}
 
       # A `.app`, because a bare Mach-O has no name in the menu bar, no Dock
@@ -171,8 +189,16 @@ jobs:
           sed "s/__VERSION__/$VERSION/g" packaging/macos/Info.plist \
             > "$APP/Contents/Info.plist"
           cp "target/${{ matrix.target }}/release/mbrd" "$APP/Contents/MacOS/mbrd"
+          cp packaging/icons/mbrd.icns "$APP/Contents/Resources/mbrd.icns"
           chmod +x "$APP/Contents/MacOS/mbrd"
           codesign --force --deep --sign - "$APP"
+
+          # The updater's copy, tarred *after* the signature so the bundle it
+          # installs is the one macOS will run. A `.dmg` would need `hdiutil
+          # attach` and a mounted filesystem to read one directory out of; a
+          # tarball needs two crates and no subprocess. See SHIPPING.md.
+          tar -czf "dist/mbrd_${VERSION}_${{ matrix.arch }}.app.tar.gz" \
+            -C stage mbrd.app
 
           # The symlink is what makes the window that opens a drag-to-install
           # rather than a folder with a mystery in it.
@@ -187,6 +213,56 @@ jobs:
           tar -czf "dist/mbrd_${VERSION}_${{ matrix.arch }}-linux.tar.gz" \
             -C "target/${{ matrix.target }}/release" mbrd
 
+      # One file that runs on any desktop from the glibc floor upward, with
+      # its own copies of the shared libraries the tarball expects to find.
+      # This is the answer to "standalone" on the one platform where the app
+      # is not already: Windows links its runtime statically and macOS ships a
+      # bundle, and Linux has neither until this exists.
+      - name: Package the AppImage
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSLo /tmp/linuxdeploy \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x /tmp/linuxdeploy
+
+          # The runner has no FUSE, so the AppImages we *use* have to be
+          # unpacked rather than mounted. The one we produce is unaffected.
+          ( cd /tmp && ./linuxdeploy --appimage-extract >/dev/null )
+
+          mkdir -p AppDir/usr/bin
+          cp "target/${{ matrix.target }}/release/mbrd" AppDir/usr/bin/mbrd
+
+          APPIMAGE_EXTRACT_AND_RUN=1 /tmp/squashfs-root/AppRun \
+            --appdir AppDir \
+            --executable AppDir/usr/bin/mbrd \
+            --desktop-file packaging/linux/mbrd.desktop \
+            --icon-file packaging/icons/hicolor/256x256/apps/mbrd.png \
+            --output appimage
+
+          mv mbrd*.AppImage "dist/mbrd_${VERSION}_${{ matrix.arch }}.AppImage"
+
+      # Native packages, for people who would rather their package manager
+      # knew about this. Both set MBRD_PACKAGED, which is what stops the
+      # in-app updater writing over a file dpkg or rpm believes it owns —
+      # see crates/app/src/update/eligible.rs.
+      - name: Package the deb and the rpm
+        if: runner.os == 'Linux'
+        env:
+          MBRD_PACKAGED: "1"
+        run: |
+          cargo install cargo-deb cargo-generate-rpm --locked
+
+          # Both tools read `target/release`, not `target/<triple>/release`,
+          # and the matrix builds into the latter. Rebuild rather than copy:
+          # the marker above changes the binary, so this is a genuinely
+          # different build and not the same one in a different place.
+          cargo build --release -p mbrd
+
+          cargo deb -p mbrd --no-build --output \
+            "dist/mbrd_${VERSION}_amd64.deb"
+          cargo generate-rpm -p crates/app --output \
+            "dist/mbrd-${VERSION}-1.x86_64.rpm"
+
       # No installer. One file, which is what somebody being sent a copy wants,
       # and there is nothing to install alongside it.
       - name: Package the Windows exe
@@ -196,6 +272,22 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item "target\${{ matrix.target }}\release\mbrd.exe" `
             "dist\mbrd_${env:VERSION}_${{ matrix.arch }}.exe"
+          # The name the installer script expects to find it under. The
+          # portable artifact carries the version in its name and the
+          # installed one must not, because the updater replaces it in place.
+          Copy-Item "target\${{ matrix.target }}\release\mbrd.exe" "dist\mbrd.exe"
+
+      # An installer as well as the portable exe, not instead of it. Per-user,
+      # which means no UAC prompt and — the reason that matters here — an
+      # installed executable the app can still write to, so the in-app updater
+      # works in the installed location. See packaging/windows/mbrd.nsi.
+      - name: Package the Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" `
+            "/DVERSION=${env:VERSION}" packaging\windows\mbrd.nsi
+          Remove-Item "dist\mbrd.exe"
 
       - name: Size
         shell: bash
@@ -218,3 +310,129 @@ jobs:
           name: mbrd-${{ matrix.target }}
           path: dist/
           if-no-files-found: error
+
+  # What the in-app updater reads, and the only thing standing between a
+  # release download and arbitrary code execution on somebody's machine —
+  # nothing here is signed by Apple or Microsoft, so this signature is the
+  # entire trust boundary. See SHIPPING.md.
+  #
+  # Last, and its own job, because it hashes the artifacts the four build jobs
+  # produced: it cannot run until all of them have finished, and it must not
+  # run if any of them failed. `needs` gives both.
+  manifest:
+    needs: [notes, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    environment: release
+    env:
+      VERSION: ${{ needs.notes.outputs.version }}
+      REF: ${{ github.ref_name }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # `rsign2`, not the `minisign` apt package, and the difference matters.
+      # The key was generated with rsign, and rsign is what is known to read
+      # it back: the two implementations agree on the *signature* format, but
+      # whether one reads the other's passwordless secret key is an assumption
+      # nobody here has tested. On the one path that would break the trust
+      # root, using the tool that made the key removes the question.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: rsign
+      - name: Install rsign
+        run: cargo install rsign2 --locked
+
+      # From the release rather than from the build jobs' workspaces, so what
+      # is hashed is what somebody will actually download — including anything
+      # GitHub did to it on the way in.
+      - name: Fetch the artifacts
+        run: |
+          mkdir -p dist
+          gh release download "$REF" --dir dist --pattern '*'
+          ls -lh dist
+
+      - name: Write the manifest
+        run: |
+          # The updater is indexed by target triple, so the map is written by
+          # hand rather than derived: the triple a binary was *built* for is
+          # not recoverable from the name of the file it ended up in, and
+          # guessing it wrong would offer somebody another platform's build.
+          write() {
+            local triple="$1" file="dist/$2"
+            if [ ! -f "$file" ]; then
+              echo "::error::$file is missing; the $triple build did not publish"
+              exit 1
+            fi
+            printf '%s %s %s %s\n' "$triple" "$2" \
+              "$(stat -c%s "$file")" \
+              "$(sha256sum "$file" | cut -d" " -f1)"
+          }
+
+          {
+            write aarch64-apple-darwin     "mbrd_${VERSION}_aarch64.app.tar.gz"
+            write x86_64-apple-darwin      "mbrd_${VERSION}_x64.app.tar.gz"
+            write x86_64-pc-windows-msvc   "mbrd_${VERSION}_x64.exe"
+            write x86_64-unknown-linux-gnu "mbrd_${VERSION}_x86_64-linux.tar.gz"
+          } > targets.txt
+
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${REF}"
+          {
+            printf '{\n  "version": "%s",\n' "$VERSION"
+            printf '  "notes": "https://github.com/%s/releases/tag/%s",\n' \
+              "$GITHUB_REPOSITORY" "$REF"
+            printf '  "targets": {\n'
+            first=1
+            while read -r triple file size sha; do
+              [ $first -eq 1 ] || printf ',\n'
+              first=0
+              printf '    "%s": { "url": "%s/%s", "size": %s, "sha256": "%s" }' \
+                "$triple" "$BASE" "$file" "$size" "$sha"
+            done < targets.txt
+            printf '\n  }\n}\n'
+          } > latest.json
+
+          cat latest.json
+          # Fail here rather than shipping something the client will refuse.
+          python3 -c "import json,sys; json.load(open('latest.json'))"
+
+      - name: Sign it
+        env:
+          SECRET_KEY: ${{ secrets.MBRD_UPDATE_SECRET_KEY }}
+          PUBLIC_KEY: ${{ vars.MBRD_UPDATE_PUBLIC_KEY }}
+        run: |
+          if [ -z "$SECRET_KEY" ]; then
+            echo "::error::MBRD_UPDATE_SECRET_KEY is not set."
+            echo "::error::Without it the release has no manifest and no"
+            echo "::error::existing install will be offered this version."
+            exit 1
+          fi
+          if [ -z "$PUBLIC_KEY" ]; then
+            echo "::error::MBRD_UPDATE_PUBLIC_KEY is not set, so the binaries"
+            echo "::error::in this release were built unable to verify anything."
+            exit 1
+          fi
+
+          printf '%s\n' "$SECRET_KEY" > /tmp/mbrd.key
+          chmod 600 /tmp/mbrd.key
+
+          # `-H` prehashes. Not optional: the client calls minisign-verify with
+          # `allow_legacy: false`, which refuses a non-prehashed signature
+          # outright, and a release signed without it would be refused by every
+          # install with no useful error anywhere. `manifest.rs` has a test for
+          # the pairing. `-W` because the key carries no password — it is a
+          # GitHub secret, and a password held as a second GitHub secret would
+          # protect it from nothing the first is not already exposed to.
+          rsign sign -W -H -s /tmp/mbrd.key -x latest.json.minisig latest.json
+          shred -u /tmp/mbrd.key
+
+          # Verify what was just signed against the *public* key the binaries
+          # in this very release were compiled with. If the two halves have
+          # drifted apart, every install refuses every update and the only
+          # symptom is that nobody is ever offered one — so it is checked here,
+          # where it is still a failed job rather than a silent dead release.
+          rsign verify -P "$PUBLIC_KEY" -x latest.json.minisig latest.json
+
+      - name: Attach it to the release
+        run: gh release upload "$REF" latest.json latest.json.minisig --clobber

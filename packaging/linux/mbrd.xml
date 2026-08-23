@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  What a `.mbrd` is, for the shared MIME database. Installed to
+  `/usr/share/mime/packages/` by the .deb and the .rpm, which is what makes a
+  file manager show the icon and offer this app for one.
+
+  `application/x-mbrd` rather than a registered `application/vnd.*` type,
+  because this is not registered with IANA and claiming a vendor tree that has
+  not been applied for would be claiming something untrue.
+-->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-mbrd">
+    <comment>mbrd board</comment>
+    <glob pattern="*.mbrd"/>
+    <!-- A `.mbrd` is a zip. The magic is the zip signature, which on its own
+         would match every zip there is — so the glob is what actually decides,
+         and the magic only has to lose to it. Hence the low priority. -->
+    <magic priority="30">
+      <match type="string" value="PK\003\004" offset="0"/>
+    </magic>
+    <sub-class-of type="application/zip"/>
+    <generic-icon name="mbrd"/>
+  </mime-type>
+</mime-info>

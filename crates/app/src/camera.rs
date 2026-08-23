@@ -74,7 +74,19 @@ const SLACK_EASE: f32 = 0.12;
 /// it — that is what the closed form in [`mbrd_core::motion`] is for — but a
 /// camera that teleports a second's worth of travel in one frame is not
 /// animation, so a very long frame is treated as a slow one instead.
-const LONGEST_FRAME: f32 = 1.0 / 15.0;
+///
+/// This is only for that pathology — a window dragged off to sleep, a modal
+/// loop, a monitor drag — and not for anything a working board does in the
+/// course of an afternoon. It used to sit at `1/15`, which also caught a
+/// perfectly routine 200ms hitch (a big picture landing mid-decode) and
+/// rewound the camera's clock to make it look like the flick in flight had
+/// only travelled a fifteenth of a second, roughly 130ms behind the wall
+/// clock it was actually released on. The closed-form spring does not need
+/// that protection — a 350ms step is exercised in `motion`'s own tests and
+/// stays finite — so the clamp only has to be short enough to stop a frame
+/// from reading as a teleport, not short enough to catch a hitch a decode
+/// leaves behind.
+const LONGEST_FRAME: f32 = 0.25;
 
 /// The camera's motion: three springs, a strain, and what it is aiming at.
 pub struct Camera {
@@ -103,6 +115,11 @@ pub struct Camera {
     /// animated by something that did not think about where you were aiming.
     /// While this is set the pan is derived from it every frame rather than
     /// sprung, and any deliberate pan clears it.
+    ///
+    /// Only ever taken while the pan is at rest — see [`Camera::zoom_by`] —
+    /// because deriving the pan from the pivot means *not* stepping its
+    /// spring, and a pan already in flight to a `travel_to` or a flick has
+    /// somewhere to be that a zoom did not ask it to give up.
     pivot: Option<(WorldPoint, ScreenPoint)>,
     /// When the last frame was, so that a step knows how long it is for.
     last: Option<Instant>,
@@ -182,9 +199,17 @@ impl Camera {
     /// `from` is where the camera is now and the velocity is in world units per
     /// second — the pan's own units, so that the projection below is a distance
     /// in the same space as the thing being projected.
+    ///
+    /// Uses [`Spring::THROW`], not [`Spring::CAMERA`], and the two are not
+    /// interchangeable here the way they might look: `THROW` is specifically
+    /// the spring whose response is matched to `motion::DECELERATION`, so that
+    /// the curve `project` used to pick the landing point is the same curve
+    /// the spring actually draws on the way there. A mismatched spring hits
+    /// this exact landing point too, just not smoothly — see `Spring::THROW`'s
+    /// doc for what that costs.
     pub fn fling(&mut self, from: WorldPoint, vx: f32, vy: f32) {
         self.pivot = None;
-        self.pan_spring = Spring::FLICK;
+        self.pan_spring = Spring::THROW;
         self.x.fling(from.x + motion::project(vx, motion::DECELERATION), vx);
         self.y.fling(from.y + motion::project(vy, motion::DECELERATION), vy);
     }
@@ -206,11 +231,25 @@ impl Camera {
     /// The world point currently under `at` is read *now* and pinned, so the
     /// thing being aimed at is the thing that holds still for the whole of the
     /// animation and not merely at the end of it.
+    ///
+    /// That pin is only taken when the pan is at rest. `step`'s pivot branch
+    /// derives the pan from the pivot every frame instead of stepping its
+    /// spring, which is exactly right when the pan had nowhere else to be —
+    /// but a pan mid-flight to a `travel_to` destination or still carrying a
+    /// flick *does* have somewhere else to be, and deriving it from a wheel
+    /// notch would silently overwrite that flight and park its spring at
+    /// zero velocity: the board would slam to a halt sideways, the destination
+    /// discarded without anything having asked for that. So a pan already
+    /// moving is left alone and the zoom simply scales about the middle of the
+    /// view for as long as the flight lasts — losing zoom-to-cursor for that
+    /// stretch is a far smaller thing than losing the destination outright.
     pub fn zoom_by(&mut self, factor: f32, at: ScreenPoint, vp: &Viewport) {
         if factor <= 0.0 || !factor.is_finite() {
             return;
         }
-        self.pivot = Some((vp.to_world(point(at.0, at.1)), at));
+        if !self.x.moving() && !self.y.moving() {
+            self.pivot = Some((vp.to_world(point(at.0, at.1)), at));
+        }
 
         let wanted = self.scale.target() + factor.ln();
         let bound = wanted.clamp(MIN_ZOOM.ln(), MAX_ZOOM.ln());
@@ -313,6 +352,9 @@ impl Camera {
 /// millisecond apart, and one stray sample divided by one millisecond is a
 /// number that throws the board into the next county. So a short history is
 /// kept and the velocity is measured across it.
+///
+/// [`Trail::throw`] is the one the release actually asks, and it is the
+/// stricter of the two: a measured speed is not on its own a throw.
 #[derive(Debug, Default)]
 pub struct Trail {
     samples: VecDeque<(WorldPoint, Instant)>,
@@ -336,6 +378,38 @@ const TRAIL_STALE: f32 = 0.06;
 
 /// The shortest span worth dividing by.
 const TRAIL_SHORTEST: f32 = 0.008;
+
+/// Below this speed at release, the hand was not throwing anything, in
+/// *screen* pixels a second.
+///
+/// The rule this enforces: **inertia is for flicks, not for every drag.**
+/// Placing the board by hand and letting go while the hand happens to still
+/// be drifting is not a throw, and answering it with one is why the board
+/// seemed to slide sometimes and not others — the difference was real but far
+/// too small to feel deliberate, so it read as the board deciding for itself.
+/// At or below this the board stays exactly where it was put; above it,
+/// something carries on — see [`TRAIL_THROW`] for how much.
+///
+/// In screen pixels rather than world units because it is a statement about
+/// the hand, and the hand does not know the zoom: the same flick across the
+/// desk has to be the same flick at 10% and at 500%.
+const TRAIL_FLOOR: f32 = 120.0;
+
+/// At or above this release speed the board carries on at the hand's full
+/// speed, in *screen* pixels a second.
+///
+/// This used to be the *only* threshold: below it, nothing; at it, the board
+/// suddenly carried on at the full release velocity. A release at 399 stopped
+/// dead and one at 401 sailed off, and there is no gesture that precise — the
+/// hand cannot aim for a pixel-per-second, so which side of the line a release
+/// landed on read as the board flipping a coin.
+///
+/// [`Trail::throw`] now ramps the gain smoothly from `0` at [`TRAIL_FLOOR`] to
+/// `1` here, so the speed the hand actually let go at comes out as a
+/// proportionate throw instead of an all-or-nothing guess. The cliff was the
+/// bug; the two speeds themselves are unchanged from what a flick has always
+/// meant here.
+const TRAIL_THROW: f32 = 400.0;
 
 impl Trail {
     /// Note where the camera is, now.
@@ -366,6 +440,37 @@ impl Trail {
             return None;
         }
         Some(((last.x - first.x) / span, (last.y - first.y) / span))
+    }
+
+    /// The velocity to carry on at, or `None` if the release did not clear
+    /// [`TRAIL_FLOOR`].
+    ///
+    /// Everything [`Trail::velocity`] rejects, and one thing more: a hand at
+    /// or below [`TRAIL_FLOOR`] at the release was placing the board rather
+    /// than throwing it. Between the floor and [`TRAIL_THROW`] the release is
+    /// scaled down by a smoothstep rather than passed through whole or
+    /// dropped outright — see [`TRAIL_THROW`] for why a hard line was worth
+    /// replacing. `zoom` converts both thresholds into the trail's own units.
+    pub fn throw(&self, now: Instant, zoom: f32) -> Option<(f32, f32)> {
+        let (vx, vy) = self.velocity(now)?;
+        // The whole speed, not either axis: a diagonal flick is one gesture,
+        // and asking per-axis would take a fast throw at 45 degrees for two
+        // slow ones and drop it.
+        let z = zoom.max(f32::EPSILON);
+        let floor = TRAIL_FLOOR / z;
+        let full = TRAIL_THROW / z;
+        let speed = vx.hypot(vy);
+        if speed <= floor {
+            return None;
+        }
+        // Smoothstep rather than a straight ramp: a linear gain starts moving
+        // the instant the hand clears the floor, which just relocates the
+        // cliff to that boundary as a kink in the carried velocity instead of
+        // a jump in it. The cubic's derivative is zero at both ends, so the
+        // gain comes on gradually and saturates gradually too.
+        let t = ((speed - floor) / (full - floor)).clamp(0.0, 1.0);
+        let gain = t * t * (3.0 - 2.0 * t);
+        Some((vx * gain, vy * gain))
     }
 }
 
@@ -437,6 +542,42 @@ mod tests {
     }
 
     #[test]
+    fn zooming_mid_travel_does_not_kill_the_pan() {
+        // The brick wall this module's invariant promises not to be:
+        // `zoom_by` used to take the pivot unconditionally, and the pivot
+        // branch of `step` derives the pan from the pivot and parks the pan
+        // springs every frame — so a wheel notch during a `travel_to` used to
+        // silently zero the pan's velocity and drop the destination, and the
+        // board would slam to a halt sideways mid-flight.
+        let (mut v, mut cam) = (vp(), Camera::new(&vp()));
+        let mut want = v;
+        want.pan = point(4000.0, 0.0);
+        cam.travel_to(&want);
+        for _ in 0..10 {
+            cam.step(&mut v, 1.0 / 120.0);
+        }
+        let target_before = cam.resting().0;
+
+        // Velocity just before the zoom, from two consecutive positions.
+        let p0 = v.pan;
+        cam.step(&mut v, 1.0 / 120.0);
+        let p1 = v.pan;
+        let velocity_before = (p1.x - p0.x) * 120.0;
+        assert!(velocity_before > 0.0, "it should already be travelling");
+
+        cam.zoom_by(1.1, (400.0, 300.0), &v);
+        cam.step(&mut v, 1.0 / 120.0);
+        let p2 = v.pan;
+        let velocity_after = (p2.x - p1.x) * 120.0;
+
+        assert!(
+            velocity_after > velocity_before * 0.9,
+            "the zoom killed the pan: {velocity_before} became {velocity_after}"
+        );
+        assert_eq!(cam.resting().0, target_before, "zooming mid-flight changed the destination");
+    }
+
+    #[test]
     fn a_zoom_holds_the_point_under_the_cursor_for_the_whole_animation() {
         // The one that matters. Checking only the ends would pass on an
         // implementation that lets the board slide out from under the pointer
@@ -505,10 +646,15 @@ mod tests {
 
     #[test]
     fn a_flick_carries_on_the_way_it_was_going() {
+        // 400.0 was the threshold before `motion::DECELERATION` was retuned
+        // from 0.998 to 0.996 for a snappier canvas glide (see `Spring::THROW`
+        // for why the two are a matched pair); `motion::project(1200.0, 0.996)`
+        // now lands at roughly 300, so the bar is lower but still well short
+        // of a no-op.
         let (mut v, mut cam) = (vp(), Camera::new(&vp()));
         cam.fling(point(0.0, 0.0), 1200.0, 0.0);
         settle(&mut cam, &mut v);
-        assert!(v.pan.x > 400.0, "a hard flick only carried it to {}", v.pan.x);
+        assert!(v.pan.x > 250.0, "a hard flick only carried it to {}", v.pan.x);
         assert_eq!(v.pan.y, 0.0, "a sideways flick moved it vertically");
     }
 
@@ -521,6 +667,37 @@ mod tests {
         settle(&mut gentle.1, &mut gentle.0);
         settle(&mut hard.1, &mut hard.0);
         assert!(hard.0.pan.x > gentle.0.pan.x * 3.0);
+    }
+
+    #[test]
+    fn a_flick_never_speeds_up_after_the_hand_lets_go() {
+        // The bug `Spring::THROW` exists to kill: with a pan spring stiffer
+        // than the decay `motion::project` assumes, the position error at the
+        // handoff dominates the seeded velocity and the board *accelerates*
+        // for the first several frames after release — a lurch to several
+        // times the release speed — before dying away. The two tests above
+        // only look at where the flick lands, and land it does either way, so
+        // neither would ever catch this: this one watches the whole flight.
+        let (mut v, mut cam) = (vp(), Camera::new(&vp()));
+        let release = 1200.0;
+        cam.fling(point(0.0, 0.0), release, 0.0);
+
+        let dt = 0.008;
+        let mut last = v.pan;
+        let mut peak: f32 = 0.0;
+        for _ in 0..2000 {
+            let moving = cam.step(&mut v, dt);
+            let speed = ((v.pan.x - last.x) / dt).abs();
+            peak = peak.max(speed);
+            last = v.pan;
+            if !moving {
+                break;
+            }
+        }
+        assert!(
+            peak <= release * 1.05,
+            "the flick peaked at {peak}, well past the release speed of {release}"
+        );
     }
 
     #[test]
@@ -607,6 +784,90 @@ mod tests {
         }
         // Dragged fast, then held still for half a second. The board stays.
         assert!(trail.velocity(now).is_none());
+    }
+
+    /// A drag at `speed` world units a second, sampled the way a pointer does.
+    fn dragged_at(speed: f32, now: Instant) -> Trail {
+        let mut trail = Trail::default();
+        for i in 0..=5 {
+            let ago = 50 - i * 10;
+            let t = now - Duration::from_millis(ago as u64);
+            trail.push(point(-speed * ago as f32 / 1000.0, 0.0), t);
+        }
+        trail
+    }
+
+    #[test]
+    fn a_slow_drag_is_a_placement_and_does_not_throw() {
+        // The complaint this exists for: letting go of a deliberate drag while
+        // the hand is still drifting used to slide the board a little, which
+        // read as inertia arriving at random. Below TRAIL_FLOOR, not merely
+        // below the old single TRAIL_THROW cliff.
+        let now = Instant::now();
+        let trail = dragged_at(TRAIL_FLOOR * 0.5, now);
+        assert!(trail.velocity(now).is_some(), "the drag was not even measured");
+        assert!(trail.throw(now, BASE_ZOOM).is_none(), "a slow drag threw the board");
+    }
+
+    #[test]
+    fn a_quick_drag_still_throws() {
+        let now = Instant::now();
+        let (vx, vy) = dragged_at(1600.0, now).throw(now, BASE_ZOOM).expect("that was a flick");
+        assert!((vx - 1600.0).abs() < 50.0, "it threw at {vx}");
+        assert_eq!(vy, 0.0);
+    }
+
+    #[test]
+    fn the_throw_floor_is_a_speed_of_the_hand_not_of_the_board() {
+        // Zoomed out, the same hand covers far more world units a second. The
+        // floor has to move with it, or a gentle drag at 10% would fling and
+        // the identical gesture at 100% would not.
+        let now = Instant::now();
+        let gentle = (TRAIL_FLOOR * 0.5) / 0.1;
+        assert!(
+            dragged_at(gentle, now).throw(now, 0.1).is_none(),
+            "the same slow hand threw the board once it was zoomed out"
+        );
+        let flick = (TRAIL_THROW * 4.0) / 0.1;
+        assert!(dragged_at(flick, now).throw(now, 0.1).is_some(), "a flick at 10% did nothing");
+    }
+
+    #[test]
+    fn a_release_between_the_floor_and_the_full_throw_is_scaled_not_all_or_nothing() {
+        // The bug the smoothstep replaces: a straight cliff at TRAIL_THROW
+        // meant every release in between either carried at the full release
+        // speed or not at all. A release halfway between the two thresholds
+        // should carry, but slower than the hand actually let go at.
+        let now = Instant::now();
+        let midpoint = (TRAIL_FLOOR + TRAIL_THROW) / 2.0;
+        let (vx, _) = dragged_at(midpoint, now).throw(now, BASE_ZOOM).expect("above the floor");
+        assert!(vx > 0.0, "it did not carry on at all");
+        assert!(vx < midpoint, "a half-cleared throw carried at the full release speed");
+    }
+
+    #[test]
+    fn a_diagonal_flick_is_one_gesture() {
+        // Neither axis clears the floor alone; together they are plainly a
+        // throw, and a per-axis test would have dropped it.
+        let now = Instant::now();
+        let mut trail = Trail::default();
+        let speed = TRAIL_THROW * 0.8;
+        for i in 0..=5 {
+            let ago = 50 - i * 10;
+            let d = -speed * ago as f32 / 1000.0;
+            trail.push(point(d, d), now - Duration::from_millis(ago as u64));
+        }
+        assert!(trail.throw(now, BASE_ZOOM).is_some(), "a diagonal flick was ignored");
+    }
+
+    #[test]
+    fn a_hand_that_stopped_before_letting_go_never_throws() {
+        let now = Instant::now();
+        let mut trail = Trail::default();
+        for i in 0..=5 {
+            trail.push(point(i as f32 * 200.0, 0.0), now - Duration::from_millis(500 - i * 10));
+        }
+        assert!(trail.throw(now, BASE_ZOOM).is_none());
     }
 
     #[test]

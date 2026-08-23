@@ -12,7 +12,64 @@ path = "src/main.rs"
 [dependencies]
 mbrd-core = { path = "../core" }
 anyhow.workspace = true
+flate2.workspace = true
 gpui = "0.2.2"
 image.workspace = true
+minisign-verify.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tar.workspace = true
+trash.workspace = true
+ureq.workspace = true
+
+# Only to put an icon on the Windows executable — but declared unconditionally
+# on purpose. Cargo evaluates `[target.'cfg(...)'.build-dependencies]` against
+# the **host**, not the target, so gating this on `cfg(windows)` would remove
+# it from every Linux and macOS build of the build script — including a
+# Windows *cross*-build from Linux, which is the one case the gate looks like
+# it is for. `build.rs` asks `CARGO_CFG_TARGET_OS` instead, which is the
+# question that was meant.
+[build-dependencies]
+embed-resource = "3"
+
+# The Linux packages, built by the release workflow with `cargo-deb` and
+# `cargo-generate-rpm`. Both install the same five things: the binary, the
+# desktop entry, the MIME type, the icons, and nothing else.
+#
+# Both also set `MBRD_PACKAGED`, which is what stops the in-app updater
+# replacing a file `dpkg` or `rpm` believes it owns — see
+# `src/update/eligible.rs`. A package that forgot it would still be caught by
+# the `/usr` prefix check, but the marker is the exact answer and the prefix
+# check is the safety net.
+[package.metadata.deb]
+name = "mbrd"
+maintainer = "omznc"
+section = "graphics"
+priority = "optional"
+# The floor the release build is compiled against — Ubuntu 22.04's glibc. See
+# RELEASING.md for why the runner is pinned there.
+depends = "libc6 (>= 2.35), libxkbcommon-x11-0, libfontconfig1, libfreetype6"
+extended-description = """A moodboard on an endless canvas. Pan, zoom, drop images, notes and connections onto a board that has no edges, and save it as a single .mbrd file that travels."""
+assets = [
+    ["../../target/release/mbrd", "usr/bin/", "755"],
+    ["../../packaging/linux/mbrd.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/linux/mbrd.xml", "usr/share/mime/packages/", "644"],
+    ["../../packaging/icons/hicolor/**/*", "usr/share/icons/hicolor/", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "../../target/release/mbrd", dest = "/usr/bin/mbrd", mode = "755" },
+    { source = "../../packaging/linux/mbrd.desktop", dest = "/usr/share/applications/mbrd.desktop", mode = "644" },
+    { source = "../../packaging/linux/mbrd.xml", dest = "/usr/share/mime/packages/mbrd.xml", mode = "644" },
+    { source = "../../packaging/icons/hicolor/scalable/apps/mbrd.svg", dest = "/usr/share/icons/hicolor/scalable/apps/mbrd.svg", mode = "644" },
+    { source = "../../packaging/icons/hicolor/256x256/apps/mbrd.png", dest = "/usr/share/icons/hicolor/256x256/apps/mbrd.png", mode = "644" },
+    { source = "../../packaging/icons/hicolor/128x128/apps/mbrd.png", dest = "/usr/share/icons/hicolor/128x128/apps/mbrd.png", mode = "644" },
+    { source = "../../packaging/icons/hicolor/48x48/apps/mbrd.png", dest = "/usr/share/icons/hicolor/48x48/apps/mbrd.png", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+glibc = ">= 2.35"
+libxkbcommon-x11 = "*"
+fontconfig = "*"
+freetype = "*"

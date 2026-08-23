@@ -6,6 +6,11 @@
 //! invalidate and nothing to go stale. This module never reaches for the board
 //! or the spatial index; obstacles are handed in.
 //!
+//! Right angles are how a route is *worked out* and not quite how it is drawn:
+//! [`line`] hands what the search found to [`smooth`], which rounds the turns
+//! without moving the runs between them. Everything below [`route`] is written
+//! in terms of the right angles, so that is where the orthogonality holds.
+//!
 //! ## Why not a grid
 //!
 //! World space is infinite and float, so any fixed cell size either misses real
@@ -242,9 +247,11 @@ pub fn route(a: &Rect, b: &Rect, from: End, to: End, ask: &Ask) -> Vec<Point> {
     // Rung two: the cheap two-bend elbow, on every one of the sixteen pairs.
     // No search, so all sixteen are affordable.
     let pairs = face_pairs(&ranked_a, &ranked_b, from, to);
+    // Neither the obstacles nor the clearance change across the sixteen pairs,
+    // so the wall set is built once rather than once per pair.
+    let blocks = walls(a, b, ask.obstacles, ask.clearance, false);
     for (fa, fb) in &pairs {
         let (sa, sb) = (anchor(a, *fa), anchor(b, *fb));
-        let blocks = walls(a, b, ask.obstacles, ask.clearance, false);
         if let Some(bent) = elbow(sa, sb, *fa, *fb, &blocks) {
             return bent;
         }
@@ -321,15 +328,19 @@ fn walls(a: &Rect, b: &Rect, obstacles: &[Rect], room: f32, forgive_covering: bo
     if out.len() > MAX_OBSTACLES {
         // Shed the furthest, which were never what the route had to bend
         // around. A lattice too large to search gives up cards, not the route.
+        // What survives is unordered — nothing downstream cares which of the
+        // kept obstacles comes first — so the key is worked out once per rect
+        // and a partition finds the nearest `MAX_OBSTACLES` rather than a full
+        // sort recomputing every centre on every comparison.
         let mid = point((a.centre().x + b.centre().x) / 2.0, (a.centre().y + b.centre().y) / 2.0);
-        out.sort_by(|p, q| {
-            let d = |r: &Rect| {
-                let c = r.centre();
-                (c.x - mid.x).powi(2) + (c.y - mid.y).powi(2)
-            };
-            d(p).total_cmp(&d(q))
-        });
-        out.truncate(MAX_OBSTACLES);
+        let d = |r: &Rect| {
+            let c = r.centre();
+            (c.x - mid.x).powi(2) + (c.y - mid.y).powi(2)
+        };
+        let mut keyed: Vec<(f32, Rect)> = out.into_iter().map(|r| (d(&r), r)).collect();
+        keyed.select_nth_unstable_by(MAX_OBSTACLES - 1, |p, q| p.0.total_cmp(&q.0));
+        keyed.truncate(MAX_OBSTACLES);
+        out = keyed.into_iter().map(|(_, r)| r).collect();
     }
     out.push(*a);
     out.push(*b);
@@ -506,45 +517,57 @@ fn search(
         (p.x - target.x).abs() + (p.y - target.y).abs()
     };
 
-    let mut best: HashMap<Step, f32> = HashMap::new();
-    let mut came: HashMap<Step, Step> = HashMap::new();
+    // Flat vectors rather than hash maps: `node < nx * ny <= MAX_NODES`, so
+    // every `Step` packs into a small dense index — see [`packed`] — and a
+    // slot is a pointer add rather than a hash and a probe. Neither map had
+    // any ordering effect on the search, so this changes nothing about which
+    // route is found.
+    let slots = 2 * nx * ny;
+    let mut best: Vec<f32> = vec![f32::INFINITY; slots];
+    // `u32::MAX` stands for "no predecessor" — never a real packed index,
+    // since those top out at `slots - 1`.
+    let mut came: Vec<u32> = vec![u32::MAX; slots];
     let mut open = BinaryHeap::new();
     // Both arrival axes are free at the start: the first move pays no corner,
     // whichever way it goes.
     for horizontal in [true, false] {
         let step = Step { node: start_n, horizontal };
-        best.insert(step, 0.0);
+        best[packed(step) as usize] = 0.0;
         open.push(Queued { f: guess(start_n), step });
     }
 
     while let Some(Queued { step, .. }) = open.pop() {
-        let so_far = best.get(&step).copied().unwrap_or(f32::INFINITY);
+        let so_far = best[packed(step) as usize];
         if step.node == goal_n {
             return Some(unwind(&came, step, world));
         }
         let (ix, iy) = xy(step.node);
+        // Loop-invariant across all four neighbours, so worked out once
+        // rather than once per candidate direction.
+        let from = world(step.node);
         let consider = |dx: i64,
                         dy: i64,
                         open: &mut BinaryHeap<Queued>,
-                        came: &mut HashMap<Step, Step>,
-                        best: &mut HashMap<Step, f32>| {
+                        came: &mut [u32],
+                        best: &mut [f32]| {
             let (nix, niy) = (ix as i64 + dx, iy as i64 + dy);
             if nix < 0 || niy < 0 || nix >= nx as i64 || niy >= ny as i64 {
                 return;
             }
             let next = at(nix as usize, niy as usize);
-            let (a, b) = (world(step.node), world(next));
-            if !clear(a, b, blocks) {
+            let b = world(next);
+            if !clear(from, b, blocks) {
                 return;
             }
             let horizontal = dy == 0;
-            let length = (b.x - a.x).abs() + (b.y - a.y).abs();
+            let length = (b.x - from.x).abs() + (b.y - from.y).abs();
             let turn = if horizontal == step.horizontal { 0.0 } else { TURN_COST };
-            let cost = so_far + length + turn + shared(a, b, avoid) * OVERLAP_COST;
+            let cost = so_far + length + turn + shared(from, b, avoid) * OVERLAP_COST;
             let onward = Step { node: next, horizontal };
-            if cost < best.get(&onward).copied().unwrap_or(f32::INFINITY) {
-                best.insert(onward, cost);
-                came.insert(onward, step);
+            let oi = packed(onward) as usize;
+            if cost < best[oi] {
+                best[oi] = cost;
+                came[oi] = packed(step);
                 open.push(Queued { f: cost + guess(next), step: onward });
             }
         };
@@ -555,12 +578,22 @@ fn search(
     None
 }
 
-fn unwind(came: &HashMap<Step, Step>, end: Step, world: impl Fn(u32) -> Point) -> Vec<Point> {
+/// A [`Step`] packed into a dense index: `node * 2 + horizontal`.
+///
+/// `node < nx * ny <= MAX_NODES`, so this always fits comfortably in a `u32`
+/// — it is what lets [`search`] use flat vectors instead of a
+/// `HashMap<Step, _>`.
+fn packed(step: Step) -> u32 {
+    step.node * 2 + step.horizontal as u32
+}
+
+fn unwind(came: &[u32], end: Step, world: impl Fn(u32) -> Point) -> Vec<Point> {
     let mut out = vec![world(end.node)];
     let mut at = end;
-    while let Some(prev) = came.get(&at) {
-        out.push(world(prev.node));
-        at = *prev;
+    while came[packed(at) as usize] != u32::MAX {
+        let prev = came[packed(at) as usize];
+        at = Step { node: prev / 2, horizontal: prev % 2 == 1 };
+        out.push(world(at.node));
         if out.len() > came.len() + 2 {
             break;
         }
@@ -634,6 +667,103 @@ fn tidy(path: &[Point]) -> Vec<Point> {
         out.push(*path.last().unwrap_or(&point(0.0, 0.0)));
     }
     out
+}
+
+/// The largest a corner is rounded by, in world units.
+///
+/// Generous on purpose, because this is the number that decides whether a
+/// route reads as a line or as a diagram: a two-unit fillet on a right angle
+/// looks like a fault in the rasteriser rather than like a curve. What stops
+/// it swallowing a short jog is the leg cap in [`smooth`], not this.
+const CORNER: f32 = 36.0;
+
+/// How many points one rounded corner is sampled into.
+///
+/// A corner is a quadratic, so eight is well inside a pixel at the sizes a
+/// line is looked at — and a route with four bends still comes back with
+/// fewer points than the twenty-four a [`Rope`] is sampled into, which is the
+/// budget everything downstream was already built for.
+const CORNER_STEPS: usize = 8;
+
+/// The shortest radius worth rounding by. Below it, the corner stays square.
+const CORNER_LEAST: f32 = 1.0;
+
+/// Round the corners of a routed path, without letting it into a card.
+///
+/// The route is a stack of right angles because the search is — see the module
+/// note — and that is the honest shape rather than the nice one. This replaces
+/// each corner with a quadratic through the same turn, which is a **corner
+/// cut**: a quadratic never leaves the triangle its three points make, so what
+/// was clear of a card before is clear of it after.
+///
+/// That containment is the whole reason this is not the interpolating spline
+/// it ends up looking like. A Catmull-Rom through the same points overshoots
+/// *outside* them, and outside them is exactly where the card the route just
+/// bent around is sitting — a smoother line that occasionally drives through a
+/// photograph is a worse line than a square one.
+///
+/// The radius is still checked against the obstacles rather than trusted,
+/// because the last rungs of the ladder route at no clearance at all and a
+/// corner hugging an edge has no room to be cut. A corner that cannot be
+/// rounded stays square, which is the same answer this module gives everywhere
+/// else: concede the shape before conceding the route.
+pub fn smooth(path: &[Point], blocks: &[Rect]) -> Vec<Point> {
+    if path.len() < 3 {
+        return path.to_vec();
+    }
+    let mut out = Vec::with_capacity(path.len() + (path.len() - 2) * CORNER_STEPS);
+    out.push(path[0]);
+    for i in 1..path.len() - 1 {
+        let (prev, here, next) = (path[i - 1], path[i], path[i + 1]);
+        // Half of each leg, so two corners sharing a run meet in the middle of
+        // it rather than fighting over it — and so the stub that leaves a
+        // card's face keeps half its length pointing straight out of the face.
+        let mut radius = CORNER.min(span(prev, here) / 2.0).min(span(here, next) / 2.0);
+        let rounded = loop {
+            if radius < CORNER_LEAST {
+                break None;
+            }
+            let arc = fillet(prev, here, next, radius);
+            if arc.windows(2).all(|w| !blocks.iter().any(|r| meets(w[0], w[1], r))) {
+                break Some(arc);
+            }
+            radius /= 2.0;
+        };
+        match rounded {
+            Some(arc) => out.extend(arc),
+            None => out.push(here),
+        }
+    }
+    out.push(path[path.len() - 1]);
+    out
+}
+
+/// One corner as a sampled quadratic: `radius` back along each leg, bending
+/// through the turn with the corner itself as the control point.
+fn fillet(prev: Point, here: Point, next: Point, radius: f32) -> Vec<Point> {
+    let start = along(here, prev, radius);
+    let end = along(here, next, radius);
+    (0..=CORNER_STEPS)
+        .map(|n| {
+            let t = n as f32 / CORNER_STEPS as f32;
+            let u = 1.0 - t;
+            point(
+                u * u * start.x + 2.0 * u * t * here.x + t * t * end.x,
+                u * u * start.y + 2.0 * u * t * here.y + t * t * end.y,
+            )
+        })
+        .collect()
+}
+
+/// The point `d` from `from`, on the way to `to`.
+fn along(from: Point, to: Point, d: f32) -> Point {
+    let len = span(from, to).max(1e-6);
+    point(from.x + (to.x - from.x) / len * d, from.y + (to.y - from.y) / len * d)
+}
+
+/// How far apart two points are.
+fn span(a: Point, b: Point) -> f32 {
+    ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt()
 }
 
 /// The sixteen face pairs, best first, with the one already tried left out.
@@ -832,8 +962,10 @@ pub enum Line {
     /// Nothing was in the way. The ordinary [`Rope`] stands, and the caller
     /// draws it as the curve it already knew how to draw.
     Curve(Rope),
-    /// Something was, so the line goes round it: an orthogonal polyline in
-    /// world units, never fewer than two points.
+    /// Something was, so the line goes round it: a polyline in world units,
+    /// never fewer than two points. Routed as right angles and then handed to
+    /// [`smooth`], so the long runs are still axis-aligned and the turns
+    /// between them are curves rather than corners.
     Around(Vec<Point>),
 }
 
@@ -863,7 +995,12 @@ pub fn line(a: &Rect, b: &Rect, obstacles: &[Rect]) -> Line {
     }
     let from = End::only(faces_towards(a, b)[0]);
     let to = End::only(faces_towards(b, a)[0]);
-    Line::Around(route(a, b, from, to, &Ask::new(obstacles, &[])))
+    // Rounded here rather than inside [`route`], because the right angles are
+    // what the search, the pull and the overlap charge are all written in
+    // terms of — the curve is how the answer is *drawn*, and this is the
+    // boundary where a route stops being worked out and starts being a line.
+    let path = route(a, b, from, to, &Ask::new(obstacles, &[]));
+    Line::Around(smooth(&path, obstacles))
 }
 
 /// Whether a segment of any slope meets a box.
@@ -913,6 +1050,12 @@ mod tests {
 
     fn hits(path: &[Point], r: &Rect) -> bool {
         path.windows(2).any(|w| crosses(w[0], w[1], r))
+    }
+
+    /// The same question for a path that has been rounded, whose corners are
+    /// no longer axis-aligned and so are not [`crosses`]'s to answer.
+    fn touches(path: &[Point], r: &Rect) -> bool {
+        path.windows(2).any(|w| meets(w[0], w[1], r))
     }
 
     #[test]
@@ -1059,8 +1202,77 @@ mod tests {
         let Line::Around(path) = line(&a, &b, &[wall]) else {
             panic!("a rope was drawn straight through a card");
         };
-        assert!(orthogonal(&path), "{path:?}");
-        assert!(!hits(&path, &wall), "{path:?}");
+        // Not `orthogonal`: what comes out of `line` has had its corners
+        // rounded. What still has to be true is the thing the elbow was for.
+        assert!(!touches(&path, &wall), "{path:?}");
+    }
+
+    #[test]
+    fn a_rounded_corner_stays_inside_the_turn_it_replaced() {
+        // The containment the module note leans on: a quadratic never leaves
+        // the triangle of its three points, so every point of the arc is
+        // inside the box the corner and its two legs make.
+        let (prev, here, next) = (point(0.0, 0.0), point(100.0, 0.0), point(100.0, 100.0));
+        let arc = fillet(prev, here, next, 36.0);
+        let box_ = Rect::new(64.0, 0.0, 100.0, 36.0);
+        for p in &arc {
+            assert!(box_.contains(*p), "{p:?} left the corner's own box");
+        }
+        // And it starts and ends on the legs rather than near them.
+        assert!(span(arc[0], point(64.0, 0.0)) < SAME, "{arc:?}");
+        assert!(span(arc[arc.len() - 1], point(100.0, 36.0)) < SAME, "{arc:?}");
+    }
+
+    #[test]
+    fn smoothing_keeps_the_two_ends_exactly_where_they_were() {
+        // The ends are on the cards' faces, and a line that arrives a whisker
+        // off the face it was aimed at is a line that misses its card.
+        let path = vec![point(0.0, 0.0), point(200.0, 0.0), point(200.0, 200.0)];
+        let out = smooth(&path, &[]);
+        assert_eq!(out[0], path[0]);
+        assert_eq!(out[out.len() - 1], path[2]);
+        assert!(out.len() > path.len(), "nothing was rounded: {out:?}");
+    }
+
+    #[test]
+    fn a_corner_gives_up_room_rather_than_run_into_a_card() {
+        // A card sitting *inside* the turn, which is where the cut goes and
+        // where a square corner was clear. The corner still rounds, by less.
+        let path = vec![point(0.0, 0.0), point(200.0, 0.0), point(200.0, 200.0)];
+        let inside = Rect::new(170.0, 4.0, 196.0, 30.0);
+        assert!(!hits(&path, &inside), "the square corner was supposed to be clear");
+        let out = smooth(&path, &[inside]);
+        assert!(!touches(&out, &inside), "the rounding drove through a card: {out:?}");
+        assert!(out.len() > path.len(), "it gave up on the corner entirely: {out:?}");
+        // Tighter than it would have been with the card gone.
+        let free = smooth(&path, &[]);
+        assert!(out[1].x > free[1].x, "it took the same radius anyway: {out:?}");
+    }
+
+    #[test]
+    fn a_corner_between_two_very_short_legs_stays_square() {
+        // Nothing here is worth a curve: a radius under a world unit is a
+        // corner drawn as a corner with extra points in it.
+        let path = vec![point(0.0, 0.0), point(1.5, 0.0), point(1.5, 1.5)];
+        assert_eq!(smooth(&path, &[]), path);
+    }
+
+    #[test]
+    fn a_short_jog_is_not_swallowed_by_its_own_corners() {
+        // Two corners eight units apart. Each may take half the run between
+        // them and no more, so the jog survives as a jog.
+        let path = vec![point(0.0, 0.0), point(100.0, 0.0), point(100.0, 8.0), point(200.0, 8.0)];
+        let out = smooth(&path, &[]);
+        assert!(!touches(&out, &Rect::new(-1.0, 20.0, 300.0, 40.0)), "it ballooned: {out:?}");
+        // The run still gets from one end to the other, in order.
+        assert!(out[0].x < out[out.len() - 1].x);
+        assert!(out.windows(2).all(|w| w[1].x >= w[0].x - SAME), "it doubled back: {out:?}");
+    }
+
+    #[test]
+    fn a_line_of_two_points_has_no_corners_to_round() {
+        let path = vec![point(0.0, 0.0), point(100.0, 0.0)];
+        assert_eq!(smooth(&path, &[]), path);
     }
 
     #[test]

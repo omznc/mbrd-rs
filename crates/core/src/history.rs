@@ -337,24 +337,30 @@ impl Timeline {
     /// that is what stepping back puts on the board again. So an asset a step
     /// names is live even when no card and no bin entry wants it.
     ///
-    /// Unlike the live board and the bin, a hash named only from here that has
-    /// no bytes is **not** fatal to a save — a step can legitimately name bytes
-    /// something else discarded, and refusing to write somebody's board over an
-    /// entry in its history would be the wrong way round.
+    /// Unlike the live board, a hash named only from here that has no bytes is
+    /// **not** fatal to a save — a step can legitimately name bytes something
+    /// else discarded, and refusing to write somebody's board over an entry in
+    /// its history would be the wrong way round.
+    ///
+    /// **The bin is not walked**, and that is the whole of what keeps a deleted
+    /// photograph from following a board around forever. The bin does not reach
+    /// the file at all now — see [`TrashEntry`](crate::model::TrashEntry) — so
+    /// bytes that only a bin entry names are bytes nothing will ever read back.
+    /// Nothing is lost by it: binning a card records the card on the *items*
+    /// side of the same step, as the value stepping backwards restores, and
+    /// that side is walked. Skipping the trash side skips a second copy of the
+    /// same names, plus the one case they differ — a bin somebody filled in
+    /// another app, which this app is about to drop anyway.
     pub fn hashes(&self) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
-        for keyed in [&self.base.items, &self.base.trash] {
-            for text in keyed.values() {
-                eat_hashes(text, &mut out);
-            }
+        for text in self.base.items.values() {
+            eat_hashes(text, &mut out);
         }
         for step in &self.steps {
-            for section in [Section::Items, Section::Trash] {
-                let Some(part) = step.delta.section(section) else { continue };
-                for (before, after) in part.changed.values() {
-                    for text in [before, after].into_iter().flatten() {
-                        eat_hashes(text, &mut out);
-                    }
+            let Some(part) = step.delta.section(Section::Items) else { continue };
+            for (before, after) in part.changed.values() {
+                for text in [before, after].into_iter().flatten() {
+                    eat_hashes(text, &mut out);
                 }
             }
         }
@@ -674,8 +680,9 @@ pub fn merge_delta(first: &Delta, second: &Delta) -> Delta {
         let mut changed = a.changed.clone();
         for (id, pair) in &b.changed {
             // The earliest before and the latest after: that is the whole of
-            // what collapsing a run means.
-            let from = changed.get(id).map(|p| p.0.clone()).unwrap_or_else(|| pair.0.clone());
+            // what collapsing a run means. `remove` rather than `get` so the
+            // prior `from` is taken rather than cloned when there is one.
+            let from = changed.remove(id).map(|p| p.0).unwrap_or_else(|| pair.0.clone());
             changed.insert(id.clone(), (from, pair.1.clone()));
         }
         // A card moved out and back is not a change, and leaving the pair in
@@ -695,7 +702,7 @@ pub fn merge_delta(first: &Delta, second: &Delta) -> Delta {
     }
     let mut rest = first.rest.clone();
     for (field, pair) in &second.rest {
-        let from = rest.get(field).map(|p| p.0.clone()).unwrap_or_else(|| pair.0.clone());
+        let from = rest.remove(field).map(|p| p.0).unwrap_or_else(|| pair.0.clone());
         rest.insert(field.clone(), (from, pair.1.clone()));
     }
     rest.retain(|_, pair| pair.0 != pair.1);

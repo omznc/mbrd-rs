@@ -90,10 +90,12 @@ impl Editor {
             .then(|| (self.caret.min(self.anchor), self.caret.max(self.anchor)))
     }
 
-    /// Which line the caret is on, and how far along it, in bytes.
+    /// Which line the caret is on, and how far along it, in bytes — lines as
+    /// somebody pressed Enter, with no wrap.
     ///
-    /// What the drawing side needs to put a caret on screen, and the only shape
-    /// in which the answer does not depend on a font.
+    /// What a single-line field's drawing side needs, and what the vertical
+    /// arrows walk. A card's drawing side wraps, and asks [`Self::caret_in`]
+    /// instead.
     pub fn caret_line(&self) -> (usize, usize) {
         let before = &self.text[..self.caret];
         let row = before.matches('\n').count();
@@ -101,29 +103,82 @@ impl Editor {
         (row, column)
     }
 
-    /// The text as lines, split where somebody actually pressed Enter.
+    /// The text as the visual rows a card `columns` characters wide shows:
+    /// one byte span per row, breaking where somebody pressed Enter and again
+    /// where the words run out of room.
     ///
-    /// Deliberately **not** wrapped. A wrap reflows, so a byte offset in the
-    /// text no longer names a place on the screen — and a caret that is one
-    /// character out is worse than a line that runs off the edge of the card,
-    /// which the drawing side handles by scrolling to follow it.
-    pub fn lines(&self) -> Vec<&str> {
-        self.text.split('\n').collect()
+    /// Spans rather than strings, because everything else about the caret is
+    /// a byte offset and a wrap that returned strings would strand it.
+    /// [`Self::caret_in`] and [`Self::highlight_in`] turn offsets into places
+    /// on these rows, and a click comes back the other way through a span's
+    /// start — arithmetic that holds because every byte of the text lands in
+    /// exactly one span, newlines excepted.
+    ///
+    /// Greedy, by word, counting `char`s rather than bytes so accented text
+    /// wraps where it looks like it should — the same bargain as the label's
+    /// own wrap in `board_view.rs`. A space never forces a break: a run of
+    /// them hangs invisibly past the edge instead, so the next word starts
+    /// its row rather than a stray indent. `columns` is an estimate from the
+    /// font size rather than a measurement, and the caller owns the estimate.
+    pub fn wrapped(&self, columns: usize) -> Vec<(usize, usize)> {
+        let columns = columns.max(1);
+        let mut out = Vec::new();
+        for (start, end) in self.line_spans() {
+            let mut row = start;
+            let mut count = 0;
+            // The byte after the last space on this row: where a break would
+            // rather land than the middle of a word.
+            let mut space: Option<usize> = None;
+            for (at, c) in self.text[start..end].char_indices() {
+                let at = start + at;
+                if c == ' ' {
+                    count += 1;
+                    space = Some(at + 1);
+                    continue;
+                }
+                if count >= columns {
+                    // This character does not fit. Break after the last
+                    // space, or right here for a word longer than the whole
+                    // row — a URL, usually.
+                    let cut = space.take().filter(|&s| s > row).unwrap_or(at);
+                    out.push((row, cut));
+                    row = cut;
+                    count = self.text[cut..at].chars().count();
+                }
+                count += 1;
+            }
+            out.push((row, end));
+        }
+        out
     }
 
-    /// The selection, cut up by line: `(row, start, end)` in bytes within each.
+    /// Which of the given rows the caret is on, and how far along it, in
+    /// bytes — [`Self::caret_line`] with a wrap applied. `rows` is what
+    /// [`Self::wrapped`] answered, handed back in so the three callers that
+    /// need all of caret, wash and rows cut the text up exactly once.
     ///
-    /// The shape a painter wants, because it draws the wash one line at a time
-    /// and a range spanning three lines is three rectangles rather than one.
-    pub fn highlight(&self) -> Vec<(usize, usize, usize)> {
+    /// A caret sitting exactly on a soft break belongs to the row *after*
+    /// it: that is where the next character typed will land, so that is
+    /// where it should be seen waiting. Across a hard break the newline byte
+    /// keeps the two rows apart, and the caret stays where Enter left it.
+    pub fn caret_in(&self, rows: &[(usize, usize)]) -> (usize, usize) {
+        let row = rows.iter().rposition(|&(start, _)| start <= self.caret).unwrap_or(0);
+        (row, self.caret - rows[row].0)
+    }
+
+    /// The selection, cut up by the given rows: `(row, start, end)` in bytes
+    /// within each.
+    ///
+    /// The shape a painter wants, because it draws the wash one row at a time
+    /// and a range spanning three rows is three rectangles rather than one.
+    pub fn highlight_in(&self, rows: &[(usize, usize)]) -> Vec<(usize, usize, usize)> {
         let Some((from, to)) = self.selection() else { return Vec::new() };
-        self.line_spans()
-            .into_iter()
+        rows.iter()
             .enumerate()
-            .filter_map(|(row, (start, end))| {
+            .filter_map(|(row, &(start, end))| {
                 let lit_from = from.max(start);
                 let lit_to = to.min(end);
-                // A line entirely inside the selection but empty — a blank line
+                // A row entirely inside the selection but empty — a blank line
                 // in the middle of a selected paragraph — has nothing to draw,
                 // and drawing a zero-width wash would be a stray pixel.
                 (lit_from < lit_to).then_some((row, lit_from - start, lit_to - start))
@@ -637,31 +692,99 @@ mod tests {
         assert_eq!(e.text(), "!");
     }
 
+    /// The rows as strings, which is what every assertion below wants to say.
+    fn rows_of(e: &Editor, columns: usize) -> Vec<&str> {
+        e.wrapped(columns).into_iter().map(|(start, end)| &e.text()[start..end]).collect()
+    }
+
     #[test]
     fn a_selection_across_lines_comes_back_as_one_piece_per_line() {
         let mut e = editor("one\ntwo\nthree");
         e.place(1, false);
         e.place(9, true);
-        assert_eq!(e.highlight(), vec![(0, 1, 3), (1, 0, 3), (2, 0, 1)]);
+        let rows = e.wrapped(ROOM);
+        assert_eq!(e.highlight_in(&rows), vec![(0, 1, 3), (1, 0, 3), (2, 0, 1)]);
+    }
+
+    #[test]
+    fn a_selection_across_a_soft_break_comes_back_as_one_piece_per_row() {
+        let mut e = editor("one two three");
+        e.select_all();
+        let rows = e.wrapped(5);
+        assert_eq!(rows_of(&e, 5), vec!["one ", "two ", "three"]);
+        assert_eq!(e.highlight_in(&rows), vec![(0, 0, 4), (1, 0, 4), (2, 0, 5)]);
     }
 
     #[test]
     fn an_empty_line_inside_a_selection_has_nothing_to_draw() {
         let mut e = editor("a\n\nb");
         e.select_all();
-        assert_eq!(e.highlight(), vec![(0, 0, 1), (2, 0, 1)]);
+        let rows = e.wrapped(ROOM);
+        assert_eq!(e.highlight_in(&rows), vec![(0, 0, 1), (2, 0, 1)]);
     }
 
     #[test]
     fn no_selection_is_nothing_to_draw_rather_than_an_empty_box() {
         let e = editor("hello");
-        assert!(e.highlight().is_empty());
+        assert!(e.highlight_in(&e.wrapped(ROOM)).is_empty());
     }
 
     #[test]
-    fn lines_are_where_enter_was_pressed_and_nowhere_else() {
-        let e = editor("a very long line that a card would never fit\nand another");
-        assert_eq!(e.lines().len(), 2);
+    fn rows_break_where_enter_was_pressed_and_where_the_room_runs_out() {
+        let e = editor("one two three four\nfive");
+        assert_eq!(rows_of(&e, 8), vec!["one two ", "three ", "four", "five"]);
+        // And with room to spare, only where Enter was.
+        assert_eq!(rows_of(&e, ROOM), vec!["one two three four", "five"]);
+    }
+
+    #[test]
+    fn a_word_longer_than_the_row_is_cut_rather_than_spun_on() {
+        let e = editor("https://example.com/a");
+        assert_eq!(rows_of(&e, 10), vec!["https://ex", "ample.com/", "a"]);
+    }
+
+    #[test]
+    fn every_byte_of_the_text_lands_in_exactly_one_row() {
+        // The invariant the caret arithmetic stands on, on a text that wraps
+        // every way at once: soft breaks, hard cuts, hard lines, blanks.
+        let e = editor("one two three\nhttps://example.com/a\n\nfour");
+        for columns in 1..12 {
+            let rows = e.wrapped(columns);
+            let mut at = 0;
+            for &(start, end) in &rows {
+                // Contiguous, separated by at most the newline byte.
+                assert!(start == at || start == at + 1, "a gap at {columns} columns");
+                assert!(start <= end);
+                at = end;
+            }
+            assert_eq!(at, e.text().len(), "a lost tail at {columns} columns");
+        }
+    }
+
+    #[test]
+    fn accented_rows_wrap_by_characters_rather_than_bytes() {
+        let e = editor("café au lait");
+        assert_eq!(rows_of(&e, 7), vec!["café au ", "lait"]);
+    }
+
+    #[test]
+    fn a_caret_on_a_soft_break_waits_at_the_start_of_the_next_row() {
+        let mut e = editor("one two three");
+        let rows = e.wrapped(5);
+        e.place(4, false); // between the rows "one " and "two "
+        assert_eq!(e.caret_in(&rows), (1, 0));
+        e.place(3, false); // still inside the first row
+        assert_eq!(e.caret_in(&rows), (0, 3));
+    }
+
+    #[test]
+    fn a_caret_at_the_end_of_a_line_stays_on_it_across_a_hard_break() {
+        let mut e = editor("one\ntwo");
+        let rows = e.wrapped(ROOM);
+        e.place(3, false); // before the newline
+        assert_eq!(e.caret_in(&rows), (0, 3));
+        e.place(4, false); // after it
+        assert_eq!(e.caret_in(&rows), (1, 0));
     }
 
     #[test]

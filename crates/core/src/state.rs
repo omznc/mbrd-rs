@@ -311,12 +311,17 @@ impl BoardState {
 
     /// Every asset hash something still points at, and whether losing it matters.
     ///
-    /// Three of the four classes of reference are fatal to a save if their bytes
-    /// are missing — a live card, a binned card, an embedded font — and the
-    /// fourth is not. A step can name bytes something else legitimately threw
-    /// away, and refusing to write somebody's board over an entry in its history
-    /// would be the wrong way round. So the two sets are answered separately
-    /// rather than unioned, and the packer treats them differently.
+    /// Two of the three classes of reference are fatal to a save if their bytes
+    /// are missing — a live card and an embedded font — and the third is not. A
+    /// step can name bytes something else legitimately threw away, and refusing
+    /// to write somebody's board over an entry in its history would be the
+    /// wrong way round. So the two sets are answered separately rather than
+    /// unioned, and the packer treats them differently.
+    ///
+    /// A *binned* card used to be a third fatal class and no longer is: the bin
+    /// does not reach the file — see [`TrashEntry`](crate::model::TrashEntry) —
+    /// so a deleted picture's bytes are carried by the ledger below, optionally,
+    /// for exactly as long as an undo could still want them.
     pub fn required_hashes(&self) -> Vec<String> {
         self.board.referenced_hashes()
     }
@@ -324,7 +329,10 @@ impl BoardState {
     /// The hashes only the ledger wants: written where the bytes are here,
     /// walked past where they are not.
     pub fn optional_hashes(&self) -> Vec<String> {
-        let required = self.board.referenced_hashes();
+        // A set rather than `Vec::contains`: this runs on the save path, and a
+        // long ledger against an image-heavy board made the filter quadratic.
+        let required: std::collections::HashSet<String> =
+            self.board.referenced_hashes().into_iter().collect();
         self.timeline.hashes().into_iter().filter(|h| !required.contains(h)).collect()
     }
 }
@@ -585,6 +593,12 @@ pub fn changes(before: &Board, after: &Board) -> Option<Delta> {
         ..Delta::default()
     };
     for field in schema::REST_FIELDS {
+        // Structurally first, so the common edit — which touches none of these —
+        // costs a comparison rather than a serialisation of, say, every
+        // connection on the board, twice, per keystroke.
+        if !schema::rest_differs(before, after, field) {
+            continue;
+        }
         let (Some(a), Some(b)) =
             (schema::rest_value(before, field), schema::rest_value(after, field))
         else {
@@ -938,6 +952,34 @@ mod tests {
         assert_eq!(state.timeline().steps().len(), 1);
         state.undo();
         assert_eq!(schema::serialize(&state), before);
+    }
+
+    #[test]
+    fn an_open_gesture_left_across_an_undo_writes_itself_back() {
+        // Why the app closes an editing session before it walks the ledger —
+        // see `BoardView::undo`. A gesture that is still open has not been
+        // measured, so an undo underneath it reaches past what is being typed
+        // to the step before, and the session's next write puts its own value
+        // straight back over what came back. Nothing here is wrong on its own:
+        // an unfinished `Pending` joining the next step is what this door
+        // promises. It is the *ordering at the call site* that has to be
+        // right, and this is what it looks like when it is not.
+        let mut state = BoardState::new(board_with(&["a"]));
+        state.edit_at("Rename", 1, |b| b.item_mut("a").unwrap().name = "first".into());
+
+        // A session opens and writes on every keystroke, recording nothing.
+        let open = state.start();
+        state.during(&open, |b| b.item_mut("a").unwrap().name = "second".into());
+
+        // The undo lands on the step before the typing, because the typing is
+        // not a step yet.
+        assert_eq!(state.undo().as_deref(), Some("Rename"));
+        assert_eq!(state.item("a").unwrap().name, "card a", "the older step came back");
+
+        // And the next frame of the still-open session overwrites it.
+        state.during(&open, |b| b.item_mut("a").unwrap().name = "second".into());
+        assert_eq!(state.item("a").unwrap().name, "second", "the undo was written over");
+        assert!(state.finish_at("Rename", open, 2), "and it lands as a step of its own");
     }
 
     #[test]

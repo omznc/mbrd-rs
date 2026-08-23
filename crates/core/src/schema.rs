@@ -16,6 +16,8 @@
 //! The two exist as a pair, and a round trip through them is the cheapest test
 //! this crate has — see the bottom of the file.
 
+use std::collections::{HashMap, HashSet};
+
 use serde_json::{json, Map, Value};
 
 use crate::model::*;
@@ -48,7 +50,11 @@ pub fn normalize(data: &Value) -> Board {
     // One id space across the live board and the bin: a restored item must not
     // collide with a live one. The live board is filled first, so where the two
     // disagree it is the *binned* item that gets renamed.
-    let mut ids: Vec<String> = Vec::new();
+    //
+    // A set rather than a list, because the only question ever asked of it is
+    // whether an id is in it, and asking that of a list once per card is a
+    // board that takes longer to open the bigger it gets. See `normalize_item`.
+    let mut ids: HashSet<String> = HashSet::new();
 
     board.items = array(src.get("items"))
         .iter()
@@ -76,7 +82,7 @@ pub fn normalize(data: &Value) -> Board {
     // The ids a connection or an ordering may name: live *or* binned, so that
     // restoring a card brings its lines and its place in the playlist back with
     // it. Narrower than "every id" for connections, which is applied below.
-    let known: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let known: HashSet<&str> = ids.iter().map(String::as_str).collect();
 
     let layouts = src.get("layouts").map(record).unwrap_or_default();
     board.layouts.desktop = normalize_layout(layouts.get("desktop"), &board.items, true);
@@ -122,7 +128,7 @@ pub fn normalize(data: &Value) -> Board {
 ///
 /// `seen` is threaded through rather than deduped afterwards because the *order*
 /// of the renames is load-bearing: whoever asks first keeps the name.
-fn normalize_item(data: &Value, seen: &mut Vec<String>) -> Item {
+fn normalize_item(data: &Value, seen: &mut HashSet<String>) -> Item {
     let src = record(data);
 
     let mut id = string(src.get("id")).map(|s| clean_id(&s)).unwrap_or_default();
@@ -132,7 +138,7 @@ fn normalize_item(data: &Value, seen: &mut Vec<String>) -> Item {
     while seen.contains(&id) {
         id = format!("{}-{}", id, seen.len());
     }
-    seen.push(id.clone());
+    seen.insert(id.clone());
 
     let w = crate::geometry::clamp_size(num(src.get("w"), 320.0));
     let h = crate::geometry::clamp_size(num(src.get("h"), 240.0));
@@ -199,6 +205,13 @@ fn normalize_settings(raw: &Map<String, Value>, mode: LayoutMode) -> BoardSettin
     }
     if let Some(v) = get("hud") {
         out.hud = truthy(Some(v));
+    }
+    // Absent means on, which is why this is not `truthy(get(..))` like the
+    // flags above it: every board written before guides existed has no key
+    // here, and reading that as "off" would quietly turn the feature off for
+    // every board anybody already has.
+    if let Some(v) = get("guides") {
+        out.guides = truthy(Some(v));
     }
     if let Some(v) = get("gridStyle").and_then(|v| v.as_str()) {
         out.grid_style = v.to_string();
@@ -351,14 +364,37 @@ fn normalize_mobile_header(data: &Value) -> MobileHeader {
 /// Missing per-item records are filled the same way rather than dropped: an
 /// item with no place in a layout would otherwise vanish from it.
 fn normalize_layout(data: Option<&Value>, items: &[Item], is_desktop: bool) -> Vec<Geometry> {
-    let src = data.map(record).unwrap_or_default();
     // Both shapes are accepted: a bare array of geometry records, and the
     // object form that also carries the layout's `arrangement` and `settings`.
-    let list = if data.map(Value::is_array).unwrap_or(false) {
-        array(data)
-    } else {
-        array(src.get("items").or_else(|| src.get("geometry")))
-    };
+    //
+    // Borrowed rather than copied out. A memo carries a record per card, so on
+    // a full board this is twenty thousand JSON objects and there is nothing
+    // here that needs its own copy of them.
+    let list: &[Value] = data
+        .and_then(Value::as_array)
+        .or_else(|| {
+            data.and_then(Value::as_object)
+                .and_then(|src| src.get("items").or_else(|| src.get("geometry")))
+                .and_then(Value::as_array)
+        })
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+
+    // **Indexed once, rather than searched once per card.** This is the line
+    // that used to decide how long a large board took to open: a scan of the
+    // whole memo for every card is the board squared, and it copied each record
+    // it looked at on the way past — twenty thousand cards against twenty
+    // thousand records is four hundred million clones of a JSON object, which
+    // is most of a minute of somebody watching a window that has stopped
+    // answering.
+    //
+    // First entry wins, which is what the search this replaces did.
+    let mut memo: HashMap<&str, &Map<String, Value>> = HashMap::with_capacity(list.len());
+    for entry in list {
+        let Some(record) = entry.as_object() else { continue };
+        let Some(id) = record.get("id").and_then(Value::as_str) else { continue };
+        memo.entry(id).or_insert(record);
+    }
 
     let mut out: Vec<Geometry> = Vec::with_capacity(items.len());
     for item in items {
@@ -366,10 +402,7 @@ fn normalize_layout(data: Option<&Value>, items: &[Item], is_desktop: bool) -> V
         if !is_desktop && item.kind == ItemType::Title {
             continue;
         }
-        let found = list
-            .iter()
-            .map(record)
-            .find(|g| g.get("id").and_then(Value::as_str) == Some(item.id.as_str()));
+        let found = memo.get(item.id.as_str()).copied();
         out.push(match found {
             Some(g) => Geometry {
                 id: item.id.clone(),
@@ -428,8 +461,12 @@ fn normalize_mobile_order(value: &str) -> String {
 /// would drop somebody's line the moment they undid the deletion that removed
 /// its far end. The pruning happens once, at the file boundary, which is the
 /// only place that knows what the file will actually carry.
-fn normalize_connections(data: Option<&Value>, known: Option<&[&str]>) -> Vec<Connection> {
+fn normalize_connections(data: Option<&Value>, known: Option<&HashSet<&str>>) -> Vec<Connection> {
     let mut out: Vec<Connection> = Vec::new();
+    // The pairs already kept, so that the duplicate check below is a lookup
+    // rather than a walk of everything kept so far — and so that `key` is not
+    // recomputed for every pair against every other pair.
+    let mut kept: HashSet<(String, String)> = HashSet::new();
     for entry in array(data).iter() {
         let Some(pair) = entry.as_array() else { continue };
         let (Some(a), Some(b)) =
@@ -443,7 +480,7 @@ fn normalize_connections(data: Option<&Value>, known: Option<&[&str]>) -> Vec<Co
         }
         // Both ends must name an item the file actually carries. A pair naming
         // nothing is dropped, since nothing could ever make it mean something.
-        if known.map(|k| !k.contains(&a) || !k.contains(&b)).unwrap_or(false) {
+        if known.map(|k| !k.contains(a) || !k.contains(b)).unwrap_or(false) {
             continue;
         }
         let conn = Connection {
@@ -452,7 +489,8 @@ fn normalize_connections(data: Option<&Value>, known: Option<&[&str]>) -> Vec<Co
             meta: pair.get(2).map(normalize_conn_meta).unwrap_or_default(),
         };
         // Duplicates collapse, in either order.
-        if out.iter().any(|c| c.key() == conn.key()) {
+        let (first, second) = conn.key();
+        if !kept.insert((first.to_string(), second.to_string())) {
             continue;
         }
         out.push(conn);
@@ -483,6 +521,10 @@ fn normalize_conn_meta(data: &Value) -> ConnMeta {
         color: pick(&src, "color", ConnColor::parse),
         weight: pick(&src, "weight", ConnWeight::parse),
         label: string(src.get("label")).map(|s| collapse_space(&s, 60)).filter(|s| !s.is_empty()),
+        // Clamped rather than rejected, like everything else in here: a
+        // fraction outside the line is a label at the end of the line, which
+        // is somewhere, and refusing the connection over it would not be.
+        label_at: num(src.get("labelAt"), crate::model::LABEL_MIDDLE).clamp(0.0, 1.0),
     }
 }
 
@@ -491,11 +533,16 @@ fn normalize_conn_meta(data: &Value) -> ConnMeta {
 /// Malformed entries are dropped one at a time rather than failing the load,
 /// and an id that names nothing goes too: both lists are self-healing at the
 /// far end, so a stale entry costs nothing to lose here.
-fn normalize_id_list(data: Option<&Value>, known: Option<&[&str]>) -> Vec<String> {
+fn normalize_id_list(data: Option<&Value>, known: Option<&HashSet<&str>>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for v in array(data).iter().take(MAX_ITEMS) {
+    // Both checks are membership questions, and both used to be walks: one over
+    // every id on the board and one over everything kept so far. A tour as long
+    // as the board is then the board squared. See `normalize_layout`.
+    let list = array(data);
+    let mut taken: HashSet<&str> = HashSet::new();
+    for v in list.iter().take(MAX_ITEMS) {
         let Some(id) = v.as_str() else { continue };
-        if known.map(|k| !k.contains(&id)).unwrap_or(false) || out.iter().any(|s| s == id) {
+        if known.map(|k| !k.contains(id)).unwrap_or(false) || !taken.insert(id) {
             continue;
         }
         out.push(id.to_string());
@@ -519,7 +566,13 @@ pub fn serialize(board: &Board) -> Value {
         "view".into(),
         json!({
             "pan": { "x": round2(board.view.pan_x), "y": round2(board.view.pan_y) },
-            "zoom": round2(board.view.zoom),
+            // Not `round2`, and this is the one field where that matters. Two
+            // decimals is plenty for a world coordinate, where the unit is
+            // about a pixel — and it is *everything* for a zoom, where the
+            // whole bottom of the range lives below `0.01` and would be saved
+            // as a flat zero, then read back as the floor. Significant digits
+            // rather than decimal places is the shape this number wants.
+            "zoom": significant(board.view.zoom),
         }),
     );
     out.insert("settings".into(), serialize_settings(board));
@@ -661,6 +714,11 @@ fn serialize_connection(c: &Connection) -> Value {
     }
     if let Some(label) = &c.meta.label {
         m.insert("label".into(), json!(label));
+        // Only alongside the label, and only when it has been moved. Where
+        // nothing is written there is nothing to place.
+        if c.meta.label_at != crate::model::LABEL_MIDDLE {
+            m.insert("labelAt".into(), json!(round2(c.meta.label_at)));
+        }
     }
     json!([c.a, c.b, Value::Object(m)])
 }
@@ -684,6 +742,7 @@ fn settings_fields(s: &BoardSettings) -> Map<String, Value> {
     out.insert("snap".into(), json!(s.snap));
     out.insert("web".into(), json!(s.web));
     out.insert("hud".into(), json!(s.hud));
+    out.insert("guides".into(), json!(s.guides));
     out.insert("gridStyle".into(), json!(s.grid_style));
     out.insert("gridStep".into(), json!(round2(s.grid_step)));
     out.insert("mobileColumns".into(), json!(s.mobile_columns));
@@ -771,7 +830,7 @@ pub fn item_value(item: &Item) -> Value {
 /// written by the board it is going back onto, so renaming here would be
 /// inventing a card the ledger never mentioned.
 pub fn item_of_value(data: &Value) -> Item {
-    normalize_item(data, &mut Vec::new())
+    normalize_item(data, &mut HashSet::new())
 }
 
 /// One item's place in one layout.
@@ -841,6 +900,33 @@ pub const REST_FIELDS: [&str; 10] = [
     "audioOrder",
     "tour",
 ];
+
+/// Whether one of [`REST_FIELDS`] differs between two boards, answered
+/// structurally and without serialising either side.
+///
+/// [`rest_value`] builds a full `serde_json::Value` — for `connections` that is
+/// an array of every wire on the board — and `changes` runs over every field on
+/// every edit, so building both sides just to learn they are equal made a nudge
+/// cost the board rather than the nudge. Serialisation is a pure function of
+/// the field, so structural equality is enough to skip it; a field that *does*
+/// differ still goes through the serialised compare, which is what lets a
+/// difference the file cannot represent round away. A name not on the list
+/// answers `true` and is sorted out by `rest_value` returning `None`.
+pub fn rest_differs(before: &Board, after: &Board, field: &str) -> bool {
+    match field {
+        "title" => before.title != after.title,
+        "layoutSettings" => before.settings != after.settings,
+        "arrangements" => before.arrangements != after.arrangements,
+        "mobileHeader" => before.mobile_header != after.mobile_header,
+        "titleHidden" => before.title_hidden != after.title_hidden,
+        "mediaFit" => before.media_fit != after.media_fit,
+        "paletteSources" => before.palette_sources != after.palette_sources,
+        "connections" => before.connections != after.connections,
+        "audioOrder" => before.audio_order != after.audio_order,
+        "tour" => before.tour != after.tour,
+        _ => true,
+    }
+}
 
 /// One of [`REST_FIELDS`], as a step records it. `None` for a name not on that
 /// list, which is what a step written by another build is read through.
@@ -978,6 +1064,22 @@ fn round2(v: f32) -> f64 {
     ((v as f64) * 100.0).round() / 100.0
 }
 
+/// Six significant digits, wherever the number happens to sit.
+///
+/// For a value whose *scale* is the thing being stored rather than its
+/// distance from something — see the zoom in [`serialize`]. Six is the width
+/// of an `f32`'s mantissa in decimal, so this is a shorter spelling of the
+/// same number rather than a lossy one.
+fn significant(v: f32) -> f64 {
+    if !v.is_finite() || v == 0.0 {
+        return 0.0;
+    }
+    let v = v as f64;
+    let places = 6 - 1 - v.abs().log10().floor() as i32;
+    let scale = 10f64.powi(places.clamp(0, 15));
+    (v * scale).round() / scale
+}
+
 /// 64 lowercase hex characters. Enforced in both directions.
 pub fn is_hash(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -1002,7 +1104,7 @@ fn next_id(n: usize) -> String {
     format!("i{n:06}")
 }
 
-fn collapse_space(s: &str, max: usize) -> String {
+pub(crate) fn collapse_space(s: &str, max: usize) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(max).collect()
 }
 
@@ -1035,6 +1137,40 @@ mod tests {
             assert_eq!(b.media_fit, "contain");
             assert_eq!(b.palette_sources, 12);
         }
+    }
+
+    #[test]
+    fn a_board_written_before_guides_existed_still_has_them() {
+        // The one flag on the settings whose absence does not mean `false`.
+        // Every board anybody already has is missing this key, and reading a
+        // missing key as "off" would turn the feature off for all of them —
+        // silently, and in a way that looks like the feature never shipped.
+        let old = json!({ "settings": { "grid": true } });
+        assert!(normalize(&old).settings.desktop.guides);
+
+        // Said explicitly, though, it is believed either way.
+        let off = json!({ "settings": { "guides": false } });
+        assert!(!normalize(&off).settings.desktop.guides);
+
+        // And the same on the ledger's side of the fence, where the record is
+        // named `layoutSettings` and keeps Desktop under its own key rather
+        // than at the top. A step that predates the flag has to read as on for
+        // the same reason a file does.
+        let mut board = Board::default();
+        rest_apply(&mut board, "layoutSettings", &json!({ "desktop": { "grid": true } }));
+        assert!(board.settings.desktop.guides);
+        rest_apply(&mut board, "layoutSettings", &json!({ "desktop": { "guides": false } }));
+        assert!(!board.settings.desktop.guides);
+    }
+
+    #[test]
+    fn whether_guides_are_on_survives_a_round_trip() {
+        // A setting that cannot be turned off across a save is a setting that
+        // is not off. See `settings_fields`, which is the other half.
+        let mut board = Board::default();
+        board.settings.desktop.guides = false;
+        let there_and_back = normalize(&serialize(&board));
+        assert!(!there_and_back.settings.desktop.guides);
     }
 
     #[test]
@@ -1191,6 +1327,63 @@ mod tests {
         let b = normalize(&json!({ "view": { "pan": { "x": 5, "y": 6 }, "zoom": 900 } }));
         assert_eq!(b.view.zoom, MAX_ZOOM);
         assert_eq!(b.view.pan_x, 5.0);
+    }
+
+    #[test]
+    fn a_label_slid_along_a_line_stays_where_it_was_put() {
+        let board = Board {
+            items: vec![Item::new("a", ItemType::Note), Item::new("b", ItemType::Note)],
+            connections: vec![Connection {
+                a: "a".into(),
+                b: "b".into(),
+                meta: ConnMeta {
+                    label: Some("goes with".into()),
+                    label_at: 0.18,
+                    ..ConnMeta::default()
+                },
+            }],
+            ..Board::default()
+        };
+        let back = normalize(&serialize(&board));
+        assert_eq!(back.connections[0].meta.label.as_deref(), Some("goes with"));
+        assert!((back.connections[0].meta.label_at - 0.18).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_line_with_no_label_has_nowhere_to_put_one() {
+        // A position with no words at it is not a connection worth writing a
+        // third element for, however far somebody once slid it.
+        let mut meta = ConnMeta { label_at: 0.9, ..ConnMeta::default() };
+        assert!(meta.is_default(), "an unlabelled line should still be a plain one");
+        let out =
+            serialize_connection(&Connection { a: "a".into(), b: "b".into(), meta: meta.clone() });
+        assert_eq!(out, json!(["a", "b"]), "it grew a third element for nothing");
+        meta.label = Some("here".into());
+        assert!(!meta.is_default());
+    }
+
+    #[test]
+    fn a_label_position_off_the_end_of_the_line_is_pulled_back_onto_it() {
+        let meta = normalize_conn_meta(&json!({ "label": "x", "labelAt": 4.5 }));
+        assert_eq!(meta.label_at, 1.0);
+        let meta = normalize_conn_meta(&json!({ "label": "x", "labelAt": -2.0 }));
+        assert_eq!(meta.label_at, 0.0);
+        let meta = normalize_conn_meta(&json!({ "label": "x" }));
+        assert_eq!(meta.label_at, LABEL_MIDDLE, "an absent position is the middle");
+    }
+
+    #[test]
+    fn a_zoom_from_the_bottom_of_the_range_survives_being_saved() {
+        // The whole floor of the range sits below two decimal places, so
+        // rounding it the way a coordinate is rounded would save every one of
+        // these as zero and read them all back as the floor.
+        let mut board = Board::default();
+        for zoom in [MIN_ZOOM, 0.004, 0.0375, MAX_ZOOM] {
+            board.view.zoom = zoom;
+            let back = normalize(&serialize(&board));
+            let off = (back.view.zoom - zoom).abs() / zoom;
+            assert!(off < 1e-5, "{zoom} came back as {}", back.view.zoom);
+        }
     }
 
     #[test]

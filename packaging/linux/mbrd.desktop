@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Name=mbrd
+GenericName=Moodboard
+Comment=A moodboard on an endless canvas
+# %f rather than %F or %u: the app opens one board per window and reads a
+# single path from argv, so offering it a list would have it open the first and
+# silently drop the rest.
+Exec=mbrd %f
+Icon=mbrd
+Terminal=false
+Categories=Graphics;2DGraphics;Viewer;
+MimeType=application/x-mbrd;
+Keywords=moodboard;canvas;board;
+# The window's own class, so the compositor matches this entry to the window
+# and the launcher shows the icon rather than a grey square. It has to agree
+# with what the app sets on the surface.
+StartupWMClass=mbrd

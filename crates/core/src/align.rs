@@ -31,6 +31,17 @@ pub enum Edge {
 }
 
 impl Edge {
+    /// Every edge, in the order a menu wants to offer them: the three across,
+    /// then the three down.
+    ///
+    /// Here rather than written out again wherever a row of them is built, for
+    /// the reason the format's own enums keep their list — see
+    /// `model::named_enum`. An edge added here is offered everywhere the
+    /// moment it exists, and `alignment_offers_every_edge_there_is` fails to
+    /// compile if this list is not the whole of them.
+    pub const ALL: [Self; 6] =
+        [Self::Left, Self::CentreX, Self::Right, Self::Top, Self::Middle, Self::Bottom];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Left => "left",
@@ -51,6 +62,9 @@ pub enum Axis {
 }
 
 impl Axis {
+    /// Both axes. See [`Edge::ALL`] for why the list lives on the type.
+    pub const ALL: [Self; 2] = [Self::Horizontal, Self::Vertical];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Horizontal => "horizontal",
@@ -412,5 +426,37 @@ mod tests {
             let was = items.iter().find(|i| i.id == m.id).unwrap();
             assert_eq!(m.y, was.y, "nothing should have moved vertically");
         }
+    }
+
+    /// The list on the type is the whole of the enum, and stays that way.
+    ///
+    /// Two guards rather than one, because a list that is only ever iterated
+    /// over cannot notice what was never put into it — which is exactly how
+    /// the app's `Command::ALL` quietly lost three entries. The match fails to
+    /// compile when an edge is added; the count then fails until it is added
+    /// to `ALL` too. Neither alone is enough.
+    #[test]
+    fn every_edge_there_is_is_in_the_list_of_them() {
+        for edge in Edge::ALL {
+            match edge {
+                Edge::Left
+                | Edge::CentreX
+                | Edge::Right
+                | Edge::Top
+                | Edge::Middle
+                | Edge::Bottom => assert!(Edge::ALL.contains(&edge)),
+            }
+        }
+        assert_eq!(Edge::ALL.len(), 6, "an edge was added to the enum and not to Edge::ALL");
+    }
+
+    #[test]
+    fn every_axis_there_is_is_in_the_list_of_them() {
+        for axis in Axis::ALL {
+            match axis {
+                Axis::Horizontal | Axis::Vertical => assert!(Axis::ALL.contains(&axis)),
+            }
+        }
+        assert_eq!(Axis::ALL.len(), 2, "an axis was added to the enum and not to Axis::ALL");
     }
 }

@@ -36,22 +36,53 @@
 use std::f32::consts::TAU;
 
 /// The feel of a spring, in the two numbers worth thinking in.
+///
+/// The fields are private and the only way to a `Spring` is [`Spring::new`],
+/// which is where the clamping lives. A public field would let a stray
+/// `Spring { damping: 3.0, .. }` literal past every guarantee this type
+/// makes — not a *worse* spring, but the critically-damped closed form
+/// running under a number that claims to be something else, silently,
+/// because `step` never checks `damping <= 1.0` again after construction.
+/// There is deliberately no overdamped branch in [`Sprung::step`] either: the
+/// constructor is what makes one unreachable, so there was nothing to write.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Spring {
+    damping: f32,
+    response: f32,
+}
+
+impl Spring {
+    /// A spring, with both numbers held to what they can actually mean.
+    ///
+    /// `const fn` so the module's own constants — [`Spring::CAMERA`],
+    /// [`Spring::THROW`], [`Spring::ZOOM`] — are built through it rather than
+    /// by struct literal, and get the same clamp everything else does. Plain
+    /// `if`s rather than `f32::clamp`/`f32::max`, because a `const fn` cannot
+    /// call a non-const method and the clamp itself is the whole point.
+    pub const fn new(damping: f32, response: f32) -> Self {
+        let damping = if damping < 0.05 {
+            0.05
+        } else if damping > 1.0 {
+            1.0
+        } else {
+            damping
+        };
+        let response = if response < 0.01 { 0.01 } else { response };
+        Self { damping, response }
+    }
+
     /// The damping ratio. `1.0` never overshoots; below it, it does.
     ///
     /// Held at or under `1.0` by [`Spring::new`]. An overdamped spring — one
     /// that crawls in without ever oscillating — is slower than critical for
     /// no gain in calm, and there is no interface here that wants one.
-    pub damping: f32,
-    /// About how long the approach takes, in seconds. Not a duration.
-    pub response: f32,
-}
+    pub fn damping(&self) -> f32 {
+        self.damping
+    }
 
-impl Spring {
-    /// A spring, with both numbers held to what they can actually mean.
-    pub fn new(damping: f32, response: f32) -> Self {
-        Self { damping: damping.clamp(0.05, 1.0), response: response.max(0.01) }
+    /// About how long the approach takes, in seconds. Not a duration.
+    pub fn response(&self) -> f32 {
+        self.response
     }
 
     /// Moving the camera somewhere it was asked to be.
@@ -60,14 +91,41 @@ impl Spring {
     /// a *destination* rather than a throw: nothing about pressing `0` implies
     /// momentum, and a camera that sailed past the origin and drifted back
     /// would be inventing a gesture nobody made.
-    pub const CAMERA: Spring = Spring { damping: 1.0, response: 0.4 };
+    pub const CAMERA: Spring = Spring::new(1.0, 0.4);
 
-    /// Carrying on after a flick.
+    /// Carrying on after a flick, matched to [`DECELERATION`].
     ///
     /// The one place overshoot belongs, because here the hand really was
     /// moving: the board is following through on a throw, and a throw that
     /// stopped dead on the millimetre would feel like it hit a wall.
-    pub const FLICK: Spring = Spring { damping: 0.8, response: 0.4 };
+    ///
+    /// "Matched" is load-bearing, not decorative. [`project`] says how far a
+    /// flick travels by pretending the board glides to a stop along an
+    /// exponential decay with time constant `τ`; this spring is a *second*,
+    /// independent curve that is handed the same start point, the same end
+    /// point and the same release velocity and asked to draw the motion in
+    /// between. Nothing forces those two curves to agree in shape, and if
+    /// this spring is stiffer than the decay it is standing in for, it has a
+    /// large position error to close at `t = 0` and closes it fast: the
+    /// board accelerates for the first several frames after the hand lets
+    /// go, peaking well past the release speed, before the spring even
+    /// reaches the part that looks like slowing down. That is a lurch, not a
+    /// throw, and a test that only checks where the flick ends up — which is
+    /// all the tests below did, until one didn't — cannot see it, because
+    /// the handoff at `t = 0` is exact either way.
+    ///
+    /// The fix is to pick the response so the initial acceleration is
+    /// exactly zero: a spring released a distance `D = v·τ` from its target
+    /// — the same `D` [`project`] computes — with velocity `v` has zero
+    /// acceleration at `t = 0` exactly when `ω = 2ζ/τ`, i.e.
+    /// `response = 2π/ω = πτ/ζ`. With `damping = 0.8` and the `τ ≈ 0.249s`
+    /// that [`DECELERATION`] implies, that comes out to `response ≈ 0.98`.
+    ///
+    /// **The two constants move together.** Retuning [`DECELERATION`]
+    /// without recomputing this response reintroduces the lurch from the
+    /// other side; retuning this response without touching [`DECELERATION`]
+    /// does the same.
+    pub const THROW: Spring = Spring::new(0.8, 0.98);
 
     /// Answering the wheel.
     ///
@@ -75,7 +133,7 @@ impl Spring {
     /// zoom notch is a small, repeated, aimed input — the smoothing is there to
     /// stop a mouse wheel arriving in steps, not to take the scenic route, and
     /// anything slower than this reads as lag rather than as motion.
-    pub const ZOOM: Spring = Spring { damping: 1.0, response: 0.19 };
+    pub const ZOOM: Spring = Spring::new(1.0, 0.19);
 
     /// The undamped angular frequency the two numbers imply.
     fn omega(&self) -> f32 {
@@ -205,7 +263,13 @@ impl Sprung {
 
 /// How fast a flicked thing stops, per the scroll views everybody has already
 /// learned the feel of. Nearer `1.0` slides further.
-pub const DECELERATION: f32 = 0.998;
+///
+/// `0.996` rather than the `0.998` scroll views themselves use, chosen for a
+/// canvas rather than a list: a working board wants the glide over sooner
+/// than a document wants its scroll to settle. See [`Spring::THROW`] — this
+/// number and that spring's response are a matched pair, derived together,
+/// and neither one is free to move without the other.
+pub const DECELERATION: f32 = 0.996;
 
 /// How far something thrown at `velocity` will travel before it stops.
 ///
@@ -255,6 +319,26 @@ pub const TENSION: f32 = 0.55;
 mod tests {
     use super::*;
 
+    /// `Spring::new` is the one door onto a `Spring`, and this is the whole
+    /// reason it exists rather than a public-field literal: a damping past
+    /// `1.0` is not a *worse* spring, it is a number the closed form silently
+    /// stops asking "is this critically damped or not" about and just treats
+    /// as if it were, and the clamp is what keeps that question from ever
+    /// coming up in `Sprung::step`.
+    #[test]
+    fn a_spring_cannot_be_built_with_an_overdamped_ratio() {
+        assert_eq!(Spring::new(3.0, 0.4).damping(), 1.0);
+        assert_eq!(Spring::new(-1.0, 0.4).damping(), 0.05);
+    }
+
+    #[test]
+    fn a_spring_cannot_be_built_with_a_response_of_zero_or_less() {
+        // `omega` divides by `response`; a zero or negative one would hand a
+        // step an infinity or a spring that runs backwards.
+        assert_eq!(Spring::new(1.0, 0.0).response(), 0.01);
+        assert_eq!(Spring::new(1.0, -5.0).response(), 0.01);
+    }
+
     /// Step a spring for `seconds` at 120fps, and say where it got to.
     fn run(s: &mut Sprung, spring: Spring, seconds: f32, rest: f32) {
         let dt = 1.0 / 120.0;
@@ -280,13 +364,13 @@ mod tests {
     #[test]
     fn an_underdamped_spring_does_go_past() {
         // The whole difference between the two constants, asserted rather than
-        // trusted: if this stops overshooting, a flick has stopped feeling
+        // trusted: if this stops overshooting, a throw has stopped feeling
         // like a throw and nothing else in the app would notice.
         let mut s = Sprung::at(0.0);
         s.retarget(100.0);
         let mut highest: f32 = 0.0;
         for _ in 0..600 {
-            s.step(Spring::FLICK, 1.0 / 120.0, 0.01);
+            s.step(Spring::THROW, 1.0 / 120.0, 0.01);
             highest = highest.max(s.value());
         }
         assert!(highest > 100.0, "it never overshot; highest was {highest}");

@@ -3,7 +3,7 @@ members = ["crates/core", "crates/app"]
 resolver = "2"
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 
@@ -12,9 +12,25 @@ anyhow = "1"
 # Pinned to the line gpui itself uses, so `image::Frame` here and
 # `image::Frame` inside `RenderImage` are the same type rather than two.
 image = "0.25"
+# The update path. `ureq` is blocking and runs on gpui's background executor,
+# which is the whole reason it is here rather than reqwest: the lockfile
+# already carries a full reqwest and tokio through `gpui_http_client`, but
+# gpui's default client is `NullHttpClient` and reaching the real one means
+# standing a tokio runtime up beside gpui's smol executor for two GET
+# requests. `minisign-verify` verifies and cannot sign, which is the only half
+# that belongs in a binary handed to other people.
+flate2 = "1"
+minisign-verify = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
+tar = "0.4"
+# The only irreversible action in the app is a board delete, and this is what
+# stops it from being one: `trash::delete` implements the freedesktop trash
+# spec on Linux and the native Recycle Bin / Trash on Windows and macOS,
+# natively, with no system dependencies to shell out to.
+trash = "5"
+ureq = "3"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # What a build sent to somebody else is compiled with. `strip` and `lto`
