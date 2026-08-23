@@ -35,6 +35,7 @@
 //!   does not know walks past it.
 
 pub mod align;
+pub mod arrange;
 pub mod fence;
 pub mod geometry;
 pub mod guides;
