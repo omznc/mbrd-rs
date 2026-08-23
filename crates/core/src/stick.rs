@@ -1,26 +1,23 @@
 //! Sticky notes pinned to the card they were dropped on.
 //!
-//! A note lying across a photograph is not near it, it is *on* it, and moving
-//! the photograph has to take the note with it — otherwise the one gesture
-//! everybody tries first, dragging the picture somewhere else, leaves its
-//! caption behind. So the note is pinned: a drag on it takes hold of its host,
-//! and a drag on the host brings it along.
+//! A note the author has marked **sticky** and dropped across a photograph is
+//! not near it, it is *on* it: moving the photograph takes the note with it,
+//! and a drag on the note takes hold of the photograph. That is the whole
+//! feature, and the flag is the whole door onto it.
 //!
-//! Like fence membership, the pin is **measured** rather than listed — a note
-//! is stuck to whatever it is lying on — with one exception, and the exception
-//! is the whole reason this module is not two functions in `fence.rs`:
+//! **Stickiness is a decision, not a measurement.** It used to be the other
+//! way around — any note lying on a card was pinned, with `meta.loose` as the
+//! opt-out — and the first thing everybody hit was two things that merely
+//! overlapped refusing to move apart, for a reason nothing on screen could
+//! explain. A gesture that grabs more than what was pressed has to have been
+//! asked for. So `meta.sticky` is the opt-in, off by default, set from the
+//! note's own menu; *which card* a sticky note is on is still measured — a
+//! sticky note is stuck to whatever it is lying on — and recorded as
+//! `meta.stuckTo` at the file boundary.
 //!
-//! **Unstickiness is a decision, not a measurement.** The usual reason to
-//! unstick a note is to nudge it, so an unstuck note is normally still lying on
-//! the very card it was unstuck from, and no geometry could tell you otherwise.
-//! That is why `meta.loose` is stored while `meta.stuckTo` is only recorded: one
-//! of them is a fact about the board and the other is a fact about the author.
-//!
-//! A reader that ignores `loose` degrades one way and one way only: it measures
-//! the overlap, finds the host, and treats the note as stuck again. So a board
-//! unstuck in a new build opens pinned in an old one, and unstuck again in the
-//! new one. Nothing is lost, and the older build writes the key back out
-//! untouched.
+//! `meta.loose` is not read any more, and is deliberately not deleted either:
+//! it belongs to the old rule, an unknown key rides through `meta` untouched,
+//! and a build that still reads it should keep finding what its author wrote.
 
 use std::collections::HashMap;
 
@@ -29,9 +26,9 @@ use crate::model::{Item, ItemType};
 
 /// How much of the note has to be over a card before it counts as lying on it.
 ///
-/// A note that clips a corner of a photograph on its way past is not stuck to
-/// it. A fifth is low enough that a note deliberately tucked into a card's
-/// corner still takes, and high enough that a graze does not.
+/// A sticky note that clips a corner of a photograph on its way past is not
+/// stuck to it. A fifth is low enough that a note deliberately tucked into a
+/// card's corner still takes, and high enough that a graze does not.
 const ENOUGH: f32 = 0.2;
 
 /// Which note is pinned to which card.
@@ -41,22 +38,8 @@ pub struct Pins {
 }
 
 impl Pins {
-    /// Measure the board, honouring what each note says about itself.
+    /// Measure the board. Only notes whose author said `sticky` take part.
     pub fn measure(items: &[Item]) -> Self {
-        Self::measured(items, true)
-    }
-
-    /// The same, but deaf to `meta.loose`.
-    ///
-    /// For the one caller that needs to know where a note *would* stick if it
-    /// were not unstuck: a drop that finds a host clears the unstick, and
-    /// asking the ordinary way would always answer "nowhere" for exactly the
-    /// notes this question is about.
-    pub fn measure_ignoring_loose(items: &[Item]) -> Self {
-        Self::measured(items, false)
-    }
-
-    fn measured(items: &[Item], honour_loose: bool) -> Self {
         let hosts: Vec<(&str, Rect, f32)> = items
             .iter()
             .filter(|it| can_host(it))
@@ -66,10 +49,7 @@ impl Pins {
             return Self::default();
         }
         let mut host = HashMap::new();
-        for note in items.iter().filter(|it| it.kind == ItemType::Note) {
-            if honour_loose && is_loose(note) {
-                continue;
-            }
+        for note in items.iter().filter(|it| it.kind == ItemType::Note && is_sticky(it)) {
             // The record comes first, and only where it still names a card the
             // board carries. A pin has to survive a reload — and a Mobile
             // reflow, where nothing overlaps anything and measuring would
@@ -122,9 +102,9 @@ impl Pins {
     }
 }
 
-/// Whether an author has explicitly unstuck this note.
-pub fn is_loose(item: &Item) -> bool {
-    item.meta.get("loose").and_then(|v| v.as_bool()).unwrap_or(false)
+/// Whether an author has asked this note to pin to what it lies on.
+pub fn is_sticky(item: &Item) -> bool {
+    item.meta.get("sticky").and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
 /// Whether a note may be pinned to this.
@@ -167,8 +147,9 @@ fn lying_on<'a>(note: &Item, hosts: &[(&'a str, Rect, f32)]) -> Option<&'a str> 
 
 /// Write the measurement onto the notes, as the file wants it.
 ///
-/// Called at the file boundary. `loose` is not touched — it is the author's,
-/// not the measurement's.
+/// Called at the file boundary. `sticky` is not touched — it is the author's,
+/// not the measurement's — and a note that is not sticky carries no record,
+/// because a record is a pin and it has none.
 pub fn stamp(items: &mut [Item]) {
     let pins = Pins::measure(items);
     for item in items.iter_mut() {
@@ -208,46 +189,60 @@ mod tests {
         at(id, ItemType::Note, x, y, 100.0, 60.0)
     }
 
+    fn sticky(id: &str, x: f32, y: f32) -> Item {
+        let mut it = note(id, x, y);
+        it.meta.insert("sticky".into(), Value::Bool(true));
+        it
+    }
+
     #[test]
-    fn a_note_dropped_on_a_photograph_sticks_to_it() {
+    fn a_plain_note_on_a_photograph_is_not_stuck_to_it() {
+        // The rule the old default broke: overlap alone is not a request.
         let items = vec![photo("p", 0.0, 0.0), note("n", 40.0, 20.0)];
-        assert_eq!(Pins::measure(&items).host_of("n"), Some("p"));
-    }
-
-    #[test]
-    fn a_note_that_merely_grazes_a_card_is_not_on_it() {
-        // Overlapping by a sliver of one corner. Somebody who wanted this
-        // stuck would have put it on the card.
-        let items = vec![photo("p", 0.0, 0.0), note("n", 195.0, 125.0)];
-        assert_eq!(Pins::measure(&items).host_of("n"), None);
-    }
-
-    #[test]
-    fn a_note_over_two_cards_sticks_to_the_one_it_is_mostly_on() {
-        let items =
-            vec![photo("left", -150.0, 0.0), photo("right", 190.0, 0.0), note("n", 100.0, 0.0)];
-        assert_eq!(Pins::measure(&items).host_of("n"), Some("right"));
-    }
-
-    #[test]
-    fn a_note_on_two_cards_at_the_same_depth_takes_the_nearer_one() {
-        let mut back = photo("back", 0.0, 0.0);
-        back.z = 1.0;
-        let mut front = photo("front", 0.0, 0.0);
-        front.z = 9.0;
-        let items = vec![back, front, note("n", 0.0, 0.0)];
-        assert_eq!(Pins::measure(&items).host_of("n"), Some("front"));
-    }
-
-    #[test]
-    fn notes_do_not_stick_to_each_other() {
-        let items = vec![note("a", 0.0, 0.0), note("b", 10.0, 5.0)];
         assert!(Pins::measure(&items).is_empty());
     }
 
     #[test]
-    fn an_unstuck_note_stays_unstuck_while_lying_on_its_host() {
-        // The case no geometry can answer, and the reason `loose` is stored.
+    fn a_sticky_note_dropped_on_a_photograph_sticks_to_it() {
+        let items = vec![photo("p", 0.0, 0.0), sticky("n", 40.0, 20.0)];
+        assert_eq!(Pins::measure(&items).host_of("n"), Some("p"));
+    }
+
+    #[test]
+    fn a_sticky_note_that_merely_grazes_a_card_is_not_on_it() {
+        // Overlapping by a sliver of one corner. Somebody who wanted this
+        // stuck would have put it on the card.
+        let items = vec![photo("p", 0.0, 0.0), sticky("n", 195.0, 125.0)];
+        assert_eq!(Pins::measure(&items).host_of("n"), None);
+    }
+
+    #[test]
+    fn a_sticky_note_over_two_cards_sticks_to_the_one_it_is_mostly_on() {
+        let items =
+            vec![photo("left", -150.0, 0.0), photo("right", 190.0, 0.0), sticky("n", 100.0, 0.0)];
+        assert_eq!(Pins::measure(&items).host_of("n"), Some("right"));
+    }
+
+    #[test]
+    fn a_sticky_note_on_two_cards_at_the_same_depth_takes_the_nearer_one() {
+        let mut back = photo("back", 0.0, 0.0);
+        back.z = 1.0;
+        let mut front = photo("front", 0.0, 0.0);
+        front.z = 9.0;
+        let items = vec![back, front, sticky("n", 0.0, 0.0)];
+        assert_eq!(Pins::measure(&items).host_of("n"), Some("front"));
+    }
+
+    #[test]
+    fn sticky_notes_do_not_stick_to_each_other() {
+        let items = vec![sticky("a", 0.0, 0.0), sticky("b", 10.0, 5.0)];
+        assert!(Pins::measure(&items).is_empty());
+    }
+
+    #[test]
+    fn the_old_loose_flag_is_not_what_keeps_a_note_free() {
+        // A note from an old file: `loose` present, `sticky` absent. It is
+        // free because nothing asked it to stick, not because of the old key.
         let mut n = note("n", 40.0, 20.0);
         n.meta.insert("loose".into(), Value::Bool(true));
         let items = vec![photo("p", 0.0, 0.0), n];
@@ -258,35 +253,34 @@ mod tests {
     fn the_record_holds_a_pin_that_the_geometry_no_longer_shows() {
         // A Mobile reflow packs the note somewhere else entirely, and measuring
         // there would unstick every note on the board.
-        let mut n = note("n", 4000.0, 4000.0);
+        let mut n = sticky("n", 4000.0, 4000.0);
         n.meta.insert("stuckTo".into(), Value::String("p".into()));
         let items = vec![photo("p", 0.0, 0.0), n];
         assert_eq!(Pins::measure(&items).host_of("n"), Some("p"));
     }
 
     #[test]
-    fn a_pin_to_a_card_that_is_gone_falls_back_to_measuring() {
+    fn a_record_without_the_decision_is_not_a_pin() {
+        // A file stamped by an old build, where every overlapping note got a
+        // `stuckTo`. The author never asked, so the note is free — this is
+        // the migration, and it is one line: no `sticky`, no pin.
         let mut n = note("n", 40.0, 20.0);
+        n.meta.insert("stuckTo".into(), Value::String("p".into()));
+        let items = vec![photo("p", 0.0, 0.0), n];
+        assert!(Pins::measure(&items).is_empty());
+    }
+
+    #[test]
+    fn a_pin_to_a_card_that_is_gone_falls_back_to_measuring() {
+        let mut n = sticky("n", 40.0, 20.0);
         n.meta.insert("stuckTo".into(), Value::String("deleted".into()));
         let items = vec![photo("p", 0.0, 0.0), n];
         assert_eq!(Pins::measure(&items).host_of("n"), Some("p"));
     }
 
     #[test]
-    fn where_a_note_would_stick_can_be_asked_even_of_one_that_is_unstuck() {
-        // The question a drop asks: putting an unstuck note down on a card is
-        // the author taking the unstick back, and the ordinary measurement
-        // would always answer "nowhere" for exactly these notes.
-        let mut n = note("n", 40.0, 20.0);
-        n.meta.insert("loose".into(), Value::Bool(true));
-        let items = vec![photo("p", 0.0, 0.0), n];
-        assert_eq!(Pins::measure(&items).host_of("n"), None);
-        assert_eq!(Pins::measure_ignoring_loose(&items).host_of("n"), Some("p"));
-    }
-
-    #[test]
     fn a_drag_on_a_stuck_note_takes_hold_of_its_host() {
-        let items = vec![photo("p", 0.0, 0.0), note("n", 40.0, 20.0)];
+        let items = vec![photo("p", 0.0, 0.0), sticky("n", 40.0, 20.0)];
         let pins = Pins::measure(&items);
         assert_eq!(pins.handle("n"), "p");
         assert_eq!(pins.handle("p"), "p");
@@ -295,17 +289,16 @@ mod tests {
     }
 
     #[test]
-    fn the_stamp_records_the_pin_and_leaves_the_decision_alone() {
-        let mut n = note("n", 40.0, 20.0);
-        n.meta.insert("loose".into(), Value::Bool(true));
-        let mut items = vec![photo("p", 0.0, 0.0), n, note("free", 900.0, 900.0)];
-        items[2].meta.insert("stuckTo".into(), Value::String("ghost".into()));
+    fn the_stamp_records_the_pin_and_clears_what_is_not_one() {
+        let mut items =
+            vec![photo("p", 0.0, 0.0), sticky("on", 40.0, 20.0), note("plain", 60.0, 30.0)];
+        // The plain note carries a record from an old build.
+        items[2].meta.insert("stuckTo".into(), Value::String("p".into()));
         stamp(&mut items);
-        // Unstuck, so nothing is recorded — but `loose` survives, because it
-        // is not the measurement's to clear.
-        assert!(!items[1].meta.contains_key("stuckTo"));
-        assert!(is_loose(&items[1]));
-        // And a stale record on a note lying on nothing is cleared.
+        assert_eq!(items[1].meta.get("stuckTo"), Some(&Value::String("p".into())));
+        // Not sticky, so not pinned, so no record — however it got there.
         assert!(!items[2].meta.contains_key("stuckTo"));
+        // And the decision itself is not the stamp's to touch.
+        assert!(is_sticky(&items[1]));
     }
 }
