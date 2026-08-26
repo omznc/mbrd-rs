@@ -137,10 +137,16 @@ pub struct Menu {
     /// Where it hangs and how much of it there is room for, worked out once
     /// when it opened. See the module note on why once is enough.
     pub list: Placed,
-    /// What it offers. Held rather than looked up at paint time, so that a
-    /// menu opened over a rope stays the rope's menu even if the command it
-    /// runs changes what is selected underneath it.
-    pub entries: &'static [Entry],
+    /// What it offers: the static list this app keeps, **already filtered to
+    /// what applies** — see [`Entry::shown`].
+    ///
+    /// Owned rather than borrowed for exactly that reason, and held rather
+    /// than filtered again at paint time for two: a menu opened over a rope
+    /// stays the rope's menu even if the command it runs changes what is
+    /// selected underneath it, and a list whose rows came and went while the
+    /// pointer was travelling down it would be a list that moves the row you
+    /// were aiming at.
+    pub entries: Vec<Entry>,
     /// The submenu that is open, where one is.
     pub open: Option<Open>,
     /// How far the list is scrolled, for the window too short to hold it.
@@ -174,7 +180,7 @@ pub struct Open {
     /// inside the list it opened.
     pub row: usize,
     pub list: Placed,
-    pub entries: &'static [Entry],
+    pub entries: Vec<Entry>,
     /// The row of *this* list the pointer or the keyboard is on. See
     /// [`Menu::cursor`], which is the same idea one level up.
     pub cursor: Option<usize>,
@@ -182,9 +188,13 @@ pub struct Open {
 
 impl Menu {
     /// Open a list at the pointer, fitted to the window it is opening in.
-    pub fn new(at: Point<Pixels>, entries: &'static [Entry], room: Size<Pixels>) -> Self {
+    ///
+    /// `entries` is what will be *drawn* rather than the table it came from —
+    /// the filtering happens at the door, in `BoardView`, because it is a
+    /// question about the board and this holds none of it.
+    pub fn new(at: Point<Pixels>, entries: Vec<Entry>, room: Size<Pixels>) -> Self {
         Self {
-            list: Self::placed(at, room, entries),
+            list: Self::placed(at, room, &entries),
             entries,
             open: None,
             scroll: ScrollHandle::new(),
@@ -206,7 +216,7 @@ impl Menu {
     }
 
     /// How tall the list wants to be, before the window has its say.
-    fn height(entries: &[Entry]) -> f32 {
+    pub(crate) fn height(entries: &[Entry]) -> f32 {
         entries.iter().map(Self::extent).sum::<f32>() + (PADDING + BORDER) * 2.0
     }
 
@@ -242,7 +252,7 @@ impl Menu {
         // scrolls, so a submenu placed against the row's position in the list
         // rather than its position on the screen would open level with whatever
         // had scrolled into its place.
-        let top = self.list.at.y + px(Self::top_of(self.entries, row)) + scroll;
+        let top = self.list.at.y + px(Self::top_of(&self.entries, row)) + scroll;
         // Slid up rather than flipped where it runs past the bottom: a submenu
         // that flipped would clear its row entirely, and the row is the only
         // thing saying where the second list came from.
@@ -261,15 +271,24 @@ impl Menu {
     /// rather than on leaving: a row that closed its submenu on the way out
     /// would close it as the pointer crossed into it.
     ///
-    /// `opens` is asked of the caller rather than worked out here, because
-    /// availability is a question about the *board* and this holds none of it.
-    pub fn reveal(&mut self, row: usize, room: Size<Pixels>, scroll: Pixels, opens: bool) -> bool {
-        match self.entries.get(row).copied() {
-            Some(Entry::More(_, list)) if opens => {
+    /// `sub` is the filtered list that row opens onto, and it is asked of the
+    /// caller rather than worked out here for the reason the entries are:
+    /// which rows apply is a question about the *board*, and this holds none
+    /// of it. `None` — or an empty list — means the row opens onto nothing,
+    /// which closes whatever was open.
+    pub fn reveal(
+        &mut self,
+        row: usize,
+        room: Size<Pixels>,
+        scroll: Pixels,
+        sub: Option<Vec<Entry>>,
+    ) -> bool {
+        match sub {
+            Some(list) if !list.is_empty() => {
                 if self.open.as_ref().is_some_and(|open| open.row == row) {
                     return false;
                 }
-                let placed = self.beside(row, list, room, scroll);
+                let placed = self.beside(row, &list, room, scroll);
                 self.open = Some(Open { row, list: placed, entries: list, cursor: None });
                 true
             }
@@ -297,8 +316,8 @@ impl Menu {
     /// top list's otherwise: whichever list the keyboard is actually on.
     pub fn step(&mut self, by: i32) {
         let (entries, cursor) = match &self.open {
-            Some(open) => (open.entries, open.cursor),
-            None => (self.entries, self.cursor),
+            Some(open) => (open.entries.as_slice(), open.cursor),
+            None => (self.entries.as_slice(), self.cursor),
         };
         let Some(last) = entries.len().checked_sub(1) else { return };
         let last = last as i32;
@@ -329,8 +348,8 @@ impl Menu {
     /// list has it.
     pub fn chosen(&self) -> Option<Entry> {
         let (entries, cursor) = match &self.open {
-            Some(open) => (open.entries, open.cursor),
-            None => (self.entries, self.cursor),
+            Some(open) => (open.entries.as_slice(), open.cursor),
+            None => (self.entries.as_slice(), self.cursor),
         };
         cursor.and_then(|i| entries.get(i)).copied()
     }
@@ -340,14 +359,14 @@ impl Menu {
     /// the submenu's own cursor on its first selectable row, so a further
     /// `Down` continues straight into the list rather than starting from
     /// nothing.
-    pub fn open_under_cursor(&mut self, room: Size<Pixels>) -> bool {
+    pub fn open_under_cursor(&mut self, room: Size<Pixels>, sub: Option<Vec<Entry>>) -> bool {
         if self.open.is_some() {
             return false;
         }
         let Some(row) = self.cursor else { return false };
-        let Some(Entry::More(_, list)) = self.entries.get(row).copied() else { return false };
+        let Some(list) = sub.filter(|list| !list.is_empty()) else { return false };
         let scroll = self.scroll.offset().y;
-        let placed = self.beside(row, list, room, scroll);
+        let placed = self.beside(row, &list, room, scroll);
         self.open = Some(Open { row, list: placed, entries: list, cursor: None });
         self.step(1);
         true
@@ -381,7 +400,7 @@ pub fn render(menu: &Menu, view: &BoardView, cx: &mut Context<BoardView>) -> imp
         .child(list(
             "menu",
             menu.list,
-            menu.entries,
+            &menu.entries,
             lit,
             presence,
             false,
@@ -390,7 +409,7 @@ pub fn render(menu: &Menu, view: &BoardView, cx: &mut Context<BoardView>) -> imp
             cx,
         ))
         .children(menu.open.as_ref().map(|open| {
-            list("submenu", open.list, open.entries, open.cursor, presence, true, None, view, cx)
+            list("submenu", open.list, &open.entries, open.cursor, presence, true, None, view, cx)
         }))
 }
 
@@ -399,7 +418,7 @@ pub fn render(menu: &Menu, view: &BoardView, cx: &mut Context<BoardView>) -> imp
 fn list(
     name: &'static str,
     placed: Placed,
-    entries: &'static [Entry],
+    entries: &[Entry],
     lit: Option<usize>,
     presence: f32,
     sub: bool,
@@ -453,7 +472,7 @@ fn list(
         .bg(theme.chrome)
         .border_1()
         .border_color(theme.chrome_edge)
-        .shadow(crate::theme::shadow_medium())
+        .shadow(theme.shadow_medium())
         .text_size(px(12.0))
         .text_color(theme.text)
         // The canvas beneath listens on mouse-down, so without this a press
@@ -482,6 +501,11 @@ fn row(
     cx: &mut Context<BoardView>,
 ) -> impl IntoElement {
     let theme = view.theme;
+    // Nothing unavailable reaches here — the list was filtered before the
+    // menu was built, and again when this submenu was opened. Kept as the
+    // guard on the press handler below rather than deleted: a row that draws
+    // grey is a bug worth seeing, and one that runs a command that cannot do
+    // anything is a bug that is invisible.
     let available = entry.available(view);
     let ticked = matches!(entry, Entry::Does(command) if command.ticked(view) == Some(true));
     let more = matches!(entry, Entry::More(..));
@@ -629,7 +653,7 @@ mod tests {
             let (w, h) = (f32::from(room.width), f32::from(room.height));
             for entries in menus {
                 for corner in [at(0.0, 0.0), at(w / 2.0, h / 2.0), at(w - 1.0, h - 1.0)] {
-                    let mut menu = Menu::new(corner, entries, room);
+                    let mut menu = Menu::new(corner, entries.to_vec(), room);
                     assert!(inside(menu.list, room), "{:?} at {corner:?} in {room:?}", menu.list);
 
                     let scrolled = px(Menu::height(entries)) - menu.list.size.height;
@@ -639,7 +663,8 @@ mod tests {
                                 continue;
                             }
                             menu.open = None;
-                            menu.reveal(row, room, scroll, true);
+                            let Entry::More(_, inner) = entry else { unreachable!() };
+                            menu.reveal(row, room, scroll, Some(inner.to_vec()));
                             let open = menu.open.as_ref().expect("that row opens onto more");
                             assert!(
                                 inside(open.list, room),
@@ -719,7 +744,7 @@ mod tests {
     #[test]
     fn a_submenu_hangs_off_its_own_row_and_beside_the_list() {
         let room = room(1000.0, 700.0);
-        let menu = Menu::new(at(100.0, 80.0), &ROPE_MENU, room);
+        let menu = Menu::new(at(100.0, 80.0), ROPE_MENU.to_vec(), room);
         let Entry::More(_, list) = ROPE_MENU[4] else { panic!("row four opens onto more") };
         let placed = menu.beside(4, list, room, px(0.0));
         assert_eq!(placed.at.x, px(100.0 + WIDTH - OVERLAP), "beside, tucked under the edge");
@@ -729,7 +754,7 @@ mod tests {
     #[test]
     fn a_submenu_with_no_room_to_its_right_comes_out_the_left() {
         let room = room(800.0, 700.0);
-        let menu = Menu::new(at(700.0, 80.0), &ROPE_MENU, room);
+        let menu = Menu::new(at(700.0, 80.0), ROPE_MENU.to_vec(), room);
         let Entry::More(_, list) = ROPE_MENU[4] else { panic!("row four opens onto more") };
         let placed = menu.beside(4, list, room, px(0.0));
         assert!(placed.at.x < menu.list.at.x, "it should have come out the other side");
@@ -750,21 +775,29 @@ mod tests {
         // that puts the row `SHOW` below the top of the window, the corner the
         // menu hangs from cancels out and this is what is left.
         const SHOW: f32 = 48.0;
-        let above = Menu::top_of(&CARD_MENU, 8);
+        // Found rather than written down, for the reason the paragraph above
+        // gives about the window height: an index into the card menu is exactly
+        // the kind of literal that goes stale the next time a row is added at
+        // the top of it, and it has now done so twice.
+        let row = CARD_MENU
+            .iter()
+            .position(|entry| matches!(entry, Entry::More(..)))
+            .expect("the card menu has a submenu on it");
+        let above = Menu::top_of(&CARD_MENU, row);
         let room = room(640.0, SHOW + MARGIN + Menu::height(&CARD_MENU) - above);
-        let menu = Menu::new(at(10.0, 10.0), &CARD_MENU, room);
+        let menu = Menu::new(at(10.0, 10.0), CARD_MENU.to_vec(), room);
         let scroll = menu.list.size.height - px(Menu::height(&CARD_MENU));
         assert!(scroll < px(0.0), "the card list should not fit this window");
 
-        let Entry::More(_, list) = CARD_MENU[8] else { panic!("row eight opens onto more") };
+        let Entry::More(_, list) = CARD_MENU[row] else { unreachable!("just found one") };
         let drawn = menu.list.at.y + px(above) + scroll;
         // The premise, stated rather than assumed. A row scrolled off the top
         // has no place for a submenu to be level with, and `beside` rightly
         // slides one back inside the window instead — so a fixture that let
         // that happen would be testing the clamp while claiming to test the
         // scroll.
-        assert_eq!(drawn, px(SHOW), "row eight has to still be on screen");
-        assert_eq!(menu.beside(8, list, room, scroll).at.y, drawn);
-        assert_ne!(menu.beside(8, list, room, px(0.0)).at.y, drawn, "the scroll has to count");
+        assert_eq!(drawn, px(SHOW), "the submenu's row has to still be on screen");
+        assert_eq!(menu.beside(row, list, room, scroll).at.y, drawn);
+        assert_ne!(menu.beside(row, list, room, px(0.0)).at.y, drawn, "the scroll has to count");
     }
 }

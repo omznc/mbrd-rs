@@ -28,6 +28,7 @@ mod command;
 mod demo;
 mod dirs;
 mod editor;
+mod fetch;
 mod fuzzy;
 mod grips;
 mod icons;
@@ -36,6 +37,9 @@ mod import;
 mod live;
 mod markdown;
 mod menu;
+mod mesh_cache;
+mod metrics;
+mod opened;
 mod palette;
 mod playback;
 mod prefs;
@@ -45,6 +49,7 @@ mod settings;
 mod switcher;
 mod taps;
 mod theme;
+mod themes;
 mod tip;
 mod titlebar;
 mod tools;
@@ -57,11 +62,26 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui::{
-    point, px, size, App, AppContext as _, Application, Bounds, Size, TitlebarOptions,
-    WindowBounds, WindowDecorations, WindowOptions,
+    point, px, size, App, AppContext as _, Application, Bounds, Size, TitlebarOptions, Window,
+    WindowAppearance, WindowBounds, WindowDecorations, WindowOptions,
 };
 
 use board_view::BoardView;
+use themes::Appearance;
+
+/// What a window looks like, as this app counts it.
+///
+/// gpui draws four: each of light and dark has a "vibrant" variant, which is
+/// macOS saying the window is translucent over whatever is behind it. That is
+/// a fact about the *material*, not about whether the desktop is light or
+/// dark, and this app has one opaque ground either way — so the pair folds to
+/// one and there are two answers rather than four.
+fn appearance(window: &Window) -> Appearance {
+    match window.appearance() {
+        WindowAppearance::Light | WindowAppearance::VibrantLight => Appearance::Light,
+        WindowAppearance::Dark | WindowAppearance::VibrantDark => Appearance::Dark,
+    }
+}
 
 /// The smallest the window is allowed to get.
 ///
@@ -234,11 +254,39 @@ fn main() {
         // already said, so a second attempt at closing is let through, because
         // by then the warning has been read and staying open would just be
         // trapping somebody behind a message they already have.
-        let _ = window.update(cx, |_view, window, cx| {
+        let _ = window.update(cx, |view, window, cx| {
+            // Through the `view` this closure was handed rather than through
+            // `cx.entity().update(…)`: the entity is already borrowed for the
+            // length of this block, and asking gpui for it a second time is a
+            // panic rather than a borrow error. Before the shadowing `let`
+            // below, for the same reason.
+            view.desktop_appearance(appearance(window), cx);
+
             let view = cx.entity();
             window.on_window_should_close(cx, move |_window, cx| {
                 view.update(cx, |view, cx| view.flush(cx))
             });
+
+            // What the desktop looks like, now and whenever it changes.
+            //
+            // Here rather than in the view for the same reason the hook above
+            // is: it needs a `Window`, and this is where there is one. The
+            // seeding matters as much as the observation — on Linux the
+            // appearance arrives from the XDG desktop portal over D-Bus, so a
+            // window that only listened would sit on the placeholder until the
+            // desktop next changed its mind, which on most desks is never.
+            //
+            // Whether any of this is *acted* on is `BoardView::retheme`'s
+            // decision, not this one's: somebody who has pinned the app dark
+            // has said the desktop does not get a vote, and this still tracks
+            // it so that switching to `System` later is instant.
+            let observed = cx.entity();
+            window
+                .observe_window_appearance(move |window, cx| {
+                    let looks = appearance(window);
+                    observed.update(cx, |view, cx| view.desktop_appearance(looks, cx));
+                })
+                .detach();
         });
 
         let Ok(view) = window.entity(cx) else { return };

@@ -41,13 +41,15 @@ use crate::anchor;
 use crate::camera::{Camera, Trail};
 use crate::command::{Command, Entry};
 use crate::editor::{self, Editor};
+use crate::fetch;
 use crate::grips::Grip;
 use crate::icons::{icon, Icon};
-use crate::images::{Images, Load};
+use crate::images::{Images, Load, THUMB_SIDE};
 use crate::import;
 use crate::live::Live;
 use crate::markdown;
 use crate::menu::Menu;
+use crate::metrics::{Advance, Measure};
 use crate::palette::{Palette, What};
 use crate::playback::{Media, Timings};
 use crate::prefs::Prefs;
@@ -60,7 +62,6 @@ use crate::update;
 use crate::wires::{self, Wire, Wires};
 use mbrd_core::align;
 use mbrd_core::fence::Fences;
-use mbrd_core::stick::{self, Pins};
 
 /// `Pixels` as a plain number.
 ///
@@ -88,6 +89,14 @@ const MOST_DOTS: i64 = 40_000;
 
 /// The longest a connection's label may be. The format's own ceiling.
 const LABEL_MAX: usize = 60;
+
+/// The longest address a link card will take.
+///
+/// Nothing in the format says so. Two thousand and forty-eight is the length
+/// past which browsers, proxies and server logs start quietly disagreeing with
+/// each other about what the address was, so it is the length past which an
+/// address has stopped being one.
+const URL_MAX: usize = 2_048;
 
 /// How near a rope the pointer has to be, in screen pixels, to press it.
 ///
@@ -283,6 +292,19 @@ const OVERLAY_OUT: f32 = 0.16;
 /// percent of opacity, which is beneath what a monitor can show.
 const PRESENCE_REST: f32 = 0.004;
 
+/// How much of a page's arrival goes on covering the board over. See
+/// [`arrival`].
+const PAGE_COVER: f32 = 0.35;
+
+/// How far below where it belongs a page's content starts, in pixels.
+///
+/// Smaller than the 8px a panel slides, and in the other direction: a panel
+/// drops in from off the top edge it came from, while a page is already
+/// filling the window and only its contents are settling. Six pixels is
+/// enough to read as motion on a body of text and not enough to read as the
+/// page having been in the wrong place.
+const PAGE_RISE: f32 = 6.0;
+
 /// A switch's knob crossing its track, and a segmented row's wash crossing
 /// its segments.
 ///
@@ -291,14 +313,23 @@ const PRESENCE_REST: f32 = 0.004;
 /// it went*, not to be watched.
 const KNOB: Spring = Spring::new(1.0, 0.15);
 
-/// Roughly how wide one character is, as a fraction of the font size.
+/// The face the board sets its words in, and what to fall back to where the
+/// machine has not got it.
 ///
-/// Used to break a label into lines without shaping it first. It is an estimate
-/// and it is allowed to be: the shaped line is clipped to the card afterwards,
-/// so being wrong makes a line slightly short or slightly clipped rather than
-/// wrong. Measuring properly means shaping every candidate break, which is the
-/// cost this whole section exists to avoid.
-const AVERAGE_ADVANCE: f32 = 0.5;
+/// Out here, and read by both the root element and [`BoardView::new`]'s
+/// measurer, because those two disagreeing would mean measuring a wrap in a
+/// face the painter does not use — which is the entire failure `metrics.rs`
+/// was written to end.
+const BODY_FAMILY: &str = ".SystemUIFont";
+const BODY_FALLBACKS: [&str; 5] =
+    ["Inter", "Cantarell", "Adwaita Sans", "Noto Sans", "DejaVu Sans"];
+
+fn body_font() -> Font {
+    let mut font = gpui::font(BODY_FAMILY);
+    font.fallbacks =
+        Some(FontFallbacks::from_fonts(BODY_FALLBACKS.iter().map(|s| s.to_string()).collect()));
+    font
+}
 
 /// The words on a line: the size they are set at, and the padding of the chip
 /// drawn behind them.
@@ -353,6 +384,52 @@ fn step_presence(presence: &mut f32, leaving: bool, dt: f32) -> bool {
         (*presence - step).max(target)
     };
     true
+}
+
+/// A full-window page arriving, which is two motions and not one.
+///
+/// The menu, the switcher and the palette are **panels**: something small
+/// over a board that goes on existing behind them, so one opacity across the
+/// whole panel is honest — you are meant to see through it while it comes.
+///
+/// The settings page and the open card are not panels. They take the whole
+/// window below the titlebar, and fading one of *those* in on a single number
+/// means every frame in the middle is half a board and half a page at once.
+/// That is a cross-dissolve, which is what a slideshow does between two
+/// photographs and not what a window does when it changes what it is showing:
+/// it reads as ghosting rather than as motion, and it reads worse the busier
+/// the board behind it is.
+///
+/// So the two halves come apart. The **ground** goes solid over the first
+/// third of the travel — the board is covered decisively, and after that
+/// there is nothing left to see through. The **content** then fades and rises
+/// the last few pixels onto a page that is already opaque, which is motion
+/// against a fixed backing and is the part that actually reads as arriving.
+///
+/// Both are functions of the one presence spring, so the exit is still the
+/// entrance played backwards and an Escape pressed mid-arrival still bends
+/// out of the motion it is already in rather than starting a second one.
+#[derive(Debug, Clone, Copy)]
+pub struct Arrival {
+    /// How opaque the page's own ground is, over the board behind it.
+    pub ground: f32,
+    /// How opaque everything drawn on that ground is.
+    pub content: f32,
+    /// How far below where it belongs that content still is, in pixels.
+    pub rise: f32,
+}
+
+/// Split a page's presence into [the two things it is](Arrival).
+pub fn arrival(presence: f32) -> Arrival {
+    let content = ((presence - PAGE_COVER) / (1.0 - PAGE_COVER)).clamp(0.0, 1.0);
+    Arrival {
+        ground: (presence / PAGE_COVER).clamp(0.0, 1.0),
+        content,
+        // Tied to the fade rather than to the presence, so the content stops
+        // moving exactly as it finishes appearing instead of creeping the last
+        // fraction of a pixel after it is already fully drawn.
+        rise: PAGE_RISE * (1.0 - content),
+    }
 }
 
 /// One card a move is holding: which card, where it sat when the press
@@ -492,6 +569,13 @@ enum Gesture {
         cropping: bool,
         open: Pending,
     },
+    /// Sweeping out a selection *of text*, inside the card being typed into.
+    ///
+    /// Nothing is carried on it. The anchor is already where the press put it —
+    /// see [`crate::editor::Editor::place`] — so every frame of the drag is the
+    /// same call the press made with `extend` set, and the release has nothing
+    /// to close: a text selection is not board state and costs no undo step.
+    SelectingText,
     /// Sweeping out a selection rectangle over empty space.
     Marquee {
         from: WorldPoint,
@@ -521,6 +605,27 @@ enum Gesture {
     /// slider should be one thing to take back rather than forty.
     Louder {
         id: String,
+        open: Pending,
+    },
+    /// Turning a mesh card's camera, in Position mode on the board or always
+    /// in the opened page — see `Command::Position` and `BoardView::positioning`.
+    ///
+    /// A `Pending`, like `Louder`: the orbit is board state, saved with the
+    /// file, and one drag is one undo step rather than one per frame.
+    Orbiting {
+        id: String,
+        /// Screen pixels, not world units — a mesh has no board-space
+        /// rotation to measure a drag against. Every frame's turn is the
+        /// distance the pointer has travelled from here, not from the last
+        /// frame, for the reason `Sizing::start` measures from the press.
+        from: gpui::Point<Pixels>,
+        /// The orbit as it was when the press landed.
+        start: mbrd_core::media::Orbit,
+        /// Shift was held at the press — decided once, there, rather than
+        /// read again every frame, so letting go of Shift mid-drag does not
+        /// switch a turn into a pan under the pointer.
+        panning: bool,
+        moved: bool,
         open: Pending,
     },
     /// Dragging a rope out of one of a card's anchors.
@@ -569,13 +674,24 @@ enum Gesture {
     },
 }
 
-/// Which of a card's two pieces of text is being typed into.
+/// Which of a card's pieces of text is being typed into.
+///
+/// Three rather than two, because the window a card opens into types into
+/// everything a card *has* rather than only the thing it shows — see
+/// [`mbrd_core::preview::editable`], which is where the list of what a given
+/// card has lives. A swatch is deliberately not a fourth variant: in this
+/// format a swatch's colour and its name are the same value, and [`write_field`]
+/// is the one place that has to know it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
-    /// The label on the card.
+    /// The label on the card. For a swatch, also its colour.
     Name,
-    /// A sticky note's words.
+    /// A note's words — or the whole of the file behind a card that came
+    /// from one, which is the same field with a different limit and a different
+    /// commit. See `Editing::file`.
     Note,
+    /// A link's address.
+    Url,
 }
 
 /// What a text session is typing into.
@@ -614,6 +730,15 @@ pub struct Editing {
     pub editor: Editor,
     /// What was there before, so Escape can put it back.
     before: String,
+    /// Whether this is the card's **file** being typed rather than the card's
+    /// own words.
+    ///
+    /// The two are different pieces of state — see the header of `opened.rs` —
+    /// and they commit differently: the card's words are a `meta.text` the
+    /// ledger writes directly, while a file is new bytes in the archive and a
+    /// card repointed at them. Only the open window ever sets this; typing on
+    /// the board is always the card's words.
+    file: bool,
     /// The whole session is one step. Typing forty characters and pressing
     /// Escape should be one thing to undo, not forty.
     open: Pending,
@@ -1006,10 +1131,21 @@ enum Overlay {
     /// open — everything the rows show is read off the view each frame. See
     /// `settings.rs`.
     Settings(crate::settings::Page),
+    /// One card, opened onto the whole window. The payload is only its id, for
+    /// the same reason the settings page carries only its section. See
+    /// `opened.rs`.
+    Opened(crate::opened::Opened),
 }
 
 pub struct BoardView {
     pub doc: Document,
+    /// How wide a character is, for every wrap on this board.
+    ///
+    /// Resolved once, at startup, against [`body_font`]. Held rather than
+    /// borrowed because the two callers that need it most — `write_to` on
+    /// every keystroke and `refit` inside an `edit` — are already inside a
+    /// closure holding the document. See `metrics.rs`.
+    measure: Measure,
     pub viewport: Viewport,
     pub theme: Theme,
     /// Selected item ids, in the order they were selected.
@@ -1022,6 +1158,28 @@ pub struct BoardView {
     said: Option<Said>,
     /// What this person has asked for. See `prefs.rs`.
     pub prefs: Prefs,
+    /// Every palette this run can offer. See `themes.rs`.
+    ///
+    /// Read once, at startup. Not re-read on every frame and not watched: a
+    /// theme file is a document somebody edits in bursts and then stops, and
+    /// the settings page has a row that reloads this on request — which costs
+    /// one press on the rare occasion it is wanted, against a filesystem watch
+    /// running for the whole life of every session on the chance it is.
+    pub themes: crate::themes::Registry,
+    /// What the desktop last said it looks like.
+    ///
+    /// Only consulted when the mode is `System` — see [`Prefs::mode`] — but
+    /// tracked always, so that switching *to* `System` is instant rather than
+    /// waiting for the desktop to next change its mind.
+    pub system: crate::themes::Appearance,
+    /// A palette being tried on, which is not yet a choice.
+    ///
+    /// The theme picker previews live as the highlight moves, and this is what
+    /// makes that reversible: [`Self::theme`] is whatever is on screen, and
+    /// this remembers what was on screen before the preview started so that
+    /// Escape can put it back. `None` on every frame that is not a preview,
+    /// which is nearly all of them.
+    theme_before_preview: Option<Theme>,
     /// How far in the marks beside each card have faded, by card id.
     ///
     /// A number per card rather than one for the whole board, because hover
@@ -1134,6 +1292,15 @@ pub struct BoardView {
     /// rather than assuming it means the layout can change without silently
     /// putting the cursor in the wrong place.
     canvas_bounds: Bounds<Pixels>,
+    /// Where the open window's editor draws its text, and how wide one of its
+    /// characters is.
+    ///
+    /// The same trade `canvas_bounds` makes and for the same reason: turning a
+    /// press into a caret needs to know where the text starts, and only the
+    /// layout knows that. Recorded by the page as it draws — see
+    /// `opened::source` — and read by [`Self::place_opened_caret`].
+    opened_text: Bounds<Pixels>,
+    opened_advance: f32,
     focus_handle: FocusHandle,
     /// The file this board came from, where it came from one. `None` means a
     /// save has to invent a name — see `save::default_path`.
@@ -1161,6 +1328,11 @@ pub struct BoardView {
     fences_at: u64,
     /// Decoded pictures, keyed by content hash.
     images: Images,
+    /// Parsed meshes and their last-rasterised pictures. See `mesh_cache`.
+    meshes: crate::mesh_cache::Meshes,
+    /// The one mesh card whose drag and scroll orbit its camera instead of
+    /// moving it or zooming the board. See `Command::Position`.
+    pub positioning: Option<String>,
     /// The card being typed into, where there is one.
     ///
     /// The app's second mode, after the switcher. While this holds a value the
@@ -1394,11 +1566,19 @@ impl BoardView {
         let fences = Fences::measure(&doc.board.items);
         let saved_at = doc.board.revision();
         let mut view = Self {
+            // Resolved here rather than lazily on the first frame: the face is
+            // fixed for the life of the window — see [`body_font`] — so there
+            // is nothing to wait for, and a board that measured its first
+            // frame with a guess would lay that frame out differently from
+            // every one after it.
+            measure: Measure::new(cx.text_system().clone(), &body_font()),
             grid,
             grid_at,
             fences,
             fences_at: grid_at,
             images: Images::default(),
+            meshes: crate::mesh_cache::Meshes::default(),
+            positioning: None,
             overlay: Overlay::None,
             overlay_presence: Sprung::at(0.0),
             settings_motion: HashMap::new(),
@@ -1447,6 +1627,14 @@ impl BoardView {
             save_timer: false,
             close_refused: false,
             prefs: crate::prefs::load(),
+            themes: crate::themes::Registry::load(),
+            // Replaced by the real answer as soon as there is a window to ask
+            // — see `main.rs`, which both seeds this and observes it. Dark
+            // rather than light because that is what this app has always been,
+            // and a frame or two of the wrong palette on launch should be the
+            // one somebody already had.
+            system: crate::themes::Appearance::Dark,
+            theme_before_preview: None,
             anchor_fade: HashMap::new(),
             // The sentinel no revision can be, so the first frame counts.
             tallied: (u64::MAX, 0, 0),
@@ -1459,9 +1647,14 @@ impl BoardView {
             pan_trail: Trail::default(),
             gesture: Gesture::None,
             canvas_bounds: Bounds::default(),
+            opened_text: Bounds::default(),
+            opened_advance: 1.0,
             focus_handle: cx.focus_handle(),
         };
         view.restore_saved_view();
+        // Before the first paint, so that a chosen theme is what the window
+        // opens wearing rather than something it changes into.
+        view.theme = view.chosen_theme();
         view.look_on_launch(cx);
         view
     }
@@ -2223,7 +2416,16 @@ impl BoardView {
         // is in it. Leaving the contents behind would empty the rectangle
         // rather than remove the grouping, and there is already a word for
         // removing the grouping — see `ungroup`.
-        let doomed: Vec<String> = self.kin(self.selection.clone());
+        // Locked cards are left out, for the reason a drag leaves them where
+        // they are: a lock says this one is not to be disturbed, and being
+        // inside a group somebody binned is not consent. A locked *fence*
+        // keeps its contents for the same reason — see `unlocked_kin`.
+        let doomed: Vec<String> = self.unlocked_kin(self.selection.clone());
+        if doomed.is_empty() {
+            self.tell("locked".into());
+            cx.notify();
+            return;
+        }
         self.selection.clear();
         let at = mbrd_core::naming::now_millis();
         let binned = self.doc.board.edit("To the bin", |board| {
@@ -2578,7 +2780,7 @@ impl BoardView {
         }
     }
 
-    /// Drop a fresh sticky note in the middle of the view.
+    /// Drop a fresh note in the middle of the view.
     pub fn add_note(&mut self, cx: &mut Context<Self>) {
         let middle = point(self.viewport.pan.x, self.viewport.pan.y);
         self.add_note_at(middle, cx);
@@ -2716,12 +2918,15 @@ impl BoardView {
         };
         *flag = !*flag;
         let now = *flag;
-        crate::prefs::save(self.prefs);
+        crate::prefs::save(&self.prefs);
 
         // An environment variable beats the file at load, so a choice that is
         // being overridden has to say so rather than appearing to take and then
         // silently not surviving a restart.
-        match crate::prefs::Prefs::forced(matches!(which, Command::ToggleMotion)) {
+        match crate::prefs::Prefs::forced(match which {
+            Command::ToggleMotion => crate::prefs::Setting::Motion,
+            _ => crate::prefs::Setting::Update,
+        }) {
             Some(var) => self.warn(format!("{label} is set by {var}, which wins at startup")),
             // The menu this came from closes on the press that got here, so
             // there is nothing left on screen to confirm the flip — the bar
@@ -2738,6 +2943,8 @@ impl BoardView {
             Command::ToggleSnap => "Snapping",
             Command::ToggleWeb => "Connections",
             Command::ToggleGuides => "Alignment guides",
+            Command::ToggleHud => "Scale bar",
+            Command::ToggleLandscape => "Landscape",
             _ => return,
         };
         let now = self.doc.board.edit(label, |board| {
@@ -2747,6 +2954,8 @@ impl BoardView {
                 Command::ToggleAxes => &mut settings.axes,
                 Command::ToggleWeb => &mut settings.web,
                 Command::ToggleGuides => &mut settings.guides,
+                Command::ToggleHud => &mut settings.hud,
+                Command::ToggleLandscape => &mut settings.paper_landscape,
                 _ => &mut settings.snap,
             };
             *flag = !*flag;
@@ -2805,6 +3014,37 @@ impl BoardView {
         }
 
         self.say(format!("{} {}", label.to_lowercase(), if now { "on" } else { "off" }));
+        cx.notify();
+    }
+
+    /// Outline a different sheet of paper, or none — `Command::Paper`'s door.
+    pub fn set_paper(&mut self, size: mbrd_core::paper::PaperSize, cx: &mut Context<Self>) {
+        let id = size.id();
+        if self.doc.board.settings.desktop.paper == id {
+            return;
+        }
+        self.doc.board.edit("Paper", |board| {
+            board.settings.desktop.paper = id.to_string();
+        });
+        self.say(match size {
+            mbrd_core::paper::PaperSize::NoSheet => "no paper".into(),
+            _ => format!("{} paper", size.label()),
+        });
+        cx.notify();
+    }
+
+    /// Flip the scale bar between metric and imperial. Not `toggle_setting`:
+    /// that one flips a `bool` in place, and this flips a string between two
+    /// spellings — see `Command::ToggleUnits`'s own doc for why it is a
+    /// switch and not a two-row submenu.
+    pub fn toggle_units(&mut self, cx: &mut Context<Self>) {
+        let now = self.doc.board.edit("Units", |board| {
+            let settings = &mut board.settings.desktop;
+            settings.units =
+                if settings.units == "imperial" { "metric" } else { "imperial" }.into();
+            settings.units.clone()
+        });
+        self.say(format!("{now} units"));
         cx.notify();
     }
 
@@ -2936,6 +3176,16 @@ impl BoardView {
             n => format!("tinted {n}"),
         });
         cx.notify();
+    }
+
+    /// Open whatever card is selected onto the whole window. `O`.
+    ///
+    /// The last one selected, which is the same card [`Self::rename`] picks and
+    /// for the same reason: with several in hand, the one you touched most
+    /// recently is the one you meant.
+    pub fn open_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.selection.last().cloned() else { return };
+        self.open_card(&id, cx);
     }
 
     /// Open whatever is selected for typing. `F2`, and Enter.
@@ -3111,45 +3361,60 @@ impl BoardView {
     /// on its own.
     /// Everything a drag on these cards should actually take hold of.
     ///
-    /// Two rules, and both of them are what somebody would expect rather than
-    /// what the data structure suggests:
-    ///
-    /// - **A stuck note hands the gesture to its host.** That is what "pinned"
-    ///   means. Dragging the caption off the photograph it is captioning is not
-    ///   a thing anybody means to do; unsticking it is how you say you did.
-    /// - **A fence brings what is inside it.** A fence that moves and leaves
-    ///   its cards behind has not moved a grouping, it has torn one.
+    /// [`kin`](Self::kin) with the locked taken out **before** the
+    /// expansion, or a locked fence would hand its contents to a drag it is
+    /// not itself taking part in — which is a locked group whose cards slide
+    /// out of it. Not filtered again *after* the expansion: a lock says a
+    /// card is not to be dragged on its own, not that it can resist the fence
+    /// that holds it — a locked card in an unlocked fence is still carried
+    /// when the fence moves, or the group would tear itself apart every time
+    /// it travelled.
     ///
     /// Deliberately worked out once at the press rather than on every frame:
     /// the set has to stay the same for the length of the gesture, or a card
     /// sliding out of a fence mid-drag would stop moving halfway across the
     /// board.
     fn dragging(&self, ids: Vec<String>) -> Vec<String> {
-        let pins = Pins::measure(&self.doc.board.items);
-        // The host first, and then the expansion — in that order, because a
-        // note handed to its host has to bring the host's *other* notes with
-        // it, and doing it the other way round would leave them behind.
-        self.kin(ids.into_iter().map(|id| pins.handle(&id).to_string()).collect())
+        self.kin(self.movable(ids))
+    }
+
+    /// The set [`dragging`](Self::dragging) describes, less the locked cards
+    /// even where they are only along for the ride: what binning asks is a
+    /// different question from what dragging asks — a group somebody binned
+    /// should not take a locked passenger down with it, where a group somebody
+    /// *moved* should.
+    fn unlocked_kin(&self, ids: Vec<String>) -> Vec<String> {
+        self.movable(self.kin(self.movable(ids)))
+    }
+
+    /// These ids, less the ones the author has nailed down.
+    ///
+    /// One door for every gesture that moves something — the drag, the nudge,
+    /// the aligns — so that a lock cannot be honoured in one of them and
+    /// forgotten in the next.
+    fn movable(&self, ids: Vec<String>) -> Vec<String> {
+        ids.into_iter().filter(|id| !self.is_locked(id)).collect()
+    }
+
+    /// Whether this card is nailed down. See [`mbrd_core::Item::locked`].
+    pub fn is_locked(&self, id: &str) -> bool {
+        self.doc.board.item(id).is_some_and(Item::locked)
     }
 
     /// These cards, plus everything that travels with them.
     ///
-    /// The half of [`dragging`](Self::dragging) that is not about pins, and the
-    /// half that copying wants too:
-    ///
-    /// - **A fence brings what is inside it.** A fence that moves and leaves
-    ///   its cards behind has not moved a grouping, it has torn one — and a
-    ///   fence *copied* without them is an empty rectangle, which is the bug
-    ///   this being shared is here to stop coming back.
-    /// - **A card brings the notes stuck to it.** Same argument: a photograph
-    ///   copied without its caption has lost the caption.
+    /// One rule, and it is what somebody would expect rather than what the
+    /// data structure suggests: **a fence brings what is inside it.** A fence
+    /// that moves and leaves its cards behind has not moved a grouping, it has
+    /// torn one — and a fence *copied* without them is an empty rectangle,
+    /// which is the bug this being shared between the drag and the copy is
+    /// here to stop coming back.
     ///
     /// Not recursive, and it does not need to be: `contents` is already
     /// transitive, so a fence holding a fence holding a card yields all three
     /// in one pass.
     fn kin(&self, ids: Vec<String>) -> Vec<String> {
         let items = &self.doc.board.items;
-        let pins = Pins::measure(items);
         let fences = Fences::measure(items);
 
         let mut out: Vec<String> = Vec::with_capacity(ids.len());
@@ -3161,18 +3426,13 @@ impl BoardView {
         for id in ids {
             push(id, &mut out);
         }
-        // A separate pass, because what a fence holds is decided by the fences
-        // and what a note is stuck to is decided by the pins, and a note stuck
-        // to a card inside a fence must not be added twice.
+        // A separate pass, so that a fence inside a fence is not added twice.
         let mut carried: Vec<String> = Vec::new();
         for id in &out {
             if self.doc.board.item(id).map(|i| &i.kind) == Some(&ItemType::Fence) {
                 for held in fences.contents(id, items) {
                     carried.push(held.id.clone());
                 }
-            }
-            for note in pins.stuck_to(id, items) {
-                carried.push(note.id.clone());
             }
         }
         for id in carried {
@@ -3354,7 +3614,7 @@ impl BoardView {
     }
 
     // -----------------------------------------------------------------------
-    // Arranging, fencing, unsticking
+    // Arranging and fencing
     // -----------------------------------------------------------------------
 
     /// Line up, space out, or push apart what is selected.
@@ -3364,8 +3624,16 @@ impl BoardView {
     /// the door. Nothing here decides anything, which is what keeps the
     /// deciding testable without a window.
     pub fn arrange(&mut self, what: Command, cx: &mut Context<Self>) {
-        let picked: Vec<&Item> =
-            self.selection.iter().filter_map(|id| self.doc.board.item(id)).collect();
+        // Locked cards are left out of the measurement as well as out of the
+        // move: an alignment that read a nailed-down card's edge and then
+        // could not move it would line the others up on an edge nothing
+        // explains.
+        let picked: Vec<&Item> = self
+            .selection
+            .iter()
+            .filter_map(|id| self.doc.board.item(id))
+            .filter(|item| !item.locked())
+            .collect();
         let (moves, label) = match what {
             Command::Align(edge) => (align::align(&picked, edge), what.label()),
             Command::Distribute(axis) => (align::distribute(&picked, axis), what.label()),
@@ -3473,14 +3741,11 @@ impl BoardView {
     /// The whole-board relayout: ask `core::arrange` for one position per
     /// card and write the answer through the door as one step.
     ///
-    /// The same shape as [`Self::arrange`] one floor up, with three rules
+    /// The same shape as [`Self::arrange`] one floor up, with two rules
     /// carried over from the original's `rearrange()` because each guards a
     /// grouping somebody made by hand:
     ///
-    /// - **A stuck note is not laid out.** It rides its host to the host's
-    ///   new slot; a note whose host is not in the set rides a host that does
-    ///   not move, and so does not move either.
-    /// - **A fenced card is not laid out either**, when its fence is in the
+    /// - **A fenced card is not laid out**, when its fence is in the
     ///   set: the fence takes a slot at its own size and its contents keep
     ///   their places inside it. Laid out flat, an arrangement would deal
     ///   every fence a slot as though it were a card and scatter its cards to
@@ -3497,7 +3762,6 @@ impl BoardView {
             .or_else(|| Arrangement::parse(&self.doc.board.arrangements.desktop))
             .unwrap_or(Arrangement::Grid);
         let items = &self.doc.board.items;
-        let pins = Pins::measure(items);
         let fences = Fences::measure(items);
 
         // Furniture is left out and left alone: the title card and the hints
@@ -3508,6 +3772,12 @@ impl BoardView {
         let chosen: Vec<&Item> = items
             .iter()
             .filter(|i| !matches!(i.kind, ItemType::Title | ItemType::Ghost))
+            // A locked card is furniture the author made: the layout leaves it
+            // exactly where it stands, the same way it leaves the title card —
+            // and so is everything inside a locked fence, or locking a group
+            // would keep its rectangle still while its cards were dealt slots
+            // out from under it.
+            .filter(|i| !i.locked() && !fences.chain(&i.id).iter().any(|f| self.is_locked(f)))
             .filter(|i| !only_selection || self.selection.contains(&i.id))
             .collect();
         if chosen.is_empty() {
@@ -3516,21 +3786,17 @@ impl BoardView {
             return;
         }
         let in_set: HashSet<&str> = chosen.iter().map(|i| i.id.as_str()).collect();
-        let is_rider = |it: &Item| pins.host_of(&it.id).is_some();
         let carried: Vec<&Item> = chosen
             .iter()
             .copied()
-            .filter(|i| !is_rider(i) && fences.owner_of(&i.id).is_some_and(|f| in_set.contains(f)))
+            .filter(|i| fences.owner_of(&i.id).is_some_and(|f| in_set.contains(f)))
             .collect();
         let carried_ids: HashSet<&str> = carried.iter().map(|i| i.id.as_str()).collect();
-        let free: Vec<&Item> = chosen
-            .iter()
-            .copied()
-            .filter(|i| !is_rider(i) && !carried_ids.contains(i.id.as_str()))
-            .collect();
+        let free: Vec<&Item> =
+            chosen.iter().copied().filter(|i| !carried_ids.contains(i.id.as_str())).collect();
         if free.is_empty() {
-            // The whole set was followers. There is no arrangement of riders
-            // alone; they stay on their hosts.
+            // Every card in the set was inside a fence that is also in it.
+            // There is nothing left to deal a slot to.
             self.tell("nothing to lay out".into());
             cx.notify();
             return;
@@ -3579,8 +3845,14 @@ impl BoardView {
         } else {
             point(0.0, 0.0)
         };
-        let obstacles: Vec<Rect> =
-            items.iter().filter(|i| i.kind == ItemType::Title).map(Rect::of_item).collect();
+        // What a slot may not be dealt over. The title card, and everything
+        // the author has locked — both are things that stay where they are, so
+        // both are places the layout has to work around rather than through.
+        let obstacles: Vec<Rect> = items
+            .iter()
+            .filter(|i| i.kind == ItemType::Title || i.locked())
+            .map(Rect::of_item)
+            .collect();
 
         let refs: Vec<&Item> = laid.iter().collect();
         let spots = arranging::arrange(
@@ -3645,35 +3917,6 @@ impl BoardView {
                 // somehow. Leave the stragglers where they stand rather than
                 // loop forever; a card that does not move is a smaller wrong
                 // than a hang.
-                break;
-            }
-            pending = next;
-        }
-
-        // Hosts are at their new slots; carry each rider by its host's
-        // translation, keeping the offset the author set. In passes, so a
-        // note stuck to a note follows only once its own host has moved. A
-        // rider whose host is not moving does not move either.
-        let riders: Vec<&Item> = chosen.iter().copied().filter(|i| is_rider(i)).collect();
-        let mut pending: Vec<&Item> = riders;
-        loop {
-            let mut next: Vec<&Item> = Vec::new();
-            let mut grew = false;
-            for note in pending {
-                let Some(host) = pins.host_of(&note.id) else { continue };
-                let still_moving = plan.contains_key(host);
-                let host_is_pending_rider =
-                    !still_moving && pins.host_of(host).is_some() && in_set.contains(host);
-                if host_is_pending_rider {
-                    next.push(note);
-                    continue;
-                }
-                if let (Some(&(hx1, hy1)), Some(&(hx0, hy0))) = (plan.get(host), before.get(host)) {
-                    plan.insert(note.id.clone(), (note.x + hx1 - hx0, note.y + hy1 - hy0));
-                    grew = true;
-                }
-            }
-            if !grew || next.is_empty() {
                 break;
             }
             pending = next;
@@ -3765,69 +4008,51 @@ impl BoardView {
         cx.notify();
     }
 
-    /// The notes in the selection, which are what [`Self::toggle_sticky`]
-    /// works on.
-    fn selected_notes(&self) -> Vec<String> {
-        self.selection
-            .iter()
-            .filter(|id| self.doc.board.item(id).is_some_and(|item| item.kind == ItemType::Note))
-            .cloned()
-            .collect()
-    }
-
-    /// Whether the sticky toggle would reach anything.
-    pub fn can_toggle_sticky(&self) -> bool {
-        !self.selected_notes().is_empty()
-    }
-
-    /// What the sticky row's tick should show: whether *every* selected note
-    /// is sticky. `None` when no note is selected, so the row does not tick
-    /// over a selection it would not act on.
-    pub fn sticky_state(&self) -> Option<bool> {
-        let notes = self.selected_notes();
-        if notes.is_empty() {
+    /// What the Lock row's tick should show: whether *every* selected card is
+    /// locked. `None` with nothing selected, so the row does not tick over a
+    /// selection it would not act on.
+    pub fn lock_state(&self) -> Option<bool> {
+        if self.selection.is_empty() {
             return None;
         }
-        Some(notes.iter().all(|id| self.doc.board.item(id).is_some_and(stick::is_sticky)))
+        Some(self.selection.iter().all(|id| self.is_locked(id)))
     }
 
-    /// Flip whether the selected notes pin to what they lie on.
+    /// Nail the selected cards down, or let them go.
     ///
-    /// Off by default and stored only when the author asks — see
-    /// `core::stick` for why stickiness is a decision rather than a
-    /// measurement. A mixed selection goes to sticky, the way every
-    /// all-or-nothing toggle resolves ambiguity: the second press then means
-    /// the other thing for all of them.
+    /// A mixed selection goes to locked, the way every all-or-nothing toggle
+    /// in this table resolves ambiguity: the second press then means the other
+    /// thing for all of them.
     ///
-    /// Turning it off also drops the `stuckTo` record: a record is a pin, and
-    /// the note no longer has one. Turning it *on* writes nothing but the
-    /// flag — where the note is lying is measured, as it always is.
-    pub fn toggle_sticky(&mut self, cx: &mut Context<Self>) {
-        let notes = self.selected_notes();
-        if notes.is_empty() {
+    /// Not through `kin`. Locking a fence locks the *rectangle* — what is
+    /// inside it is a measurement rather than a membership somebody typed, and
+    /// a lock that silently reached six other cards would be a lock nobody
+    /// could undo by looking at what they selected.
+    pub fn toggle_lock(&mut self, cx: &mut Context<Self>) {
+        if self.selection.is_empty() {
             return;
         }
-        let on = !self.sticky_state().unwrap_or(false);
-        let n = notes.len();
-        self.doc.board.edit(if on { "Sticky" } else { "Unstick" }, |board| {
-            for id in &notes {
+        let on = !self.lock_state().unwrap_or(false);
+        let ids = self.selection.clone();
+        let n = ids.len();
+        self.doc.board.edit(if on { "Lock" } else { "Unlock" }, |board| {
+            for id in &ids {
                 if let Some(item) = board.item_mut(id) {
                     if on {
-                        item.meta.insert("sticky".into(), serde_json::Value::Bool(true));
+                        item.meta.insert("locked".into(), serde_json::Value::Bool(true));
                     } else {
-                        item.meta.remove("sticky");
-                        item.meta.remove("stuckTo");
+                        // Removed rather than set to `false`, so a board that
+                        // has nothing locked says nothing about locking.
+                        item.meta.remove("locked");
                     }
-                    // The old opt-out key has nothing left to say either way.
-                    item.meta.remove("loose");
                 }
             }
         });
         self.say(match (on, n) {
-            (true, 1) => "sticky — it now travels with what it lies on".into(),
-            (true, n) => format!("{n} sticky"),
-            (false, 1) => "unstuck".into(),
-            (false, n) => format!("unstuck {n}"),
+            (true, 1) => "locked".into(),
+            (true, n) => format!("locked {n}"),
+            (false, 1) => "unlocked".into(),
+            (false, n) => format!("unlocked {n}"),
         });
         cx.notify();
     }
@@ -3898,6 +4123,7 @@ impl BoardView {
     pub fn toggle_fit_text(&mut self, cx: &mut Context<Self>) {
         let Some(fitted) = self.text_fitted() else { return };
         let Some(id) = self.selection.first().cloned() else { return };
+        let measure = self.measure.clone();
         self.doc.board.edit("Dynamic size", |board| {
             if let Some(item) = board.item_mut(&id) {
                 match fitted {
@@ -3912,7 +4138,7 @@ impl BoardView {
                     }
                     false => {
                         item.meta.insert(FIT_TEXT.into(), serde_json::Value::Bool(true));
-                        refit(item);
+                        refit(item, &measure);
                     }
                 }
             }
@@ -3921,6 +4147,31 @@ impl BoardView {
             true => "this note keeps the size you give it".into(),
             false => "this note now grows to fit what is written on it".into(),
         });
+        cx.notify();
+    }
+
+    /// The one selected card, if it is a mesh — what `Command::Position`'s
+    /// row asks, and what `Self::toggle_positioning` acts on.
+    ///
+    /// `None` for anything else selected, nothing selected, or more than one
+    /// card at once: Position mode is one card's camera, not a setting
+    /// several could disagree about — the same shape `text_unscaled` answers
+    /// for its own row, and for the same reason.
+    pub fn positionable(&self) -> Option<String> {
+        let [id] = &self.selection[..] else { return None };
+        let item = self.doc.board.item(id)?;
+        (mbrd_core::preview::of(item, self.asset_of(item)) == mbrd_core::preview::Preview::Mesh)
+            .then(|| id.clone())
+    }
+
+    /// Turn Position mode on for the one selected mesh, or off if it is
+    /// already the card in it.
+    pub fn toggle_positioning(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.positionable() else { return };
+        self.positioning = match self.positioning.as_deref() == Some(id.as_str()) {
+            true => None,
+            false => Some(id),
+        };
         cx.notify();
     }
 
@@ -4026,12 +4277,13 @@ impl BoardView {
 
     /// The connection whose label is under the pointer, if any.
     ///
-    /// The chip's width is **estimated** rather than shaped, for the same
-    /// reason [`AVERAGE_ADVANCE`] exists at all: shaping is the expensive
-    /// thing, and this is asked on every mouse move. Being a few pixels out at
-    /// either end costs a press that lands on the line running under the chip
-    /// instead, which selects the connection — the near-miss answer rather
-    /// than a wrong one.
+    /// The chip's width is **added up** rather than shaped: shaping is the
+    /// expensive thing and this is asked on every mouse move, but the width of
+    /// each character is a cached lookup — see `metrics.rs`. That is not quite
+    /// a shaping, since it takes no account of kerning or of ligatures, so
+    /// being a pixel out at either end costs a press that lands on the line
+    /// running under the chip instead, which selects the connection — the
+    /// near-miss answer rather than a wrong one.
     fn label_at(&self, world: WorldPoint) -> Option<(String, String)> {
         let zoom = self.viewport.zoom;
         if zoom <= LABEL_ZOOM {
@@ -4042,9 +4294,7 @@ impl BoardView {
             // A chip is a fixed size on screen sitting on a board measured in
             // world units, so how far it reaches in world units grows as the
             // board is zoomed out. Same arithmetic as `rope_at`'s.
-            let wide = (text.chars().count() as f32 * LABEL_TEXT * AVERAGE_ADVANCE
-                + LABEL_PAD * 2.0)
-                / zoom;
+            let wide = (self.measure.width(text, LABEL_TEXT) + LABEL_PAD * 2.0) / zoom;
             let tall = LABEL_TEXT * LABEL_LEADING / zoom;
             let at = w.label_spot();
             // A few screen pixels of grace on top of the estimate, in world
@@ -4308,6 +4558,109 @@ impl BoardView {
                 mbrd_core::media::set_volume(item, level);
             }
         });
+    }
+
+    /// Open a mesh's orbiting gesture at the press. Shared by the board's own
+    /// `on_mouse_down` — gated on `positioning` — and the opened page, where
+    /// a press on the picture always means this.
+    ///
+    /// `panning` is Shift held at the press: a turn of the camera by default,
+    /// a shift of its look-at point instead when held — the same "the drag
+    /// happens on the same picture either way, a modifier says which it
+    /// means" shape `Gesture::Moving`'s own axis lock is built out of.
+    pub(crate) fn begin_mesh_orbit(
+        &mut self,
+        id: &str,
+        position: gpui::Point<Pixels>,
+        panning: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(item) = self.doc.board.item(id) else { return };
+        let start = mbrd_core::media::orbit(item);
+        let open = self.doc.board.start();
+        self.gesture = Gesture::Orbiting {
+            id: id.to_string(),
+            from: position,
+            start,
+            panning,
+            moved: false,
+            open,
+        };
+        cx.notify();
+    }
+
+    /// Zoom a mesh's camera by one wheel notch. The opened page and the
+    /// board's own Position-gated `on_scroll` both land here.
+    pub(crate) fn dolly_orbit(&mut self, id: &str, factor: f32, cx: &mut Context<Self>) {
+        self.doc.board.edit("Zoom", |board| {
+            if let Some(item) = board.item_mut(id) {
+                let next = mbrd_core::media::orbit(item).dollied(factor);
+                mbrd_core::media::set_orbit(item, next);
+            }
+        });
+        self.meshes.forget(id);
+        self.begin_mesh_decode(id, cx);
+    }
+
+    /// The opened page's scroll wheel, which always dollies the one mesh it
+    /// is showing — the same wheel-to-factor arithmetic `on_scroll` uses for
+    /// the board's Position-gated branch, kept in one place since both are
+    /// this same "one notch, one small zoom" decision.
+    pub(crate) fn dolly_mesh(
+        &mut self,
+        id: &str,
+        event: &ScrollWheelEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let dy = match event.delta {
+            ScrollDelta::Pixels(p) => f(p.y) / 40.0,
+            ScrollDelta::Lines(p) => p.y,
+        };
+        let factor = (1.0 + ZOOM_PER_LINE).powf(-dy);
+        self.dolly_orbit(id, factor, cx);
+    }
+
+    /// Rasterise a mesh's newest, still-being-dragged orbit onto `live` —
+    /// never onto `resting`, which is only for a *released* orbit. See
+    /// `live.rs` and `mesh_cache.rs`'s own module docs for why the two are
+    /// kept apart.
+    ///
+    /// Sharp where the opened page has this card up, thumb otherwise — the
+    /// same two tiers `resting` holds, so swapping from one to the other at
+    /// the end of the drag is not a jump in size.
+    fn live_orbit_frame(
+        &mut self,
+        id: &str,
+        orbit: mbrd_core::media::Orbit,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(item) = self.doc.board.item(id) else { return };
+        let Some(hash) = item.asset.as_ref().and_then(ItemAsset::hash) else { return };
+        let Some(mesh) = self.meshes.parsed(hash) else {
+            // Not parsed yet — the first decode this card ever asked for is
+            // still in flight, or has not been asked for. Nothing to turn
+            // yet; the resting picture, once it lands, is where this orbit
+            // will show up.
+            return;
+        };
+        let sharp = matches!(&self.overlay, Overlay::Opened(opened) if opened.id.as_str() == id);
+        let id = id.to_string();
+        let task = cx
+            .background_executor()
+            .spawn(async move { crate::mesh_cache::rasterize_tiers(&mesh, orbit) });
+        cx.spawn(async move |view, cx| {
+            let decoded = task.await;
+            view.update(cx, |view, cx| {
+                if let Some(decoded) = decoded {
+                    let frame =
+                        if sharp { decoded.sharp.unwrap_or(decoded.thumb) } else { decoded.thumb };
+                    view.live.put(&id, frame);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The hovered card, if the pointer has only got as far as its marks.
@@ -4837,10 +5190,723 @@ impl BoardView {
         moving
     }
 
+    /// Whether something is drawn over the whole board rather than beside it.
+    ///
+    /// The two whole-window overlays, and not the three that float: a menu, a
+    /// palette or a switcher leaves most of the board visible and pointing at
+    /// that part of it still means what it meant. A settings page or an opened
+    /// card does not — there is no board under the pointer any more, only a
+    /// picture of one.
+    fn covered(&self) -> bool {
+        matches!(self.overlay, Overlay::Settings(_) | Overlay::Opened(_))
+    }
+
     pub fn close_settings(&mut self) {
         if matches!(self.overlay, Overlay::Settings(_)) {
             self.close_overlay();
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Themes
+    // -----------------------------------------------------------------------
+
+    /// Which of the two palettes the app is wearing right now.
+    ///
+    /// The mode's answer, with the desktop's own only consulted where the mode
+    /// says to. Every question about *which* theme — which list the settings
+    /// page shows, which name a choice writes into — is this question first,
+    /// which is why it is one function and not a `match` repeated at each of
+    /// them.
+    pub fn appearance(&self) -> crate::themes::Appearance {
+        self.prefs.mode.appearance(self.system)
+    }
+
+    /// The palette the current settings add up to.
+    pub fn chosen_theme(&self) -> Theme {
+        let appearance = self.appearance();
+        self.themes.resolve(self.prefs.theme_for(appearance), appearance)
+    }
+
+    /// Wear what the settings currently say.
+    ///
+    /// The one door. The settings rows, the picker, the desktop changing its
+    /// mind and the reload button all end here rather than each assigning
+    /// [`Self::theme`] themselves — which matters more than it looks, because
+    /// "which theme is on" is a question with four inputs (the mode, the
+    /// desktop, two names and a registry) and any path that answered it
+    /// privately would be a path that could answer it differently.
+    ///
+    /// It also ends any preview: arriving here means a real decision has been
+    /// made, and the palette that was being tried on is no longer what is
+    /// being asked about.
+    pub fn retheme(&mut self, cx: &mut Context<Self>) {
+        self.theme_before_preview = None;
+        self.theme = self.chosen_theme();
+        cx.notify();
+    }
+
+    /// What the desktop says, which is only news when the mode is `System`.
+    pub fn desktop_appearance(
+        &mut self,
+        appearance: crate::themes::Appearance,
+        cx: &mut Context<Self>,
+    ) {
+        if self.system == appearance {
+            return;
+        }
+        self.system = appearance;
+        // Tracked always, applied only when it is being followed. Somebody who
+        // has pinned the app dark has said the desktop does not get a vote,
+        // and a repaint on every sunrise would be this app disagreeing.
+        if self.prefs.mode == crate::prefs::Mode::System {
+            self.retheme(cx);
+        }
+    }
+
+    /// Choose the mode, and save it.
+    pub fn set_mode(&mut self, mode: crate::prefs::Mode, cx: &mut Context<Self>) {
+        self.prefs.mode = mode;
+        crate::prefs::save(&self.prefs);
+        self.retheme(cx);
+    }
+
+    /// Choose the theme for one appearance, and save it.
+    ///
+    /// Takes the appearance rather than assuming the current one, because the
+    /// settings page shows both rows at once: somebody pinned to dark can
+    /// still be setting which theme their light one will be.
+    pub fn set_theme(
+        &mut self,
+        appearance: crate::themes::Appearance,
+        name: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.prefs.set_theme(appearance, name);
+        crate::prefs::save(&self.prefs);
+        self.retheme(cx);
+    }
+
+    /// Try a palette on without choosing it.
+    ///
+    /// What the picker does as the highlight moves. The first preview
+    /// remembers what was on screen; the ones after it do not, so that
+    /// arrowing through nine themes and pressing Escape returns to where
+    /// somebody started rather than to the eighth.
+    pub fn preview_theme(&mut self, theme: Theme, cx: &mut Context<Self>) {
+        if self.theme_before_preview.is_none() {
+            self.theme_before_preview = Some(self.theme);
+        }
+        self.theme = theme;
+        cx.notify();
+    }
+
+    /// Put back whatever was on screen before the preview started.
+    ///
+    /// Deliberately not [`Self::retheme`]: they agree in every case but one,
+    /// and that one is the point. A preview started from a theme that is no
+    /// longer in the registry — the file was deleted while the app was open —
+    /// would be "restored" by `retheme` to the fallback rather than to what
+    /// the person was actually looking at a moment ago.
+    pub fn cancel_preview(&mut self, cx: &mut Context<Self>) {
+        if let Some(theme) = self.theme_before_preview.take() {
+            self.theme = theme;
+            cx.notify();
+        }
+    }
+
+    /// Read the themes directory again.
+    ///
+    /// The cheap half of watching it. Somebody who has just written a theme
+    /// file presses this; nobody else pays anything for it.
+    pub fn reload_themes(&mut self, cx: &mut Context<Self>) {
+        self.themes = crate::themes::Registry::load();
+        self.retheme(cx);
+    }
+
+    /// Open the settings page onto Appearance with the theme list already up.
+    ///
+    /// What `Command::SelectTheme` does. It goes through the settings page
+    /// rather than putting a picker of its own over the board, and that is
+    /// the point of it: `Overlay` holds one thing at a time — see its note —
+    /// so a second, free-standing theme picker would be a second list to keep
+    /// saying the same thing as the first, and a person who arrived by the
+    /// fast route would have no way onward to the rest of the appearance
+    /// settings without closing it and opening something else.
+    pub fn open_theme_picker(&mut self, cx: &mut Context<Self>) {
+        let appearance = self.appearance();
+        let was = self.prefs.theme_for(appearance).to_string();
+        let names: Vec<String> =
+            self.themes.of(appearance).iter().map(|t| t.name.clone()).collect();
+        let mut page = crate::settings::Page::onto(crate::settings::Section::Appearance);
+        page.pick_theme(appearance, &was, &names);
+        self.taps.forget();
+        self.open_overlay(Overlay::Settings(page));
+        cx.notify();
+    }
+
+    /// Start choosing a theme for one of the two slots.
+    pub fn pick_theme(&mut self, appearance: crate::themes::Appearance, cx: &mut Context<Self>) {
+        let was = self.prefs.theme_for(appearance).to_string();
+        let names: Vec<String> =
+            self.themes.of(appearance).iter().map(|t| t.name.clone()).collect();
+        if let Overlay::Settings(page) = &mut self.overlay {
+            page.pick_theme(appearance, &was, &names);
+            cx.notify();
+        }
+    }
+
+    /// Keep the theme the picker is on.
+    pub fn choose_theme(&mut self, name: String, cx: &mut Context<Self>) {
+        let Overlay::Settings(page) = &mut self.overlay else { return };
+        let Some(appearance) = page.picking.as_ref().map(|p| p.appearance) else { return };
+        page.picking = None;
+        self.set_theme(appearance, name, cx);
+    }
+
+    /// Put back whatever was chosen before the picker opened.
+    pub fn cancel_theme_pick(&mut self, cx: &mut Context<Self>) {
+        let Overlay::Settings(page) = &mut self.overlay else { return };
+        let Some(picker) = page.picking.take() else { return };
+        // The *choice* is restored through the ordinary setter, and the
+        // palette on screen through `cancel_preview`. Both, and in that
+        // order: the setter is what makes `retheme` agree with the prefs
+        // again, and the preview is what is actually being looked at.
+        self.prefs.set_theme(picker.appearance, picker.was);
+        self.cancel_preview(cx);
+        self.retheme(cx);
+    }
+
+    /// Fold or unfold one of the settings sidebar's groups.
+    pub fn fold_settings_group(&mut self, group: crate::settings::Group, cx: &mut Context<Self>) {
+        if let Overlay::Settings(page) = &mut self.overlay {
+            page.fold(group);
+            cx.notify();
+        }
+    }
+
+    /// Take hold of the settings search field with the mouse.
+    ///
+    /// The keys were always coming here — the page has one field and nothing
+    /// else to type into — so this is not what makes typing work. It is what
+    /// makes pressing the field mean something instead of nothing, which is
+    /// what anybody who reaches for a search box with the pointer first is
+    /// owed. The caret goes to the end because the field cannot measure its
+    /// own text to find out which character was pressed, and the end is where
+    /// pressing past a short query lands anyway.
+    pub fn focus_settings_search(&mut self, cx: &mut Context<Self>) {
+        if let Overlay::Settings(page) = &mut self.overlay {
+            let end = page.query.text().len();
+            page.query.place(end, false);
+            page.focused = true;
+            cx.notify();
+        }
+    }
+
+    /// Let go of it again, on a press anywhere else on the page.
+    ///
+    /// Only the drawing changes: the next letter typed takes it back, because
+    /// a settings page you cannot search by simply typing would be a worse
+    /// page than one whose caret is sometimes not where you looked last.
+    pub fn blur_settings_search(&mut self, cx: &mut Context<Self>) {
+        if let Overlay::Settings(page) = &mut self.overlay {
+            if page.focused {
+                page.focused = false;
+                cx.notify();
+            }
+        }
+    }
+
+    /// Empty the settings search field.
+    pub fn clear_settings_search(&mut self, cx: &mut Context<Self>) {
+        if let Overlay::Settings(page) = &mut self.overlay {
+            page.query = crate::editor::Editor::new("", 64, false);
+            cx.notify();
+        }
+    }
+
+    /// Open `settings.json` in whatever this desktop opens `.json` with.
+    ///
+    /// Written first, and that is the point rather than an implementation
+    /// detail: on a fresh install the file does not exist yet, and handing
+    /// somebody's editor a path to nothing is a worse answer than handing it
+    /// the defaults they are about to change. `prefs::save` is the same
+    /// best-effort write every other setting goes through, so this cannot
+    /// fail loudly either.
+    ///
+    /// Shelled out rather than taken as a dependency. This is one command with
+    /// three spellings, and the workspace's note about `dirs` applies exactly:
+    /// eight direct dependencies, each of them a decision, and this is not
+    /// worth being the ninth.
+    pub fn edit_settings_file(&mut self, cx: &mut Context<Self>) {
+        crate::prefs::save(&self.prefs);
+        let Some(path) = crate::dirs::config().map(|dir| dir.join("settings.json")) else {
+            self.warn("There is nowhere on this computer to keep settings.".into());
+            cx.notify();
+            return;
+        };
+
+        // Three spellings of one command. Windows needs the extra dance
+        // because `start` is a shell builtin rather than a program, and its
+        // first argument is taken as the *window title* — hence the empty
+        // string, which is the documented way of saying "the path is the
+        // path, not the title".
+        #[cfg(target_os = "linux")]
+        let (program, before): (&str, &[&str]) = ("xdg-open", &[]);
+        #[cfg(target_os = "macos")]
+        let (program, before): (&str, &[&str]) = ("open", &[]);
+        #[cfg(windows)]
+        let (program, before): (&str, &[&str]) = ("cmd", &["/C", "start", ""]);
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        let (program, before): (&str, &[&str]) = ("xdg-open", &[]);
+
+        let mut command = std::process::Command::new(program);
+        command.args(before);
+        // Detached and never waited on. Whatever opens a `.json` here is a
+        // text editor somebody will sit in for a while, and a canvas that
+        // blocked its own frame loop on one closing would be a hang.
+        match command.arg(&path).spawn() {
+            Ok(_) => self.tell(format!("Opened {}", path.display())),
+            Err(_) => self.warn(format!("Nothing on this computer would open {}", path.display())),
+        }
+        cx.notify();
+    }
+
+    // -----------------------------------------------------------------------
+    // A card, opened onto the whole window
+    // -----------------------------------------------------------------------
+
+    /// Open a card. What a double-click on one means, whatever type it is.
+    ///
+    /// The gesture used to open a card for *typing*, which is right for a note
+    /// and is very nearly nothing for a photograph — the only thing there was
+    /// to type on one is its name. So typing moved to `F2`, which is the key
+    /// people already reach for, and this became the thing a double-click means
+    /// everywhere: show me this. See `opened.rs`.
+    pub fn open_card(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.doc.board.item(id).is_none() {
+            return;
+        }
+        // Any session still open on the board belongs to the board. Left
+        // standing it would be a caret on a card behind a page nobody can see,
+        // and its `Pending` would join the next edit made up here.
+        self.stop_editing(true, cx);
+        self.taps.forget();
+        // The rail opens with the page for a card there is nothing to draw
+        // for, and stays shut for one there is. Both are the same argument: a
+        // page should never open onto an empty middle, and a photograph should
+        // never open onto a photograph with a panel of numbers across a third
+        // of it. See `opened::rail`.
+        let bare = self.opened_preview(id) == mbrd_core::preview::Preview::Nothing;
+        self.open_overlay(Overlay::Opened(crate::opened::Opened::open(id, bare)));
+        cx.notify();
+    }
+
+    pub fn close_opened(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.overlay, Overlay::Opened(_)) {
+            // Keeping what was typed, which is the same thing closing the
+            // window with the mouse means everywhere else in this app: the
+            // undo history is what puts a change back, not a lost page.
+            self.stop_editing(true, cx);
+            self.close_overlay();
+            cx.notify();
+        }
+    }
+
+    /// The card the open window is showing, where one is open.
+    pub fn opened_id(&self) -> Option<&str> {
+        match &self.overlay {
+            Overlay::Opened(opened) => Some(opened.id.as_str()),
+            _ => None,
+        }
+    }
+
+    /// What is being typed, for the page that draws it.
+    pub fn editor(&self) -> Option<&Editor> {
+        self.editing.as_ref().map(|open| &open.editor)
+    }
+
+    /// Show or hide it. The page's other button, and the one that is on every
+    /// type — see the module header of `opened.rs`.
+    pub fn toggle_opened_info(&mut self, cx: &mut Context<Self>) {
+        let Overlay::Opened(opened) = &mut self.overlay else { return };
+        opened.info = !opened.info;
+        let shut = !opened.info;
+        // Putting the rail away while a rail field is being typed into would
+        // leave the caret behind it, which is exactly the state
+        // `edit_opened_field` opens the rail to avoid — the same defect, from
+        // the other end. So the rail closing ends that session, keeping what
+        // was typed: the words are the one field typed in the page, and they
+        // are untouched by this.
+        let typing_in_the_rail = self
+            .editing
+            .as_ref()
+            .and_then(|open| open.on.card())
+            .is_some_and(|(_, field)| field != Field::Note);
+        if shut && typing_in_the_rail {
+            self.stop_editing(true, cx);
+        }
+        cx.notify();
+    }
+
+    /// What the open page should draw for a card, or would if it were open.
+    ///
+    /// A method rather than a call at each site because resolving the asset is
+    /// two `Option`s and a map lookup, and three copies of that is how one of
+    /// them eventually resolves a different asset than the page is drawing.
+    pub fn opened_preview(&self, id: &str) -> mbrd_core::preview::Preview {
+        let Some(item) = self.doc.board.item(id) else {
+            return mbrd_core::preview::Preview::Nothing;
+        };
+        mbrd_core::preview::of(item, self.asset_of(item))
+    }
+
+    /// The bytes behind a card, where it has any in this document.
+    pub fn asset_of(&self, item: &Item) -> Option<&mbrd_core::mbrd::Asset> {
+        let hash = item.asset.as_ref().and_then(ItemAsset::hash)?;
+        self.doc.assets.get(hash)
+    }
+
+    /// Start or stop typing into the open card.
+    ///
+    /// The page's Edit button, which starts on whatever
+    /// [`mbrd_core::preview::editable`] put first — the words for a note, the
+    /// address for a link, the colour for a swatch, and the name for everything
+    /// whose name is all it has. It is never dead: every card has something.
+    pub fn toggle_opened_typing(&mut self, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            self.stop_editing(true, cx);
+            return;
+        }
+        let Some(id) = self.opened_id().map(str::to_string) else { return };
+        let Some(what) = self.opened_principal(&id) else { return };
+        self.edit_opened_field(&id, what, cx);
+    }
+
+    /// Open the *words* of the page for typing. What a double-click on the
+    /// shown text asks for.
+    ///
+    /// Deliberately not [`Self::toggle_opened_typing`], which is the button:
+    /// the button toggles whatever session happens to be open, so a
+    /// double-click on the words while a name was being typed in the rail
+    /// would close the name and open nothing. This one names the field it
+    /// wants. [`Self::edit_opened_field`] commits the rail's session on the
+    /// way past, so nothing typed there is lost.
+    ///
+    /// Silent where the words are not the principal field — a ten-megabyte log
+    /// is shown and not typed into — so that the double-click and the Edit
+    /// button can never disagree about what they open. See
+    /// [`crate::opened::typeable`], which is the same condition asked before
+    /// the handler is wired at all.
+    pub fn edit_opened_words(&mut self, cx: &mut Context<Self>) {
+        use mbrd_core::preview::Editable;
+        let Some(id) = self.opened_id().map(str::to_string) else { return };
+        let Some(what @ Editable::Text { .. }) = self.opened_principal(&id) else { return };
+        self.edit_opened_field(&id, what, cx);
+    }
+
+    /// The field the Edit button starts on.
+    ///
+    /// The first of the card's editables, with one exception: a file too long
+    /// to hold in a `String` with a caret in it is skipped, so the button falls
+    /// through to the next field rather than going grey. A ten-megabyte log
+    /// still has a name worth changing.
+    pub fn opened_principal(&self, id: &str) -> Option<mbrd_core::preview::Editable> {
+        use mbrd_core::preview::Editable;
+        let item = self.doc.board.item(id)?;
+        let fields = mbrd_core::preview::editable(item, self.asset_of(item));
+        let long =
+            crate::opened::words_of(item, self).chars().count() > mbrd_core::preview::TEXT_MAX;
+        fields.into_iter().find(|what| !(long && matches!(what, Editable::Text { .. })))
+    }
+
+    /// Open one of the card's fields for typing, in the window rather than on
+    /// the card.
+    ///
+    /// *Which* fields a card has is `mbrd_core::preview`'s answer and not this
+    /// function's, which is the whole point of the split: "a link has an
+    /// address and a name" is a fact about the format and testable without a
+    /// window, while "the words commit as new bytes in the archive" is a fact
+    /// about this editor and cannot be.
+    pub fn edit_opened_field(
+        &mut self,
+        id: &str,
+        what: mbrd_core::preview::Editable,
+        cx: &mut Context<Self>,
+    ) {
+        use mbrd_core::preview::Editable;
+        self.stop_editing(true, cx);
+        let Some(item) = self.doc.board.item(id) else { return };
+        let (field, before, limit, multiline, from_file) = match what {
+            Editable::Text { limit } => match crate::opened::file_text(item, self) {
+                // A file this long is not something a `String` with a caret in
+                // it should be asked to hold. It stays readable; the button
+                // moves on to the next field.
+                Some(text) if text.chars().count() > mbrd_core::preview::TEXT_MAX => return,
+                Some(text) => (Field::Note, text, limit, true, true),
+                None => {
+                    let words = item.note_text().unwrap_or_default().to_string();
+                    (Field::Note, words, limit, true, false)
+                }
+            },
+            Editable::Url => {
+                (Field::Url, item.url().unwrap_or_default().to_string(), URL_MAX, false, false)
+            }
+            // A swatch's colour is its name — see `write_field`.
+            Editable::Hex | Editable::Name => {
+                (Field::Name, item.name.clone(), mbrd_core::model::NOTE_MAX, false, false)
+            }
+        };
+        // The words are typed in the page; everything else is typed in the
+        // rail — see `opened::field` — so a session on one of those fields puts
+        // the rail out first. Without this the header's Edit button on a link,
+        // a swatch or a plain file starts a session whose caret is behind a
+        // closed rail: the keys land, the card changes, and nothing on screen
+        // says so. Here rather than in `toggle_opened_typing` because it is a
+        // fact about where a field is drawn, and the rail's own rows reach this
+        // function too — for them it is already true and costs nothing.
+        if field != Field::Note {
+            if let Overlay::Opened(opened) = &mut self.overlay {
+                opened.info = true;
+            }
+        }
+        // A short field opens selected, so typing replaces it; a long one opens
+        // with the caret at the end, so typing continues it. The same bargain
+        // `edit_card` makes on the board, for the same reason.
+        let editor = match multiline {
+            true => Editor::new(before.clone(), limit, true),
+            false => Editor::selecting_all(before.clone(), limit, false),
+        };
+        self.rope = None;
+        self.editing = Some(Editing {
+            on: Subject::Card(id.to_string(), field),
+            editor,
+            before,
+            file: from_file,
+            open: self.doc.board.start(),
+        });
+        self.hint(Some(hint_for(field)));
+        cx.notify();
+    }
+
+    /// What the open page needs from the window, measured for it.
+    ///
+    /// Here rather than in `opened.rs` because both halves want a `&mut` the
+    /// render pass has already given up by the time it is holding the overlay:
+    /// looking a photograph up in the cache is what marks it as wanted, and a
+    /// character's width comes from the window's text system.
+    fn ready_opened(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> crate::opened::Ready {
+        // The whole window's worth of texels, which is what asks the cache for
+        // the sharp copy rather than the thumbnail a card would be happy with.
+        let wanted = f(window.viewport_size().width) * window.scale_factor();
+        // Through the page's own decision rather than the card's: a `.png` that
+        // imported as `generic` draws as a picture here, and `picture_hash`
+        // would answer `None` for it because a *card* of that type does not.
+        // A mesh's picture depends on more than its bytes — see
+        // `mesh_cache`'s own module doc — so it is not `images.look`'s to
+        // answer, the way `frame_of` would otherwise have it try to.
+        let picture = if self.opened_preview(id) == mbrd_core::preview::Preview::Mesh {
+            self.mesh_picture(id, true, cx)
+        } else {
+            let hash = crate::opened::frame_of(id, self);
+            match hash {
+                Some(hash) => match self.images.look(&hash, wanted) {
+                    Load::Ready(image, _) => Some(image),
+                    // Nobody has asked for this one yet — the card may never
+                    // have been on screen. Ask now; the page draws its
+                    // placeholder for a frame and the decode lands behind it.
+                    Load::Cold => {
+                        self.begin_decode(&hash, cx);
+                        None
+                    }
+                    Load::Waiting | Load::Failed => None,
+                },
+                None => None,
+            }
+        };
+
+        // One character of the editor's face, which is what turns a column into
+        // an `x`. Measured rather than assumed: the family that answers is
+        // whichever of the fallback chain the machine actually has.
+        let run = TextRun {
+            len: 1,
+            font: crate::opened::mono(),
+            color: self.theme.text,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let advance = window
+            .text_system()
+            .shape_line("0".into(), px(crate::opened::mono_size()), &[run], None)
+            .width;
+
+        let advance = f(advance).max(1.0);
+        self.opened_advance = advance;
+        // Off the card's own playhead, the same read `draw_list` makes for the
+        // card behind — so opening a GIF shows it where it already was rather
+        // than restarting it, and closing the page does not jump it back.
+        let frame = match &picture {
+            Some(image) if image.frame_count() > 1 => {
+                let item = self.doc.board.item(id);
+                let looping = item.is_some_and(|item| mbrd_core::media::playback(item).looping);
+                self.timings.of(id, image).frame_at(self.media.at(id), looping)
+            }
+            _ => 0,
+        };
+        crate::opened::Ready { picture, frame, advance }
+    }
+
+    /// Record where the open editor's text landed. Called by the page's own
+    /// canvas as it is laid out; notifies only on a change, or it would ask for
+    /// a frame from inside the frame it is drawing.
+    /// How wide the open editor's text block is, once it has been drawn once.
+    ///
+    /// `None` on the frame the page opens, which is the caller's cue to use the
+    /// measure the page is capped at — see `opened::source`.
+    /// How wide one character of the open editor's face is, once the window has
+    /// measured it. See [`Self::ready_opened`].
+    pub fn opened_advance(&self) -> f32 {
+        self.opened_advance.max(1.0)
+    }
+
+    pub fn opened_width(&self) -> Option<f32> {
+        let width = f(self.opened_text.size.width);
+        (width > 1.0).then_some(width)
+    }
+
+    pub fn opened_text_at(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
+        if self.opened_text != bounds {
+            self.opened_text = bounds;
+            cx.notify();
+        }
+    }
+
+    /// Move the caret to where somebody clicked in the open editor.
+    ///
+    /// [`Self::place_caret`] is the same errand on a card and cannot be shared
+    /// with this: there it lands on a proportional face and the answer has to
+    /// come back from the text system, and here the face is fixed-width, so a
+    /// column is a division and there is nothing to measure. That is the whole
+    /// reason the page is set in that face — see `opened.rs`.
+    pub fn place_opened_caret(
+        &mut self,
+        at: gpui::Point<Pixels>,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(offset) = self.opened_caret_at(at) else { return };
+        if let Some(open) = &mut self.editing {
+            open.editor.place(offset, extend);
+        }
+        cx.notify();
+    }
+
+    /// A second, third or fourth press on the page: the run, the line, the lot.
+    /// [`Self::select_run_at`] is the same ladder on a card.
+    pub fn select_opened_run_at(
+        &mut self,
+        at: gpui::Point<Pixels>,
+        clicks: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(offset) = self.opened_caret_at(at) else { return };
+        if let Some(open) = &mut self.editing {
+            match clicks {
+                2 => open.editor.select_word_at(offset),
+                3 => open.editor.select_line_at(offset),
+                _ => open.editor.select_all(),
+            }
+        }
+        cx.notify();
+    }
+
+    /// Which byte of the open page's text a point lands on.
+    fn opened_caret_at(&self, at: gpui::Point<Pixels>) -> Option<usize> {
+        let advance = self.opened_advance.max(1.0);
+        let line_height = crate::opened::line_height();
+        // The same break the page made when it drew these rows. See
+        // `opened::room_in` for why it is one function and not two.
+        let (room, per_char) = crate::opened::room_in(
+            self.opened_width().unwrap_or(f(self.opened_text.size.width)),
+            advance,
+        );
+        let open = self.editing.as_ref()?;
+
+        let rows = open.editor.wrapped(room, crate::opened::mono_size(), &per_char);
+        let local_y = f(at.y) - f(self.opened_text.origin.y);
+        let local_x = f(at.x) - f(self.opened_text.origin.x);
+        let row =
+            ((local_y / line_height).floor().max(0.0) as usize).min(rows.len().checked_sub(1)?);
+        let (start, end) = rows[row];
+
+        // Rounded rather than truncated, so pressing in the right-hand half of
+        // a character puts the caret after it — which is what everything else
+        // with a caret in it does, and the difference between aiming at a
+        // character and aiming at the gap before one.
+        let column = (local_x / advance).round().max(0.0) as usize;
+        let line = &open.editor.text()[start..end];
+        Some(line.char_indices().nth(column).map_or(end, |(offset, _)| start + offset))
+    }
+
+    /// Whether a drag is sweeping out a text selection right now.
+    ///
+    /// The page asks before it extends: a pointer crossing the words with no
+    /// button down is not a selection, and one whose press landed on the
+    /// page's chrome rather than on the text is not one either.
+    pub fn selecting_text(&self) -> bool {
+        matches!(self.gesture, Gesture::SelectingText)
+    }
+
+    /// Arm or disarm the text drag. Called by the page, which has its own
+    /// listeners because the board's canvas is behind it.
+    pub fn select_text_drag(&mut self, on: bool) {
+        match on {
+            true => self.gesture = Gesture::SelectingText,
+            false if self.selecting_text() => self.gesture = Gesture::None,
+            false => {}
+        }
+    }
+
+    /// Write the words back as the card's **file**, and repoint the card at it.
+    ///
+    /// Two things happen and both have to, in this order. The bytes go into the
+    /// archive under the hash of their own contents, which is the format's own
+    /// identity rule and is what makes the same text twice one asset. Then the
+    /// card is repointed at that hash *through the ledger*, alongside a
+    /// refreshed `meta.text` — so the card behind the page still says what the
+    /// file starts with, and one Ctrl Z takes the whole edit back.
+    ///
+    /// The old bytes are not removed. Nothing here removes an asset: a step in
+    /// the history still names it, which is exactly what undo needs to find.
+    fn write_file(&mut self, id: &str, text: &str, token: &Pending) {
+        let (ext, label) = self
+            .doc
+            .board
+            .item(id)
+            .and_then(|item| item.asset.as_ref())
+            .and_then(ItemAsset::hash)
+            .and_then(|hash| self.doc.assets.get(hash))
+            .map(|asset| (asset.ext.clone(), asset.label.clone()))
+            .unwrap_or_else(|| ("md".to_string(), "note".to_string()));
+
+        let bytes = text.as_bytes().to_vec();
+        let hash = mbrd_core::mbrd::hash_bytes(&bytes);
+        self.doc.assets.entry(hash.clone()).or_insert(mbrd_core::mbrd::Asset { bytes, ext, label });
+
+        let head: String = text.chars().take(mbrd_core::model::NOTE_MAX).collect();
+        let id = id.to_string();
+        self.doc.board.during(token, |board| {
+            if let Some(item) = board.item_mut(&id) {
+                item.asset = Some(ItemAsset::Embedded { hash: hash.clone(), family: None });
+                write_field(item, Field::Note, &head, &self.measure);
+            }
+        });
     }
 
     /// Do what a palette row says, and put the palette away.
@@ -4909,7 +5975,7 @@ impl BoardView {
         let world = geometry::union(items).map(|r| r.centre()).unwrap_or(self.viewport.pan);
         let screen = self.viewport.to_screen(world);
         let local = gpui::point(px(screen.x), px(screen.y));
-        let entries = crate::command::menu_for(self);
+        let entries = Entry::shown(crate::command::menu_for(self), self);
         self.open_overlay(Overlay::Menu(Menu::new(local, entries, self.canvas_bounds.size)));
         cx.notify();
     }
@@ -4921,10 +5987,15 @@ impl BoardView {
     /// else closes what was open. See [`Menu::reveal`] for why it is arrival
     /// rather than departure that decides.
     pub fn reveal_menu(&mut self, row: usize, cx: &mut Context<Self>) {
-        let Overlay::Menu(menu) = &self.overlay else { return };
-        let entry = menu.entries.get(row).copied();
-        let opens = entry.is_some_and(|entry| entry.available(self));
+        if !matches!(self.overlay, Overlay::Menu(_)) {
+            return;
+        }
+        // Worked out while the overlay is only borrowed, because the list a
+        // row opens onto is filtered against the board — see `Entry::shown` —
+        // and the board is what the mutable borrow below is taken out of.
+        let sub = self.submenu_at(row);
         let room = self.canvas_bounds.size;
+        let Overlay::Menu(menu) = &self.overlay else { return };
         // How far the list has scrolled, which is the difference between where
         // the row sits in the list and where it sits on the screen. Only a
         // window too short to hold the list makes it anything but zero, and
@@ -4933,11 +6004,27 @@ impl BoardView {
         if let Overlay::Menu(menu) = &mut self.overlay {
             let moved = menu.cursor != Some(row);
             menu.cursor = Some(row);
-            let opened = menu.reveal(row, room, scroll, opens);
+            let opened = menu.reveal(row, room, scroll, sub);
             if moved || opened {
                 cx.notify();
             }
         }
+    }
+
+    /// The list the row at `row` of the open menu opens onto, filtered to the
+    /// rows that apply — `None` where that row opens onto nothing at all.
+    fn submenu_at(&self, row: usize) -> Option<Vec<Entry>> {
+        let Overlay::Menu(menu) = &self.overlay else { return None };
+        match menu.entries.get(row).copied()? {
+            Entry::More(_, list) => Some(Entry::shown(list, self)),
+            _ => None,
+        }
+    }
+
+    /// The same, for whichever row the keyboard is on.
+    fn submenu_under_cursor(&self) -> Option<Vec<Entry>> {
+        let Overlay::Menu(menu) = &self.overlay else { return None };
+        self.submenu_at(menu.cursor?)
     }
 
     /// The pointer has arrived on a row of the open *submenu*. Only the
@@ -5330,10 +6417,29 @@ impl BoardView {
 
     /// Take whatever is on the clipboard.
     ///
-    /// An image becomes a picture, an address becomes a link, and anything else
-    /// becomes a note — which is the order somebody would guess, and the reason
-    /// [`import::as_url`] is deliberately strict about what an address is.
+    /// An image becomes a picture, an address becomes what it points at, and
+    /// anything else becomes a note — which is the order somebody would guess,
+    /// and the reason [`import::as_url`] is deliberately strict about what an
+    /// address is.
     pub fn paste(&mut self, cx: &mut Context<Self>) {
+        self.paste_from(false, cx);
+    }
+
+    /// The same, without following anything.
+    ///
+    /// The escape hatch for the one place a paste does something more than put
+    /// the clipboard down: an address that points at a picture or a video is
+    /// fetched and becomes that picture or that video, and this is how to say
+    /// you meant the address itself. Everything else on the clipboard pastes
+    /// identically either way — there is nothing else this build goes and
+    /// looks up — so the two keys differ in exactly one case, which is the
+    /// case somebody reaching for `Ctrl Shift V` has in mind.
+    pub fn paste_raw(&mut self, cx: &mut Context<Self>) {
+        self.paste_from(true, cx);
+    }
+
+    /// The whole of both. `raw` means a link stays a link.
+    fn paste_from(&mut self, raw: bool, cx: &mut Context<Self>) {
         // The app's own cards first. See `paste_cards` for why one key does
         // both and in this order.
         if self.paste_cards(cx) {
@@ -5413,25 +6519,26 @@ impl BoardView {
             return;
         }
 
-        let mut card = match import::as_url(&text) {
-            Some(url) => {
-                let mut card = Item::new(id.clone(), ItemType::Link);
-                card.name = url.to_string();
-                card.w = 300.0;
-                card.h = 96.0;
-                card.meta.insert("url".into(), serde_json::Value::String(url.to_string()));
-                card
+        if let Some(url) = import::as_url(&text) {
+            // An address that points at a file is that file. A link card is
+            // what is left when it points at a page, when the fetch fails, or
+            // when somebody said they meant the address — see `paste_raw`.
+            if !raw && fetch::worth_trying(url) {
+                self.fetch_onto(url.to_string(), at, cx);
+                return;
             }
-            None => {
-                let mut card = Item::new(id.clone(), ItemType::Note);
-                let words: String = text.trim().chars().take(mbrd_core::model::NOTE_MAX).collect();
-                card.name = "note".into();
-                card.w = 260.0;
-                card.h = 200.0;
-                card.meta.insert("text".into(), serde_json::Value::String(words));
-                card
-            }
-        };
+            self.put_link(&id, url, at, z);
+            self.say("pasted".into());
+            cx.notify();
+            return;
+        }
+
+        let mut card = Item::new(id.clone(), ItemType::Note);
+        let words: String = text.trim().chars().take(mbrd_core::model::NOTE_MAX).collect();
+        card.name = "note".into();
+        card.w = 260.0;
+        card.h = 200.0;
+        card.meta.insert("text".into(), serde_json::Value::String(words));
         card.x = at.x;
         card.y = at.y;
         card.z = z;
@@ -5439,6 +6546,73 @@ impl BoardView {
         self.select_only(&id);
         self.say("pasted".into());
         cx.notify();
+    }
+
+    /// Put a link card down at `at`, and take hold of it.
+    ///
+    /// Its own function because two paths reach it: the paste that decided not
+    /// to follow the address, and the fetch that tried and could not. Both have
+    /// to leave the same card, or a failed download would be a paste that
+    /// quietly lost what was on the clipboard.
+    fn put_link(&mut self, id: &str, url: &str, at: WorldPoint, z: f32) {
+        let mut card = Item::new(id.to_string(), ItemType::Link);
+        card.name = url.to_string();
+        card.w = 300.0;
+        card.h = 96.0;
+        card.meta.insert("url".into(), serde_json::Value::String(url.to_string()));
+        card.x = at.x;
+        card.y = at.y;
+        card.z = z;
+        self.doc.board.edit("Paste", |board| board.items.push(card));
+        self.select_only(id);
+    }
+
+    /// Go and get what an address points at, and put *that* on the board.
+    ///
+    /// Two hops off the main thread and back, for the same reason the image
+    /// paste above takes one: `fetch::embed` blocks on a socket for as long as
+    /// the other end takes, and `import::ready` hashes every byte it returns.
+    /// Neither belongs inside a keystroke.
+    ///
+    /// Nothing is placed until the bytes are in, so a slow fetch is a status
+    /// line rather than a placeholder card that changes shape underneath
+    /// somebody — and one step in the history either way, because a paste is
+    /// one thing somebody did.
+    fn fetch_onto(&mut self, url: String, at: WorldPoint, cx: &mut Context<Self>) {
+        self.hint(Some("fetching…".into()));
+        cx.notify();
+        let fetching = cx.background_executor().spawn({
+            let url = url.clone();
+            async move { fetch::embed(&url).map(|got| import::ready(&got.name, got.bytes)) }
+        });
+        cx.spawn(async move |view, cx| {
+            let got = fetching.await;
+            view.update(cx, |view, cx| {
+                view.hint(None);
+                match got {
+                    Ok(file) => {
+                        let described = file.described;
+                        // At where the camera was when the paste was asked
+                        // for, not where it has drifted to since.
+                        view.place(vec![file], at);
+                        view.say(format!("pasted {described}"));
+                    }
+                    Err(why) => {
+                        // The address is still worth having, so it lands as a
+                        // link — and the reason is said out loud, because a
+                        // paste that silently made a different card than the
+                        // one before it would be a paste nobody can predict.
+                        let id = view.fresh_id();
+                        let z = view.top_z() + 1.0;
+                        view.put_link(&id, &url, at, z);
+                        view.tell(format!("{why} — pasted the link"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Put a batch of prepared files on the board, laid out around a point.
@@ -5538,7 +6712,7 @@ impl BoardView {
         // caret at the end, so typing continues it. Which is what each of them
         // is usually for.
         let editor = match field {
-            Field::Name => Editor::selecting_all(before.clone(), limit, multiline),
+            Field::Name | Field::Url => Editor::selecting_all(before.clone(), limit, multiline),
             Field::Note if whole => Editor::selecting_all(before.clone(), limit, multiline),
             Field::Note => Editor::new(before.clone(), limit, multiline),
         };
@@ -5547,12 +6721,10 @@ impl BoardView {
             on: Subject::Card(id.to_string(), field),
             editor,
             before,
+            file: false,
             open: self.doc.board.start(),
         });
-        self.hint(Some(match field {
-            Field::Name => "renaming — enter to keep, escape to put it back".into(),
-            Field::Note => "editing — escape to put it back, ctrl enter to keep".into(),
-        }));
+        self.hint(Some(hint_for(field)));
         cx.notify();
     }
 
@@ -5572,6 +6744,7 @@ impl BoardView {
             on: Subject::Rope(a, b),
             editor: Editor::selecting_all(before.clone(), LABEL_MAX, false),
             before,
+            file: false,
             open: self.doc.board.start(),
         });
         self.hint(Some("labeling — enter to keep, escape to put it back".into()));
@@ -5586,6 +6759,7 @@ impl BoardView {
         let label = match &open.on {
             Subject::Card(_, Field::Name) => "Rename",
             Subject::Card(_, Field::Note) => "Edit note",
+            Subject::Card(_, Field::Url) => "Set address",
             Subject::Rope(..) => "Label",
         };
         // The mode line names its own escape key precisely because it would
@@ -5602,7 +6776,7 @@ impl BoardView {
             // is exactly what should record nothing: not a step that undoes
             // another, but no step at all.
             let text = if keep { typed } else { open.before.clone() };
-            self.doc.board.during(&open.open, |board| write_to(board, &on, &text));
+            self.commit_edit(&on, open.file, &text, &open.open);
             if self.doc.board.finish(label, open.open) {
                 self.say(if keep { "changed".into() } else { "put back".into() });
             }
@@ -5616,14 +6790,35 @@ impl BoardView {
             // the chair in front of the screen Escape still just puts the
             // text back; underneath, one Ctrl+Z now does exactly what it
             // looks like it should and brings the typing back.
-            self.doc.board.during(&open.open, |board| write_to(board, &on, &typed));
+            self.commit_edit(&on, open.file, &typed, &open.open);
             self.doc.board.finish(label, open.open);
             let discard = self.doc.board.start();
-            self.doc.board.during(&discard, |board| write_to(board, &on, &open.before));
+            self.commit_edit(&on, open.file, &open.before, &discard);
             self.doc.board.finish("Discard", discard);
             self.say("put back".into());
         }
         cx.notify();
+    }
+
+    /// Write a finished edit, whichever of the two texts it was.
+    ///
+    /// One function rather than a branch at each of the three call sites in
+    /// [`Self::stop_editing`], because the third of those is the one that puts
+    /// discarded typing into the history where Ctrl Z can find it — and a
+    /// commit path that only two of the three took would lose a file's worth of
+    /// typing on Escape.
+    fn commit_edit(&mut self, on: &Subject, file: bool, text: &str, token: &Pending) {
+        match (file, on) {
+            (true, Subject::Card(id, _)) => {
+                let id = id.clone();
+                self.write_file(&id, text, token);
+            }
+            _ => {
+                let on = on.clone();
+                let measure = self.measure.clone();
+                self.doc.board.during(token, |board| write_to(board, &on, text, &measure));
+            }
+        }
     }
 
     /// Put the text as it stands onto the card, without ending the edit.
@@ -5634,9 +6829,18 @@ impl BoardView {
     fn show_edit(&mut self) {
         let Some(open) = &self.editing else { return };
         let on = open.on.clone();
-        let text = open.editor.text().to_string();
+        // A file's live preview is only what the card can hold. The bytes are
+        // written once, at the commit — hashing two hundred thousand
+        // characters on every keystroke would be a text field that got slower
+        // the more there was in it, for a picture nobody is looking at while
+        // the page in front of them already shows the whole thing.
+        let text = match open.file {
+            true => open.editor.text().chars().take(mbrd_core::model::NOTE_MAX).collect(),
+            false => open.editor.text().to_string(),
+        };
         let token = open.open.clone();
-        self.doc.board.during(&token, |board| write_to(board, &on, &text));
+        let measure = self.measure.clone();
+        self.doc.board.during(&token, |board| write_to(board, &on, &text, &measure));
     }
 
     /// Move the caret to where somebody clicked.
@@ -5646,12 +6850,25 @@ impl BoardView {
     /// from the same text system that drew it. Everything else about the caret
     /// is in `editor.rs`, without a window.
     fn place_caret(&mut self, at: gpui::Point<Pixels>, extend: bool, window: &mut Window) {
-        let Some(open) = &self.editing else { return };
+        let Some(offset) = self.caret_at(at, window) else { return };
+        if let Some(open) = &mut self.editing {
+            open.editor.place(offset, extend);
+        }
+    }
+
+    /// Which byte of the open editor's text a point lands on.
+    ///
+    /// Split out from [`Self::place_caret`] because a double-click needs the
+    /// offset without moving the caret to it — it selects the run around it
+    /// instead, and asking twice would be asking a question with a font in it
+    /// twice per press.
+    fn caret_at(&self, at: gpui::Point<Pixels>, window: &mut Window) -> Option<usize> {
+        let open = self.editing.as_ref()?;
         // A rope's label is not on a card, so there is no card-local geometry
         // to turn a click into a character. It is one short line and the arrow
         // keys reach all of it.
-        let Some((id, _)) = open.on.card() else { return };
-        let Some(item) = self.doc.board.item(id) else { return };
+        let (id, _) = open.on.card()?;
+        let item = self.doc.board.item(id)?;
 
         let vp = self.viewport;
         let centre = vp.to_screen(point(item.x, item.y));
@@ -5666,10 +6883,12 @@ impl BoardView {
         let local_x = f(at.x) - f(self.canvas_bounds.origin.x) - (centre.x - w / 2.0) - pad;
         let local_y = f(at.y) - f(self.canvas_bounds.origin.y) - (centre.y - h / 2.0) - pad;
 
-        // The same rows the painter drew — same columns, same wrap — or the
-        // click and the caret would disagree about which row a pixel is on.
-        let rows = open.editor.wrapped(columns_for(w, pad, font_size));
-        let row = ((local_y / line_height).floor().max(0.0) as usize).min(rows.len() - 1);
+        // The same rows the painter drew — same width, same face, same wrap —
+        // or the click and the caret would disagree about which row a pixel is
+        // on.
+        let rows = open.editor.wrapped(text_room(w, pad), font_size, &self.measure);
+        let row =
+            ((local_y / line_height).floor().max(0.0) as usize).min(rows.len().checked_sub(1)?);
         let (start, end) = rows[row];
         let line = open.editor.text()[start..end].to_string();
 
@@ -5687,8 +6906,21 @@ impl BoardView {
 
         // Back to an offset in the whole text: a row is a byte span, so its
         // start *is* the arithmetic.
-        if let Some(open) = &mut self.editing {
-            open.editor.place(start + column, extend);
+        Some(start + column)
+    }
+
+    /// What a second, third or fourth press in the same place means.
+    ///
+    /// The ladder every text field has: a word, then the line it is on, then
+    /// all of it. Past four it stays at all of it rather than starting again,
+    /// because a person leaning on the button is not asking for anything new.
+    fn select_run_at(&mut self, at: gpui::Point<Pixels>, clicks: usize, window: &mut Window) {
+        let Some(offset) = self.caret_at(at, window) else { return };
+        let Some(open) = &mut self.editing else { return };
+        match clicks {
+            2 => open.editor.select_word_at(offset),
+            3 => open.editor.select_line_at(offset),
+            _ => open.editor.select_all(),
         }
     }
 
@@ -5758,7 +6990,9 @@ impl BoardView {
             // The untilted box: a turned card's handles are not drawn yet, and
             // offering them where they are not would be worse than not offering
             // them at all.
-            if item.rot != 0.0 {
+            // A locked card wears none either — see where `Draw::lock` is
+            // decided, which is what stops one from being drawn on it.
+            if item.rot != 0.0 || item.locked() {
                 continue;
             }
             let box_ = Rect::centred(item.x, item.y, item.w, item.h);
@@ -5845,6 +7079,10 @@ impl BoardView {
         // something, and what it is holding does not change until it is let go.
         match &self.gesture {
             Gesture::Panning { .. } => return CursorStyle::ClosedHand,
+            // Sweeping out a text selection: the beam, the same as resting
+            // over the words would give. A gesture that changed the pointer
+            // half way through would read as having grabbed something else.
+            Gesture::SelectingText => return CursorStyle::IBeam,
             Gesture::Sizing { grip, cropping, .. } => {
                 // A crop is a reframing rather than a resize, and the two
                 // gestures are the same drag with `Alt` held. Saying so with
@@ -5873,6 +7111,9 @@ impl BoardView {
             Gesture::Scrubbing { .. } | Gesture::Louder { .. } => {
                 return CursorStyle::ResizeLeftRight
             }
+            // Turning a camera is a hand closing on something, the same as
+            // dragging a card.
+            Gesture::Orbiting { .. } => return CursorStyle::ClosedHand,
             Gesture::None => {}
         }
 
@@ -6020,7 +7261,7 @@ impl BoardView {
             // Which list, decided before it is placed: a rope's menu is a
             // different height from a card's, and the flip near an edge is
             // measured against whichever one is about to be drawn.
-            let entries = crate::command::menu_for(self);
+            let entries = Entry::shown(crate::command::menu_for(self), self);
             self.open_overlay(Overlay::Menu(Menu::new(local, entries, self.canvas_bounds.size)));
             cx.notify();
             return;
@@ -6049,7 +7290,17 @@ impl BoardView {
                 .and_then(|(id, _)| self.doc.board.item(id))
                 .is_some_and(|item| geometry::hit(item, world));
             if inside {
-                self.place_caret(event.position, event.modifiers.shift, window);
+                // One press moves the caret and arms a drag; two, three and
+                // four are the run, the line and the lot. `click_count` is the
+                // platform's own count, so the double-click interval is the
+                // one the rest of this desktop uses.
+                match event.click_count {
+                    0 | 1 => {
+                        self.place_caret(event.position, event.modifiers.shift, window);
+                        self.gesture = Gesture::SelectingText;
+                    }
+                    clicks => self.select_run_at(event.position, clicks, window),
+                }
                 cx.notify();
                 return;
             }
@@ -6152,14 +7403,20 @@ impl BoardView {
             return;
         }
 
-        // Twice on a card either steps into the group holding it or opens it
-        // for typing — its words if it has any, its name otherwise. The two
-        // never both apply: a card you can already reach is one there is no
-        // group left to enter, which is exactly what `enterable` answers.
+        // Twice on a card either steps into the group holding it or opens the
+        // card onto the whole window. The two never both apply: a card you can
+        // already reach is one there is no group left to enter, which is
+        // exactly what `enterable` answers.
         //
-        // This is the discoverable way in for both; `F2` and `Enter` are the
-        // ones you learn for typing, and `Escape` is the way back out of a
-        // group.
+        // Opening rather than typing, on every type there is. A double-click
+        // means "show me this" everywhere a person has used a computer, and a
+        // card is a thumbnail — so what it means here is the page. Typing is
+        // what the page is *for*: double-click the words once they are shown
+        // and the session opens there, where there is room for it. See
+        // `opened::words` and `VIEWING.md`.
+        //
+        // `F2` is still the key for typing on the board itself, unchanged, and
+        // `Escape` is still the way back out of a group.
         if event.click_count >= 2 {
             if let Some(id) = self.hit(world) {
                 match self.enterable(&id) {
@@ -6173,7 +7430,7 @@ impl BoardView {
                     }
                     None => {
                         self.select_only(&id);
-                        self.start_editing(&id, cx);
+                        self.open_card(&id, cx);
                     }
                 }
                 cx.notify();
@@ -6219,6 +7476,18 @@ impl BoardView {
             return;
         }
 
+        // Position mode. A press elsewhere leaves it — see `Command::Position`
+        // — so the check runs unconditionally rather than only while a mesh is
+        // actually under the pointer, and falls through to the ordinary press
+        // below on anything else, including empty paper.
+        if let Some(positioning) = self.positioning.clone() {
+            if self.hit(world).as_deref() == Some(positioning.as_str()) {
+                self.begin_mesh_orbit(&positioning, event.position, event.modifiers.shift, cx);
+                return;
+            }
+            self.positioning = None;
+        }
+
         match self.hit(world) {
             Some(pressed) => {
                 // What the press means, before what it does with it: a card
@@ -6250,6 +7519,15 @@ impl BoardView {
                 // order rather than selection order, which nothing reads —
                 // the delta is the same for all of them, and copies appended
                 // in item order keep their stacking.
+                // Nothing in hand that may move — everything pressed is
+                // locked. The press still selects, because unlocking is a
+                // thing you do to a locked card, but no gesture begins and no
+                // step is opened on the ledger: a drag that moves nothing must
+                // not be an undo somebody has to press twice to get past.
+                if ids.is_empty() {
+                    cx.notify();
+                    return;
+                }
                 let open = self.doc.board.start();
                 let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
                 let start = self
@@ -6316,14 +7594,24 @@ impl BoardView {
         cx.notify();
     }
 
-    fn on_mouse_move(
+    pub(crate) fn on_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let world = self.world_at(event.position);
         self.pointer = event.position;
+
+        // Dragging out a text selection. First, because it is the one gesture
+        // that is not about the board at all: the pointer may leave the card
+        // and even leave every card, and the selection should follow it to the
+        // end of the text rather than turn into a marquee half way.
+        if matches!(self.gesture, Gesture::SelectingText) {
+            self.place_caret(event.position, true, window);
+            cx.notify();
+            return;
+        }
 
         if matches!(self.gesture, Gesture::None) {
             // Which card is offering anchors. Only a change is notified, or
@@ -6444,6 +7732,41 @@ impl BoardView {
                 cx.notify();
                 return;
             }
+            Gesture::Orbiting { id, from, start, panning, open, .. } => {
+                let (id, from, start, panning, open) =
+                    (id.clone(), *from, *start, *panning, open.clone());
+                // Screen pixels since the press, not since the last frame —
+                // the same reason `Sizing` measures from its own `start`
+                // rather than accumulating a delta every frame would.
+                let dx = f(event.position.x) - f(from.x);
+                let dy = f(event.position.y) - f(from.y);
+                let next = if panning {
+                    // Fractions of the mesh's own span per pixel. Signed the
+                    // opposite way turning is: the look-at point moves
+                    // against the drag so the picture itself follows the
+                    // pointer, the same feel a pan tool anywhere else has.
+                    const PAN_UNITS_PER_PIXEL: f32 = 0.004;
+                    start.panned(-dx * PAN_UNITS_PER_PIXEL, dy * PAN_UNITS_PER_PIXEL)
+                } else {
+                    // Degrees per pixel. A drag most of the way across the
+                    // window turns the mesh about half way round, which reads
+                    // as direct without being able to spin past the angle you
+                    // meant.
+                    const DEGREES_PER_PIXEL: f32 = 0.35;
+                    start.turned(dx * DEGREES_PER_PIXEL, -dy * DEGREES_PER_PIXEL)
+                };
+                self.doc.board.during(&open, |board| {
+                    if let Some(item) = board.item_mut(&id) {
+                        mbrd_core::media::set_orbit(item, next);
+                    }
+                });
+                if let Gesture::Orbiting { moved, .. } = &mut self.gesture {
+                    *moved = true;
+                }
+                self.live_orbit_frame(&id, next, cx);
+                cx.notify();
+                return;
+            }
             _ => {}
         }
 
@@ -6478,10 +7801,12 @@ impl BoardView {
         let shift = event.modifiers.shift;
         let alt = event.modifiers.alt;
         let free = event.modifiers.secondary() || event.modifiers.control;
-        let Self { doc, gesture, viewport, pan_trail, .. } = self;
+        let Self { doc, gesture, viewport, pan_trail, measure, .. } = self;
 
         match gesture {
-            Gesture::None => {}
+            // Both dealt with before this: a text drag returns at the top of
+            // `on_mouse_move`, because it is not about the board.
+            Gesture::None | Gesture::SelectingText => {}
             Gesture::Panning { from, moved, .. } => {
                 // Move the camera so that the world point grabbed at the press
                 // stays under the pointer. Working in world units rather than
@@ -6516,7 +7841,7 @@ impl BoardView {
             // Handled after the destructuring below, where the media and the
             // board are both reachable — a scrub writes to neither of the four
             // fields borrowed here.
-            Gesture::Scrubbing { .. } | Gesture::Louder { .. } => {}
+            Gesture::Scrubbing { .. } | Gesture::Louder { .. } | Gesture::Orbiting { .. } => {}
             // Handled above, where `self` is still whole.
             Gesture::Roping { .. } => {}
             Gesture::Sizing { id, grip, start, from, hold, shape, moved, cropping, open } => {
@@ -6530,7 +7855,7 @@ impl BoardView {
                 // What the modifiers mean, and the order they are asked in.
                 // A picture keeps its shape unless somebody says otherwise;
                 // anything else is free unless `Shift` says otherwise. Two
-                // defaults, because a photograph and a sticky note want
+                // defaults, because a photograph and a note want
                 // opposite things and only one of them is ever stretched on
                 // purpose.
                 let crop = alt && shape.is_some();
@@ -6563,7 +7888,7 @@ impl BoardView {
                         // words decide the rest. Letting the handle win instead
                         // would leave a height the next keystroke overwrites,
                         // which is a control that does nothing a moment later.
-                        refit(item);
+                        refit(item, measure);
                         if crop {
                             // Cropping is a framing, and the format already has
                             // the word for it: a covered picture fills the card
@@ -6928,7 +8253,12 @@ impl BoardView {
         });
     }
 
-    fn on_mouse_up(&mut self, _event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn on_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Every gesture ends in exactly one place. A release that lands outside
         // the canvas is wired to this too, so a drag off the edge cannot leave
         // the pipeline stuck mid-gesture.
@@ -6991,6 +8321,28 @@ impl BoardView {
                     .map(|item| mbrd_core::media::playback(item).volume)
                     .unwrap_or(1.0);
                 self.say(format!("volume {}%", (level * 100.0).round() as i32));
+            }
+            cx.notify();
+            return;
+        }
+
+        if let Gesture::Orbiting { id, moved, open, .. } = ended {
+            // A press that never travelled is a click, same as `Moving`'s —
+            // and, unlike a slider, a mesh that never turned has nothing new
+            // to rasterise, so the resting picture and the live one it was
+            // already showing both still agree.
+            let changed = moved && self.doc.board.finish("Orbit", open);
+            if moved {
+                // The picture this drag was showing lived in `live`, keyed by
+                // card rather than content — see `live.rs`. What is on disk
+                // now is the released orbit, and `resting` has to catch up to
+                // it the same way any other decode catches up to a changed
+                // asset.
+                self.meshes.forget(&id);
+                self.begin_mesh_decode(&id, cx);
+            }
+            if changed {
+                self.say("orbited".into());
             }
             cx.notify();
             return;
@@ -7118,6 +8470,17 @@ impl BoardView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Position mode claims the wheel too, but only over the one card it
+        // names — everywhere else on the board still zooms the camera.
+        if let Some(id) = self.positioning.clone() {
+            let world = self.world_at(event.position);
+            if self.hit(world).as_deref() == Some(id.as_str()) {
+                self.dolly_mesh(&id, event, cx);
+                cx.notify();
+                return;
+            }
+        }
+
         let (dx, dy) = match event.delta {
             // A trackpad reports exact pixels; a wheel reports lines. Scaling
             // them the same way is what makes one notch and one flick feel
@@ -7234,15 +8597,86 @@ impl BoardView {
             return;
         }
 
-        // The settings page. It takes every press too, though for a
-        // different reason than the two text fields above: the board behind
-        // it is behind a scrim, and a shortcut that edited what nobody can
-        // properly see would be an edit nobody watched happen. Escape is the
-        // one key it answers. Same input-dead exception while leaving.
+        // The settings page. It takes every press too, and it used to answer
+        // exactly one of them: the board behind it is not on screen, and a
+        // shortcut that edited what nobody can see would be an edit nobody
+        // watched happen. It answers rather more now, because the page has a
+        // search field over its sidebar and, sometimes, a theme picker over
+        // the whole of it — both of which are text fields, and a text field
+        // whose letters were shortcuts would be one you cannot type in.
+        //
+        // Same input-dead exception while leaving as the two above.
         if matches!(self.overlay, Overlay::Settings(_)) && !self.overlay_leaving {
+            // The candidate list the picker is choosing from, worked out
+            // before the page is borrowed: it comes off the registry, which
+            // lives on `self`, and the page's `key` needs it as an argument
+            // precisely so that a plain struct does not have to reach for a
+            // view. Empty except while a picker is open.
+            let names: Vec<String> = match &self.overlay {
+                Overlay::Settings(page) => page
+                    .picking
+                    .as_ref()
+                    .map(|picker| {
+                        self.themes.of(picker.appearance).iter().map(|t| t.name.clone()).collect()
+                    })
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            let Overlay::Settings(page) = &mut self.overlay else { unreachable!() };
+            let reply = page.key(key, mods, event.keystroke.key_char.as_deref(), &names);
+            match reply {
+                crate::settings::Reply::Held => {}
+                crate::settings::Reply::Close => self.close_settings(),
+                // The clipboard is the view's, not the page's — the same
+                // division the palette and the switcher draw.
+                crate::settings::Reply::Paste => {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        if let Overlay::Settings(page) = &mut self.overlay {
+                            page.insert(&text);
+                        }
+                    }
+                }
+                // A name, not a palette: the page never holds colours, so a
+                // theme file reloaded underneath it cannot leave a stale one
+                // sitting in an overlay.
+                crate::settings::Reply::Preview(appearance, name) => {
+                    let theme = self.themes.resolve(&name, appearance);
+                    self.preview_theme(theme, cx);
+                }
+                // Ends the preview as a side effect, which is right: a choice
+                // is the answer to what a preview was asking.
+                crate::settings::Reply::Choose(appearance, name) => {
+                    self.set_theme(appearance, name, cx);
+                }
+                crate::settings::Reply::Cancel(appearance, was) => {
+                    // The choice goes back through the prefs and the palette
+                    // through `cancel_preview`, in that order and for the
+                    // reason `cancel_theme_pick` gives: one of them is what
+                    // `retheme` will agree with, the other is what is
+                    // actually being looked at.
+                    self.prefs.set_theme(appearance, was);
+                    self.cancel_preview(cx);
+                    self.retheme(cx);
+                }
+            }
+            cx.notify();
+            return;
+        }
+
+        // A card opened onto the whole window. While it is only being *read*
+        // it takes every press for the same reason the settings page does —
+        // the board is not on screen, and a shortcut that edited it would be
+        // an edit nobody watched happen. Escape is the one key it answers.
+        //
+        // While it is being typed into it deliberately does not return, and
+        // falls through to the editor below: the window is a text field then,
+        // and Escape means put the words back rather than close the page.
+        if matches!(self.overlay, Overlay::Opened(_))
+            && !self.overlay_leaving
+            && self.editing.is_none()
+        {
             if key == "escape" {
-                self.close_settings();
-                cx.notify();
+                self.close_opened(cx);
             }
             return;
         }
@@ -7257,17 +8691,26 @@ impl BoardView {
             let reply =
                 self.editing.as_mut().map(|open| open.editor.key(key, mods, typed.as_deref()));
             match reply {
+                // Every one of these stops the press here. That is not
+                // tidiness: while a note is being typed into there is an input
+                // handler installed, and gpui hands a press to it *only if the
+                // app let it propagate* — so a key this editor has already
+                // typed and then propagated would be typed a second time by
+                // the platform. See the `EntityInputHandler` impl.
                 Some(editor::Reply::Held) => {
                     self.show_edit();
+                    cx.stop_propagation();
                     cx.notify();
                     return;
                 }
                 Some(editor::Reply::Commit) => {
                     self.stop_editing(true, cx);
+                    cx.stop_propagation();
                     return;
                 }
                 Some(editor::Reply::Revert) => {
                     self.stop_editing(false, cx);
+                    cx.stop_propagation();
                     return;
                 }
                 // Copy, cut and paste inside text are the clipboard's, not the
@@ -7276,10 +8719,12 @@ impl BoardView {
                 Some(editor::Reply::Ignored) if mods.secondary => match key {
                     "c" | "x" => {
                         self.copy_text(key == "x", cx);
+                        cx.stop_propagation();
                         return;
                     }
                     "v" => {
                         self.paste_text(cx);
+                        cx.stop_propagation();
                         return;
                     }
                     _ => {}
@@ -7320,6 +8765,15 @@ impl BoardView {
             return;
         }
 
+        // Escape leaves Position mode before it touches the selection — the
+        // same "leave the mode nearest to what was just pressed" rule the
+        // tool check just above follows.
+        if key == "escape" && self.positioning.is_some() {
+            self.positioning = None;
+            cx.notify();
+            return;
+        }
+
         // The menu takes the arrows, Enter and Escape before anything else
         // gets them — the same "text field" shape the switcher and the
         // palette take above, and for the same reason: without this, Down
@@ -7351,8 +8805,9 @@ impl BoardView {
                 // one — a menu's version of the palette's Enter.
                 "right" => {
                     let room = self.canvas_bounds.size;
+                    let sub = self.submenu_under_cursor();
                     if let Overlay::Menu(menu) = &mut self.overlay {
-                        menu.open_under_cursor(room);
+                        menu.open_under_cursor(room, sub);
                     }
                     cx.notify();
                     return;
@@ -7374,8 +8829,9 @@ impl BoardView {
                     match chosen {
                         Some(Entry::More(..)) => {
                             let room = self.canvas_bounds.size;
+                            let sub = self.submenu_under_cursor();
                             if let Overlay::Menu(menu) = &mut self.overlay {
-                                menu.open_under_cursor(room);
+                                menu.open_under_cursor(room, sub);
                             }
                             cx.notify();
                         }
@@ -7486,7 +8942,14 @@ impl BoardView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let text_field_open = matches!(self.overlay, Overlay::Palette(_) | Overlay::Switcher(_));
+        // The settings page joined this list when it grew a search field over
+        // its sidebar. A double-tapped Shift is how the palette opens, and a
+        // page you are typing into must not open one on the second capital
+        // letter of a word.
+        let text_field_open = matches!(
+            self.overlay,
+            Overlay::Palette(_) | Overlay::Switcher(_) | Overlay::Settings(_)
+        );
         if self.editing.is_some() || text_field_open {
             self.taps.forget();
             return;
@@ -7867,6 +9330,10 @@ impl BoardView {
     /// first and only what survived it is copied, which bounds the copying by
     /// the size of the window rather than the size of the board.
     fn draw_list(&mut self, scale: f32, cx: &mut Context<Self>) -> Vec<Draw> {
+        // Cloned once for the frame rather than borrowed: the loop below takes
+        // `&mut self` for the image and sound caches, and an `Rc` bump is what
+        // a wrap costs to be measured against the same face the painter uses.
+        let measure = self.measure.clone();
         let vp = self.viewport;
         let theme = self.theme;
         let board_fit = self.doc.board.media_fit.clone();
@@ -7886,31 +9353,6 @@ impl BoardView {
         let hover_control =
             matches!(self.gesture, Gesture::None).then(|| self.controls_at(self.pointer)).flatten();
         let press_control = self.pressed_control.clone();
-
-        // The prospective host for a single sticky note being dragged on its
-        // own — the measurement the release will make, taken here every frame
-        // instead so the drop is not a decision made blind. Sticking changes
-        // ownership permanently, and the one gesture that does it should warn
-        // before the hand lets go. A plain note gets no preview because its
-        // drop changes nothing: pinning is asked for, not measured on.
-        //
-        // Only for one note: dragging a card together with a group, or with
-        // whatever is already stuck to it, is not a question of whether it
-        // would in turn stick to something else, and measuring against the
-        // whole moving set would answer a question nobody asked.
-        let restick_preview: Option<String> = match &self.gesture {
-            Gesture::Moving { start, .. } if start.len() == 1 => {
-                let held = &start[0];
-                self.doc
-                    .board
-                    .item(&held.id)
-                    .filter(|item| item.kind == ItemType::Note && stick::is_sticky(item))
-                    .and_then(|_| {
-                        Pins::measure(&self.doc.board.items).host_of(&held.id).map(str::to_string)
-                    })
-            }
-            _ => None,
-        };
 
         // The selection as a set, once, rather than a walk of it per card.
         //
@@ -7934,6 +9376,11 @@ impl BoardView {
         };
 
         let mut wanted: Vec<String> = Vec::new();
+        // Item ids, not hashes — unlike `wanted`, a mesh's picture depends on
+        // its orbit as well as its bytes, so this is keyed the way
+        // `mesh_cache::Meshes::resting` is. See `picture_hash`'s own doc for
+        // why `ItemType::Model` never appears there.
+        let mut mesh_wanted: Vec<String> = Vec::new();
         let mut out = Vec::with_capacity(visible.len());
         // Rebuilt from nothing every frame, like `out` itself: a control on a
         // card that has been deleted, moved off screen or shrunk past the
@@ -7987,11 +9434,16 @@ impl BoardView {
                     text: theme.text,
                     caret: None,
                     highlight: Vec::new(),
+                    marked: Vec::new(),
                     dust: true,
                     grips: false,
                     frame: false,
                     entered: false,
                     broken: false,
+                    // No padlock at this size. A card below `LOD_DUST` is a
+                    // few pixels across, and a mark on it would be the whole
+                    // card — see the note above on what dust is worth.
+                    lock: None,
                 });
                 continue;
             }
@@ -8010,7 +9462,44 @@ impl BoardView {
             // sets `broken` — a decode still in flight is not an answer yet
             // and must not flash a warning on every card while it works.
             let mut broken = false;
-            let found = if smallest >= LOD_PICTURE {
+            let found = if smallest < LOD_PICTURE {
+                None
+            } else if item.kind == ItemType::Model {
+                // Sharp past the same threshold a photograph switches tiers
+                // at — see `images::Images::look` — so a mesh card zoomed
+                // in or dragged large does not stay pinned to a 256px thumb.
+                let wanted = w.max(h) * scale;
+                match self.live.get(item.id.as_str()).cloned().or_else(|| {
+                    self.meshes.resting(item.id.as_str()).map(|d| {
+                        if wanted > THUMB_SIDE as f32 {
+                            d.sharp.clone().unwrap_or_else(|| d.thumb.clone())
+                        } else {
+                            d.thumb.clone()
+                        }
+                    })
+                }) {
+                    Some(image) => {
+                        let fit = item
+                            .meta
+                            .get("fit")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(&board_fit);
+                        let size = image.size(0);
+                        let aspect = size.width.0.max(1) as f32 / size.height.0.max(1) as f32;
+                        // A mesh's own decode is never `Failed` the way a
+                        // picture's can be — nothing here would draw at all
+                        // if the bytes could not be parsed as one of the
+                        // formats `import.rs` already accepted — and it never
+                        // fades in, since there is no thumb-then-sharp arrival
+                        // to animate.
+                        Some((image, fit_into(body, aspect, fit == "cover"), 1.0))
+                    }
+                    None => {
+                        mesh_wanted.push(item.id.clone());
+                        None
+                    }
+                }
+            } else {
                 match picture_hash(item) {
                     Some(hash) => match self.images.look(hash, w.max(h) * scale) {
                         Load::Ready(image, arrived) => {
@@ -8035,8 +9524,6 @@ impl BoardView {
                     },
                     None => None,
                 }
-            } else {
-                None
             };
 
             // What this card plays, if anything, and where its playhead is.
@@ -8100,7 +9587,7 @@ impl BoardView {
             // renaming a photograph is a thing you have to be able to see.
             let being_edited =
                 editing.as_ref().filter(|open| open.on.card().is_some_and(|(id, _)| id == item.id));
-            let (lines, caret, highlight) = match being_edited {
+            let (lines, caret, highlight, marked) = match being_edited {
                 Some(open) => {
                     // Raw, and unstyled. What is being typed is the text
                     // itself, marks and all: a note *is* Markdown, so writing
@@ -8114,13 +9601,14 @@ impl BoardView {
                     // line being typed blind. The rows are byte spans, so the
                     // caret and the wash keep their arithmetic — and a click
                     // is measured against the same rows in `place_caret`.
-                    let rows = open.editor.wrapped(columns_for(w, pad, font_size));
+                    let rows = open.editor.wrapped(text_room(w, pad), font_size, &measure);
                     (
                         rows.iter()
                             .map(|&(from, to)| markdown::Line::plain(&open.editor.text()[from..to]))
                             .collect(),
                         Some(open.editor.caret_in(&rows)),
                         open.editor.highlight_in(&rows),
+                        open.editor.marked_in(&rows),
                     )
                 }
                 // The label. Skipped where the card is too small to read, and
@@ -8136,7 +9624,7 @@ impl BoardView {
                     && font_size >= LOD_TEXT =>
                 {
                     let inner_h = (h - pad * 2.0).max(1.0);
-                    let columns = columns_for(w, pad, font_size);
+                    let room = text_room(w, pad);
                     // A budget in units of the *body* row, same as the height
                     // check above: `markdown::lay_out` charges a heading a
                     // multiple of one of these rather than its own precise
@@ -8152,44 +9640,41 @@ impl BoardView {
                         // A note is Markdown, and a card is where it is read.
                         // Everything else is a label — a filename with an
                         // underscore in it is a filename, not an italic.
-                        ItemType::Note | ItemType::Text => markdown::lay_out(&words, columns, rows),
-                        _ => wrap(&words, columns, rows)
+                        ItemType::Note | ItemType::Text => {
+                            markdown::lay_out(&words, room, font_size, rows, &measure)
+                        }
+                        _ => wrap(&words, room, font_size, rows, &measure)
                             .into_iter()
                             .map(markdown::Line::plain)
                             .collect(),
                     };
-                    (lines, None, Vec::new())
+                    (lines, None, Vec::new(), Vec::new())
                 }
-                None => (Vec::new(), None, Vec::new()),
+                None => (Vec::new(), None, Vec::new(), Vec::new()),
             };
 
             // Handles, on what is selected and big enough to put them on. Not
             // on a turned card: nothing draws rotation yet, so a handle would
             // be somewhere the card visibly is not.
+            let locked = item.locked();
             let grips = selected
+                && !locked
                 && item.rot == 0.0
                 && w >= crate::grips::TOO_SMALL
                 && h >= crate::grips::TOO_SMALL;
+            // A fence is a wash rather than a block, so the grid and anything
+            // behind it still read through.
+            let fill = if item.kind == ItemType::Fence {
+                theme.colour_of(item).opacity(0.22)
+            } else {
+                theme.colour_of(item)
+            };
 
             out.push(Draw {
                 body,
                 radius,
-                // A fence is a wash rather than a block, so the grid and
-                // anything behind it still read through.
-                fill: if item.kind == ItemType::Fence {
-                    theme.colour_of(item).opacity(0.22)
-                } else {
-                    theme.colour_of(item)
-                },
-                edge: if restick_preview.as_deref() == Some(item.id.as_str()) {
-                    // This is the card the loose note under the pointer would
-                    // take, if the hand let go right now. Sticking changes
-                    // ownership permanently, so it is the one drop on the
-                    // board that gets a warning rather than a surprise — the
-                    // same reasoning `Gesture::Roping` already previews its
-                    // landing face for.
-                    theme.accent
-                } else if selected {
+                fill,
+                edge: if selected {
                     theme.selected_edge
                 } else if previewed {
                     // "Will be caught" reads differently from "is selected"
@@ -8216,11 +9701,23 @@ impl BoardView {
                 text: theme.text,
                 caret,
                 highlight,
+                marked,
                 dust: false,
                 grips,
                 frame: item.kind == ItemType::Fence,
                 entered,
                 broken,
+                // Black or white rather than the theme's ink, because this
+                // one sits *on* the card — see `Theme::ink_on`. A fence is
+                // the exception: its fill is a wash the board shows through,
+                // so what the mark is really over is the ground.
+                lock: locked.then(|| {
+                    if item.kind == ItemType::Fence {
+                        theme.text
+                    } else {
+                        theme.ink_on(fill)
+                    }
+                }),
             });
         }
 
@@ -8245,6 +9742,14 @@ impl BoardView {
                 break;
             }
             self.begin_decode(&hash, cx);
+        }
+        // Not throttled the way the loop above is: a board with thousands of
+        // undecoded photographs is ordinary, and one with anywhere near that
+        // many meshes is not the case `mesh_cache` was written for — see its
+        // own module doc. `Meshes::begin`'s claim still keeps a card already
+        // in flight from being asked for twice.
+        for id in mesh_wanted {
+            self.begin_mesh_decode(&id, cx);
         }
         out
     }
@@ -8285,6 +9790,98 @@ impl BoardView {
         .detach();
     }
 
+    /// Start rasterising a mesh at its current orbit, off the thread that
+    /// draws — `begin_decode`'s shape, but through `mesh_cache` rather than
+    /// `images`, since a mesh's picture depends on more than its bytes.
+    ///
+    /// Parses once per content hash (`self.meshes.parsed`) and reuses that
+    /// parse for every orbit any card sharing the bytes is ever turned to —
+    /// see `mesh_cache`'s own module doc for why a mesh cannot share
+    /// `images.rs`'s cache outright.
+    fn begin_mesh_decode(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.meshes.begin(id) {
+            return;
+        }
+        let Some(item) = self.doc.board.item(id) else {
+            self.meshes.settle(id);
+            return;
+        };
+        let orbit = mbrd_core::media::orbit(item);
+        let Some(hash) = item.asset.as_ref().and_then(ItemAsset::hash).map(str::to_string) else {
+            self.meshes.settle(id);
+            return;
+        };
+        let parsed = self.meshes.parsed(&hash);
+        let bytes = match &parsed {
+            Some(_) => None,
+            None => match self.doc.assets.get(&hash) {
+                Some(asset) => Some(asset.bytes.clone()),
+                None => {
+                    // Named by a card but not in the archive — a broken file
+                    // rather than a broken picture, same as `begin_decode`.
+                    self.meshes.settle(id);
+                    return;
+                }
+            },
+        };
+        let id = id.to_string();
+        let task = cx.background_executor().spawn(async move {
+            let mesh = parsed.or_else(|| bytes.as_deref().and_then(crate::mesh_cache::parse));
+            let decoded =
+                mesh.as_ref().and_then(|mesh| crate::mesh_cache::rasterize_tiers(mesh, orbit));
+            (mesh, decoded)
+        });
+        cx.spawn(async move |view, cx| {
+            let (mesh, decoded) = task.await;
+            view.update(cx, |view, cx| {
+                if let Some(mesh) = mesh {
+                    view.meshes.cache_parsed(&hash, mesh);
+                }
+                if let Some(decoded) = decoded {
+                    view.meshes.set_resting(&id, decoded);
+                    // Left alone for a card being dragged right now — that
+                    // frame is `live`'s and newer than what this decode
+                    // started from, and clearing it here would flash the
+                    // picture back to whatever `resting` just became.
+                    let dragging =
+                        matches!(&view.gesture, Gesture::Orbiting { id: gid, .. } if gid == &id);
+                    if !dragging {
+                        view.live.clear(&id);
+                    }
+                }
+                view.meshes.settle(&id);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// A mesh's current picture for the open page — live if it is being
+    /// turned, otherwise its last-rasterised resting frame — kicking a
+    /// background decode where neither has one yet.
+    fn mesh_picture(
+        &mut self,
+        id: &str,
+        sharp: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<RenderImage>> {
+        if let Some(frame) = self.live.get(id) {
+            return Some(frame.clone());
+        }
+        match self.meshes.resting(id) {
+            Some(decoded) => Some(if sharp {
+                decoded.sharp.clone().unwrap_or_else(|| decoded.thumb.clone())
+            } else {
+                decoded.thumb.clone()
+            }),
+            None => {
+                self.begin_mesh_decode(id, cx);
+                None
+            }
+        }
+    }
+
     /// The whole board, in one painted layer.
     ///
     /// Painted rather than built from elements, and that is the difference
@@ -8316,6 +9913,9 @@ impl BoardView {
         let step = self.doc.board.settings.desktop.grid_step;
         let show_grid = self.doc.board.settings.desktop.grid;
         let show_axes = self.doc.board.settings.desktop.axes;
+        let paper_id = self.doc.board.settings.desktop.paper.clone();
+        let paper_landscape = self.doc.board.settings.desktop.paper_landscape;
+        let paper_scale = self.doc.board.settings.desktop.scale;
         let marquee = match &self.gesture {
             Gesture::Marquee { from, to, .. } => Some((*from, *to)),
             _ => None,
@@ -8332,6 +9932,9 @@ impl BoardView {
         let pointer = self.pointer;
 
         let entity = cx.entity();
+        // For the input handler, which is installed in the paint pass below
+        // and only while there is something to type into.
+        let typing = self.editing.as_ref().map(|_| (cx.entity(), self.focus_handle.clone()));
 
         canvas(
             move |bounds, window, cx| {
@@ -8369,6 +9972,16 @@ impl BoardView {
                 // already worked out which of the many things under the
                 // pointer would win.
                 window.set_cursor_style(cursor, &hitbox);
+
+                // The composing keyboard's way in — see the
+                // `EntityInputHandler` impl for the whole of what this is.
+                // Here rather than anywhere nicer because gpui takes it during
+                // paint and asserts as much, and *only while editing* because
+                // a handler standing on a board nobody is typing into would
+                // take the `key_char` of every shortcut on it.
+                if let Some((entity, focus)) = typing.clone() {
+                    window.handle_input(&focus, gpui::ElementInputHandler::new(bounds, entity), cx);
+                }
 
                 let origin = bounds.origin;
                 // The measured size, not the stale one on `vp`: on the very
@@ -8478,6 +10091,33 @@ impl BoardView {
                             theme_axis,
                         ));
                     }
+                }
+
+                // A sheet of real-world paper, outlined around the origin —
+                // "outlined" and not filled, because it is a reference mark
+                // for what will print true size, not a background the board
+                // is supposed to sit on. Same colour as the axes: both are
+                // structure the board is drawn against rather than content
+                // on it, and the eye should file them together.
+                if let Some((w, h)) =
+                    mbrd_core::paper::outline(&paper_id, paper_landscape, paper_scale)
+                {
+                    let top_left = vp.to_screen(point(-w / 2.0, -h / 2.0));
+                    let bottom_right = vp.to_screen(point(w / 2.0, h / 2.0));
+                    window.paint_quad(quad(
+                        Bounds::new(
+                            gpui::point(origin.x + px(top_left.x), origin.y + px(top_left.y)),
+                            gpui::size(
+                                px(bottom_right.x - top_left.x),
+                                px(bottom_right.y - top_left.y),
+                            ),
+                        ),
+                        px(0.0),
+                        gpui::transparent_black(),
+                        px(1.0),
+                        theme_axis,
+                        BorderStyle::Solid,
+                    ));
                 }
 
                 // The lines, under the cards. That is what makes an elbow
@@ -8624,6 +10264,37 @@ impl BoardView {
                             draw.text.opacity(0.5),
                             cx,
                         );
+                    }
+
+                    // The padlock, in the top corner of a card the author has
+                    // nailed down. Faint on purpose: it is a fact about the
+                    // card rather than a control, and a solid badge stamped
+                    // over somebody's photograph would be the app writing on
+                    // their board. The colour already answers to what it is
+                    // sitting on — see `Draw::lock`.
+                    //
+                    // Skipped on a card too small to carry it, for the reason
+                    // the transport strip is: a mark that has to shrink to fit
+                    // is a smudge, and a smudge says less than nothing.
+                    if let Some(ink) = draw.lock {
+                        let side = LOCK_MARK.min(f(body.size.width) * 0.35);
+                        if side >= LOCK_MARK * 0.6 {
+                            let pad = f(draw.radius).max(4.0);
+                            let mark = Bounds::new(
+                                gpui::point(
+                                    body.origin.x + body.size.width - px(side + pad),
+                                    body.origin.y + px(pad),
+                                ),
+                                gpui::size(px(side), px(side)),
+                            );
+                            let _ = window.paint_svg(
+                                mark,
+                                Icon::Locked.path().into(),
+                                gpui::TransformationMatrix::unit(),
+                                ink.opacity(0.45),
+                                cx,
+                            );
+                        }
                     }
 
                     if draw.selected {
@@ -8814,6 +10485,23 @@ impl BoardView {
 
                         for (row, (line, height)) in shaped.iter().enumerate() {
                             let _ = line.paint(gpui::point(left, top(row)), *height, window, cx);
+                        }
+
+                        // The composing run, underlined. Under the glyphs and
+                        // after them, because it is a mark *about* the text
+                        // rather than part of it — and because a keyboard
+                        // still working out which characters these are should
+                        // not be able to hide them.
+                        for &(row, from, to) in &draw.marked {
+                            let Some((line, height)) = shaped.get(row) else { continue };
+                            let (x0, x1) = (line.x_for_index(from), line.x_for_index(to));
+                            window.paint_quad(fill(
+                                Bounds::new(
+                                    gpui::point(left + x0, top(row) + *height - px(2.0)),
+                                    gpui::size(x1 - x0, px(1.0)),
+                                ),
+                                draw.text,
+                            ));
                         }
 
                         if let Some((row, column)) = draw.caret {
@@ -9129,7 +10817,7 @@ impl BoardView {
                         .bg(theme.chrome)
                         .border_1()
                         .border_color(theme.chrome_edge)
-                        .shadow(crate::theme::shadow_large())
+                        .shadow(theme.shadow_large())
                         .child(
                             div()
                                 .flex()
@@ -9188,6 +10876,22 @@ impl BoardView {
     fn status_bar(&self) -> impl IntoElement {
         let theme = self.theme;
         let board = &self.doc.board;
+
+        // A nice round real-world length, in pixels rather than world units —
+        // `paper::scale_bar` already checked it against the target, so this is
+        // the one multiply that turns its answer into something to draw.
+        // `Command::ToggleHud` is the only way `hud` changes, and it is off by
+        // default: the bar is drawn for someone who asked to calibrate a
+        // board, not as a fixture everyone else has to look past.
+        let settings = &board.settings.desktop;
+        let scale_seg = settings
+            .hud
+            .then(|| {
+                let zoom = self.viewport.zoom;
+                mbrd_core::paper::scale_bar(settings.scale, zoom, &settings.units, 80.0)
+                    .map(|(world, label)| (world * zoom, label))
+            })
+            .flatten();
 
         // Only what the board cannot show for itself. Everything the bar used
         // to narrate is now said by the counts beside it — see the note above
@@ -9286,6 +10990,18 @@ impl BoardView {
                         .into_any_element(),
                 }),
             )
+            .when_some(scale_seg, |el, (bar_px, label)| {
+                el.child(rule(theme)).child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .px(px(12.0))
+                        .flex_none()
+                        .child(div().w(px(bar_px.max(1.0))).h(px(1.0)).bg(theme.tertiary))
+                        .child(div().child(label)),
+                )
+            })
             .child(rule(theme))
             .child(
                 div()
@@ -9471,11 +11187,11 @@ fn dashed(points: &[gpui::Point<Pixels>], on: f32, off: f32) -> Vec<[gpui::Point
 /// One place, because the alternative is every caller knowing that a name is a
 /// field, a note's words are a `meta` key, and a rope's label is on a
 /// connection rather than on an item at all.
-fn write_to(board: &mut mbrd_core::Board, on: &Subject, text: &str) {
+fn write_to(board: &mut mbrd_core::Board, on: &Subject, text: &str, adv: &dyn Advance) {
     match on {
         Subject::Card(id, field) => {
             if let Some(item) = board.item_mut(id) {
-                write_field(item, *field, text);
+                write_field(item, *field, text, adv);
             }
         }
         Subject::Rope(a, b) => {
@@ -9511,7 +11227,21 @@ fn nearest_side(card: Rect, at: WorldPoint) -> Side {
 /// One function, because the two fields live in different places — a name is a
 /// field of the item and a note's words are a `meta` key — and the two call
 /// sites that write them would otherwise each have to know that.
-fn write_field(item: &mut Item, field: Field, text: &str) {
+/// The mode line for a typing session, by what it is typing into.
+///
+/// One function rather than a match at each door, because the *board* and the
+/// open window both start sessions and a mode line that named the wrong escape
+/// key would be worse than none — see `Tone::Mode` for why it stands until
+/// something takes it down.
+fn hint_for(field: Field) -> String {
+    match field {
+        Field::Name => "renaming — enter to keep, escape to put it back".into(),
+        Field::Note => "editing — escape to put it back, ctrl enter to keep".into(),
+        Field::Url => "addressing — enter to keep, escape to put it back".into(),
+    }
+}
+
+fn write_field(item: &mut Item, field: Field, text: &str, adv: &dyn Advance) {
     match field {
         Field::Name => {
             item.name = text.to_string();
@@ -9529,13 +11259,26 @@ fn write_field(item: &mut Item, field: Field, text: &str) {
         Field::Note => {
             item.meta.insert("text".into(), serde_json::Value::String(text.to_string()));
         }
+        Field::Url => {
+            let tidy = text.trim();
+            // Absent rather than empty, the same bargain a rope's label makes:
+            // the format writes `url` only where there is one, so clearing the
+            // address has to remove the key. A link whose address is the empty
+            // string reads, to every other reader, as a link that has one.
+            match tidy.is_empty() {
+                true => item.meta.remove("url"),
+                false => {
+                    item.meta.insert("url".into(), serde_json::Value::String(tidy.to_string()))
+                }
+            };
+        }
     }
     // A note set to fit is re-measured here rather than at the two call sites,
     // because this runs on **every keystroke** as well as on the commit — see
     // `show_edit` — and that is the whole feel of the thing: the card grows
     // under the caret as the words reach the end of a line, instead of
     // arriving at its new size once typing has stopped.
-    refit(item);
+    refit(item, adv);
 }
 
 /// How far a download has got, for a status line.
@@ -9719,6 +11462,10 @@ struct Draw {
     caret: Option<(usize, usize)>,
     /// Selected runs, as `(row, from, to)` in bytes within each line.
     highlight: Vec<(usize, usize, usize)>,
+    /// The composing run, if a keyboard is still working one out: the same
+    /// shape as `highlight`, drawn as an underline rather than a wash. See the
+    /// `EntityInputHandler` impl.
+    marked: Vec<(usize, usize, usize)>,
     /// Whether this one is below [`LOD_DUST`] — a flat quad and nothing else.
     ///
     /// Carried rather than measured again in the painter, because it is what
@@ -9748,7 +11495,23 @@ struct Draw {
     /// which is what stops a broken file from looking identical to a slow
     /// decode forever.
     broken: bool,
+    /// The colour to draw the padlock in, on a card the author has locked,
+    /// and `None` on one they have not.
+    ///
+    /// A colour rather than a `bool` because the mark has to stay legible on
+    /// a swatch of whatever hex somebody typed, and the painter has neither
+    /// the theme nor the item to work that out from — see `Theme::ink_on`,
+    /// which does, at the one place that has both.
+    lock: Option<Hsla>,
 }
+
+/// How big the padlock on a locked card is drawn, in screen pixels.
+///
+/// A fixed size rather than a fraction of the card, and the same size at every
+/// zoom, because it is a mark rather than part of the picture: a lock that grew
+/// with the card would be a lock the size of a wall on a photograph blown up,
+/// and one that shrank would vanish on the cards most likely to be locked.
+const LOCK_MARK: f32 = 14.0;
 
 /// How far past the cards it joins a guide is drawn, in screen pixels.
 ///
@@ -10305,43 +12068,50 @@ fn fit_into(card: Bounds<Pixels>, aspect: f32, cover: bool) -> Bounds<Pixels> {
 /// silently, because a card that says `photo of the...` is telling the truth
 /// about there being more and a card that says `photo of the` is not.
 ///
-/// `columns` is an estimate from the font size rather than a measurement; see
-/// [`AVERAGE_ADVANCE`]. Everything here counts `char`s rather than bytes, so a
-/// line of accented text wraps where it looks like it should.
-fn wrap(text: &str, columns: usize, rows: usize) -> Vec<SharedString> {
+/// `room` is in pixels and `adv` says how wide a character is, so this breaks
+/// where the words actually run out of card rather than where a count of
+/// characters said they would — see `metrics.rs`.
+fn wrap(text: &str, room: f32, size: f32, rows: usize, adv: &dyn Advance) -> Vec<SharedString> {
+    let space = adv.of(' ', size);
     let mut out: Vec<String> = Vec::new();
     'outer: for paragraph in text.split('\n') {
         let mut line = String::new();
+        let mut used = 0.0f32;
         for word in paragraph.split_whitespace() {
             let mut word = word;
+            let mut word_wide = adv.width(word, size);
             // A word too long for a line of its own has to be cut, or the
             // greedy loop below would never place it and would spin.
-            while word.chars().count() > columns {
+            while word_wide > room {
                 if !line.is_empty() {
                     out.push(std::mem::take(&mut line));
+                    used = 0.0;
                     if out.len() == rows {
                         break 'outer;
                     }
                 }
-                let cut = word.char_indices().nth(columns).map(|(i, _)| i).unwrap_or(word.len());
+                let cut = cut_at(word, room, size, adv);
                 out.push(word[..cut].to_string());
                 if out.len() == rows {
                     break 'outer;
                 }
                 word = &word[cut..];
+                word_wide = adv.width(word, size);
             }
-            let would_be =
-                line.chars().count() + usize::from(!line.is_empty()) + word.chars().count();
-            if !line.is_empty() && would_be > columns {
+            let would_be = if line.is_empty() { word_wide } else { used + space + word_wide };
+            if !line.is_empty() && would_be > room {
                 out.push(std::mem::take(&mut line));
+                used = 0.0;
                 if out.len() == rows {
                     break 'outer;
                 }
             }
             if !line.is_empty() {
                 line.push(' ');
+                used += space;
             }
             line.push_str(word);
+            used += word_wide;
         }
         out.push(line);
         if out.len() == rows {
@@ -10362,7 +12132,12 @@ fn wrap(text: &str, columns: usize, rows: usize) -> Vec<SharedString> {
         > out.iter().map(|l| l.split_whitespace().count()).sum::<usize>();
     if dropped {
         if let Some(last) = out.last_mut() {
-            while last.chars().count() > columns.saturating_sub(1) && !last.is_empty() {
+            // Room for the ellipsis itself, which is why this is not simply
+            // `room`: the character that says there is more has to fit on the
+            // card too, or the thing it is telling you about is the thing it
+            // pushed off the edge.
+            let allowed = (room - adv.of('\u{2026}', size)).max(0.0);
+            while adv.width(last, size) > allowed && !last.is_empty() {
                 last.pop();
             }
             last.push('\u{2026}');
@@ -10370,6 +12145,23 @@ fn wrap(text: &str, columns: usize, rows: usize) -> Vec<SharedString> {
     }
 
     out.into_iter().map(SharedString::from).collect()
+}
+
+/// The byte offset to cut `word` at so that what is left of it fits `room` —
+/// at least one character, whatever the answer, so a caller cutting a word
+/// that does not fit always makes progress.
+fn cut_at(word: &str, room: f32, size: f32, adv: &dyn Advance) -> usize {
+    let mut used = 0.0;
+    let mut cut = 0;
+    for (at, c) in word.char_indices() {
+        let next = used + adv.of(c, size);
+        if next > room && at > 0 {
+            return at;
+        }
+        used = next;
+        cut = at + c.len_utf8();
+    }
+    cut.max(1).min(word.len())
 }
 
 /// The zoom, spelled for the corner of the status bar.
@@ -10460,13 +12252,13 @@ fn fits_text(item: &Item) -> bool {
 /// [`markdown::Line::scale`], because a heading is taller than a body line
 /// and a fit that assumed a uniform grid would cut the last line off every
 /// note that starts with one.
-fn fitted_height(item: &Item) -> Option<f32> {
+fn fitted_height(item: &Item, adv: &dyn Advance) -> Option<f32> {
     if !matches!(item.kind, ItemType::Note | ItemType::Text) || !fits_text(item) {
         return None;
     }
-    let columns = columns_for(item.w, CARD_PAD, CARD_TEXT);
+    let room = text_room(item.w, CARD_PAD);
     let text = label_for(item);
-    let lines = markdown::lay_out(&text, columns, FIT_ROWS);
+    let lines = markdown::lay_out(&text, room, CARD_TEXT, FIT_ROWS, adv);
     let words: f32 = lines
         .iter()
         .map(|line| {
@@ -10489,8 +12281,8 @@ fn fitted_height(item: &Item) -> Option<f32> {
 ///
 /// A no-op on anything that is not a fitted note, so callers do not have to
 /// ask first.
-fn refit(item: &mut Item) {
-    let Some(height) = fitted_height(item) else { return };
+fn refit(item: &mut Item, adv: &dyn Advance) {
+    let Some(height) = fitted_height(item, adv) else { return };
     // `y` points up, so the top edge is the *larger* coordinate. See
     // `viewport.rs`, which is the only place that flip happens.
     let top = item.y + item.h / 2.0;
@@ -10542,16 +12334,22 @@ fn card_text(item: &Item, zoom: f32, height: f32) -> (f32, f32) {
     (font, pad.min(((height - font * leading(CARD_TEXT)) / 2.0).max(0.0)))
 }
 
-/// How many characters fit across a card `w` wide with `pad` of air each
+/// How much room the words have across a card `w` wide with `pad` of air each
 /// side — the width the label's wrap, [`markdown::lay_out`], the fit and the
 /// editor's own rows all break to.
 ///
 /// One place rather than four, and for the same reason as [`card_text`]: a
 /// click is measured back into a character against the very wrap the painter
 /// drew, and any two of these disagreeing puts the caret on the wrong row.
-fn columns_for(w: f32, pad: f32, font_size: f32) -> usize {
-    let inner = (w - pad * 2.0).max(1.0);
-    (inner / (font_size * AVERAGE_ADVANCE)).floor().max(1.0) as usize
+///
+/// Pixels, now, rather than a count of characters. This used to divide by
+/// [`crate::metrics::Estimate`] and hand back a number of columns, which is
+/// right for a
+/// fixed-width face and wrong for the one the board is actually set in — see
+/// `metrics.rs` for what that cost. The wrap does the measuring itself now,
+/// and all this has to say is how much room there is.
+fn text_room(w: f32, pad: f32) -> f32 {
+    (w - pad * 2.0).max(1.0)
 }
 
 /// What a card says on it.
@@ -10570,6 +12368,161 @@ fn label_for(item: &Item) -> String {
         ItemType::Gone => format!("{} (gone)", item.name),
         _ if item.name.is_empty() => item.kind.as_str().to_string(),
         _ => item.name.clone(),
+    }
+}
+
+/// The composing keyboard's way in.
+///
+/// A Japanese, Korean or Chinese keyboard does not hand over finished
+/// characters. It hands over a *provisional* run, revises it as more keys are
+/// pressed, and only then commits — and it expects to be told where that run
+/// is on screen so it can put its candidate window beside it. This is that
+/// protocol. The model half, including what a marked run is and how it is
+/// replaced, is in `editor.rs`; everything here is translation.
+///
+/// ## Two counting systems
+///
+/// Every offset crossing this boundary is a **UTF-16** offset, because the
+/// protocol was NSTextInputClient's before it was anybody else's. Every offset
+/// on the other side of it is a UTF-8 byte. `editor.rs` owns both conversions,
+/// for the same reason it owns every other offset.
+///
+/// ## Why this does not type everything twice
+///
+/// On X11, gpui feeds a key press to the installed input handler *only if the
+/// app let the press propagate* — see `handle_input` in its `x11/window.rs`.
+/// So [`BoardView::on_key_down`] stops propagation on every press the editor
+/// took, and the two paths never both write. A composition does not come
+/// through that door at all: it arrives on `handle_ime_preedit` and
+/// `handle_ime_commit`, which reach the handler whatever the key did.
+impl gpui::EntityInputHandler for BoardView {
+    fn text_for_range(
+        &mut self,
+        range_utf16: std::ops::Range<usize>,
+        adjusted: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let open = self.editing.as_ref()?;
+        let (text, from, to) = open.editor.text_utf16(range_utf16.start, range_utf16.end);
+        let text = text.to_string();
+        // Only when it is not what was asked for, which is what the protocol
+        // reads as "this is the range I could actually give you".
+        if from != range_utf16.start || to != range_utf16.end {
+            *adjusted = Some(from..to);
+        }
+        Some(text)
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::UTF16Selection> {
+        let open = self.editing.as_ref()?;
+        let (from, to, reversed) = open.editor.selection_utf16();
+        Some(gpui::UTF16Selection { range: from..to, reversed })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        let open = self.editing.as_ref()?;
+        open.editor.marked_utf16().map(|(from, to)| from..to)
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(open) = &mut self.editing {
+            open.editor.unmark();
+        }
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<std::ops::Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(open) = &mut self.editing else { return };
+        let range = range_utf16.map(|r| (open.editor.utf8_at(r.start), open.editor.utf8_at(r.end)));
+        open.editor.replace_text(range, text);
+        // The same errand `Reply::Held` runs on an ordinary keystroke: the
+        // card behind the caret has to show what was just typed into it.
+        self.show_edit();
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        new_selected_range_utf16: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(open) = &mut self.editing else { return };
+        let range = range_utf16.map(|r| (open.editor.utf8_at(r.start), open.editor.utf8_at(r.end)));
+        // The selection the platform asks for is relative to `new_text`, and
+        // `new_text` is not in the editor yet — so it is converted against
+        // itself rather than against the editor's own string.
+        let selected = new_selected_range_utf16.map(|r| {
+            let at = |utf16: usize| -> usize {
+                let mut counted = 0;
+                for (at, c) in new_text.char_indices() {
+                    if counted >= utf16 {
+                        return at;
+                    }
+                    counted += c.len_utf16();
+                }
+                new_text.len()
+            };
+            (at(r.start), at(r.end))
+        });
+        open.editor.replace_marked(range, new_text, selected);
+        self.show_edit();
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: std::ops::Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        // Where the candidate window goes. The caret's own row, at the card it
+        // is on — near enough, and a great deal better than the corner of the
+        // screen, which is what `None` here gets you.
+        let open = self.editing.as_ref()?;
+        let (id, _) = open.on.card()?;
+        let item = self.doc.board.item(id)?;
+        let vp = self.viewport;
+        let centre = vp.to_screen(point(item.x, item.y));
+        let (w, h) = ((item.w * vp.zoom).max(1.0), (item.h * vp.zoom).max(1.0));
+        let (font_size, pad) = card_text(item, vp.zoom, h);
+        let line_height = font_size * leading(CARD_TEXT);
+
+        let at = open.editor.utf8_at(range_utf16.start);
+        let rows = open.editor.wrapped(text_room(w, pad), font_size, &self.measure);
+        let row = rows.iter().rposition(|&(start, _)| start <= at).unwrap_or(0);
+        let left = element_bounds.origin.x + px(centre.x - w / 2.0 + pad);
+        let top = element_bounds.origin.y + px(centre.y - h / 2.0 + pad + row as f32 * line_height);
+        Some(Bounds::new(gpui::point(left, top), gpui::size(px(1.0), px(line_height))))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: gpui::Point<Pixels>,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let at = self.caret_at(point, window)?;
+        Some(self.editing.as_ref()?.editor.utf16_at(at))
     }
 }
 
@@ -10628,8 +12581,30 @@ impl Render for BoardView {
         // The modifiers as well as the position: `Alt` over a card is about to
         // duplicate rather than move, and a pointer that only said so once the
         // drag had started would be saying it a gesture too late.
-        let cursor = self.cursor_at(window.mouse_position(), window.modifiers());
+        // What the pointer would mean *on the board* — and only where the
+        // board is what the pointer is over.
+        //
+        // The canvas is one element covering the whole window and it claims a
+        // cursor through a hitbox that covers the same, so a page drawn on top
+        // of it does not take that claim away by being drawn on top: nothing
+        // on the settings page inserts a hitbox of its own, and the crosshair
+        // the Select tool asks for was leaking straight through it onto rows
+        // that are not a canvas at all. A full-page overlay is not a board you
+        // are pointing at, so while one is up the board asks for the plain
+        // arrow and whatever the page itself wants can be seen.
+        let cursor = if self.covered() {
+            gpui::CursorStyle::Arrow
+        } else {
+            self.cursor_at(window.mouse_position(), window.modifiers())
+        };
         let board = self.paint_board(draws, wires, marks, font, cursor, cx);
+
+        // What the open page needs from the window, taken before the borrow of
+        // the overlay below begins: asking the picture cache for a photograph
+        // mutates it, and measuring a character wants the text system. See
+        // `opened::Ready`.
+        let opened_ready =
+            self.opened_id().map(str::to_string).map(|id| self.ready_opened(&id, window, cx));
 
         let tools = crate::tools::render(self, cx);
         // Borrowed, not cloned. A palette over a big board holds a row —
@@ -10651,6 +12626,9 @@ impl Render for BoardView {
             Overlay::Settings(page) => {
                 Some(crate::settings::render(page, self, cx).into_any_element())
             }
+            Overlay::Opened(opened) => opened_ready
+                .as_ref()
+                .map(|ready| crate::opened::render(opened, ready, self, cx).into_any_element()),
         };
 
         let mut root = div()
@@ -10668,7 +12646,7 @@ impl Render for BoardView {
             // entirely rather than merely rendering it a little differently.
             // The names below are what a GNOME, an Adwaita or a bare Debian
             // desktop is likeliest to already have on disk, in that order.
-            .font_family(".SystemUIFont")
+            .font_family(BODY_FAMILY)
             // The default is the golden ratio, which is a pleasant number for
             // typesetting a page and not the reason this app's rows are the
             // height they are. Chrome wants to sit close to the text it
@@ -10677,13 +12655,7 @@ impl Render for BoardView {
             // number.
             .line_height(relative(1.2));
         root.text_style().get_or_insert_with(Default::default).font_fallbacks =
-            Some(FontFallbacks::from_fonts(vec![
-                "Inter".into(),
-                "Cantarell".into(),
-                "Adwaita Sans".into(),
-                "Noto Sans".into(),
-                "DejaVu Sans".into(),
-            ]));
+            body_font().fallbacks;
         root
             // Nothing where the compositor draws its own. See `titlebar.rs`.
             .child(crate::titlebar::render(self, window, cx))
@@ -10741,12 +12713,51 @@ impl Render for BoardView {
     }
 }
 
+/// What a wrap is measured against in the tests below — all six modules of
+/// them, which is why this is out here rather than in one of them.
+///
+/// [`Estimate::columns`] where the assertion is about *where the words broke*,
+/// so that "twelve" in a test means twelve characters rather than however wide
+/// twelve characters happen to be in whatever face the machine running the
+/// test has installed. [`Estimate::average`] — [`guess`] — where the assertion
+/// is about a height in pixels, because that is the same half-an-em the old
+/// `columns_for` assumed and the numbers therefore mean what they always did.
+/// See the same shim in `markdown.rs`.
+#[cfg(test)]
+fn columns() -> crate::metrics::Estimate {
+    crate::metrics::Estimate::columns()
+}
+
+#[cfg(test)]
+fn guess() -> crate::metrics::Estimate {
+    crate::metrics::Estimate::average()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn lines(text: &str, columns: usize, rows: usize) -> Vec<String> {
-        wrap(text, columns, rows).into_iter().map(|l| l.to_string()).collect()
+    fn lines(text: &str, wide: usize, rows: usize) -> Vec<String> {
+        wrap(text, wide as f32, 1.0, rows, &columns()).into_iter().map(|l| l.to_string()).collect()
+    }
+
+    #[test]
+    fn a_page_covers_the_board_before_its_contents_arrive() {
+        // The whole reason `Arrival` exists: there must be no frame in which
+        // the board and the page are both half-drawn, because that is a
+        // cross-dissolve and it reads as ghosting.
+        let half = arrival(0.5);
+        assert_eq!(half.ground, 1.0, "the board was still showing through halfway in");
+        assert!(half.content < 1.0, "the content had nothing left to do halfway in");
+
+        // And the two ends are the two ends: nothing at all, and everything
+        // where it belongs.
+        let shut = arrival(0.0);
+        assert_eq!((shut.ground, shut.content), (0.0, 0.0));
+        assert_eq!(shut.rise, PAGE_RISE, "the content started where it belongs");
+
+        let open = arrival(1.0);
+        assert_eq!((open.ground, open.content, open.rise), (1.0, 1.0, 0.0));
     }
 
     #[test]
@@ -10866,17 +12877,18 @@ mod tests {
     fn a_note_set_to_fit_is_as_tall_as_what_is_written_on_it() {
         let short = fitted("one line", 220.0);
         let long = fitted(&"word ".repeat(60), 220.0);
-        let (a, b) = (fitted_height(&short).unwrap(), fitted_height(&long).unwrap());
+        let (a, b) =
+            (fitted_height(&short, &guess()).unwrap(), fitted_height(&long, &guess()).unwrap());
         assert!(b > a, "more words is a taller note: {a} then {b}");
         // And the same words in a narrower card wrap into more lines, so the
         // fit follows the width it is given rather than only the text.
         let narrow = fitted(&"word ".repeat(60), 120.0);
-        assert!(fitted_height(&narrow).unwrap() > b);
+        assert!(fitted_height(&narrow, &guess()).unwrap() > b);
     }
 
     #[test]
     fn a_fitted_note_with_nothing_on_it_is_still_something_you_can_point_at() {
-        assert_eq!(fitted_height(&fitted("", 220.0)), Some(FIT_MIN));
+        assert_eq!(fitted_height(&fitted("", 220.0), &guess()), Some(FIT_MIN));
     }
 
     #[test]
@@ -10885,8 +12897,8 @@ mod tests {
         note.w = 220.0;
         note.h = 180.0;
         note.meta.insert("text".into(), "one line".into());
-        assert_eq!(fitted_height(&note), None);
-        refit(&mut note);
+        assert_eq!(fitted_height(&note, &guess()), None);
+        refit(&mut note, &guess());
         assert_eq!(note.h, 180.0, "the default is a card that stays where you put it");
     }
 
@@ -10899,7 +12911,7 @@ mod tests {
         let mut note = fitted(&"line\n".repeat(12), 220.0);
         note.y = 100.0;
         let top = note.y + note.h / 2.0;
-        refit(&mut note);
+        refit(&mut note, &guess());
         assert!(note.h > 180.0, "the premise: twelve lines want more than this note has");
         assert_eq!(note.y + note.h / 2.0, top, "the top edge stays put");
 
@@ -10908,7 +12920,7 @@ mod tests {
         let mut note = fitted("one line", 220.0);
         note.y = 100.0;
         let top = note.y + note.h / 2.0;
-        refit(&mut note);
+        refit(&mut note, &guess());
         assert!(note.h < 180.0, "the premise: one line wants less than this note has");
         assert_eq!(note.y + note.h / 2.0, top);
     }
@@ -10918,13 +12930,13 @@ mod tests {
         // The path that actually runs sixty times a second while somebody is
         // typing. See `show_edit`, which reaches `write_field` on every press.
         let mut note = fitted("one line", 220.0);
-        write_field(&mut note, Field::Note, &"word ".repeat(60));
+        write_field(&mut note, Field::Note, &"word ".repeat(60), &guess());
         assert!(note.h > 180.0);
 
         let mut plain = Item::new("p", ItemType::Note);
         plain.w = 220.0;
         plain.h = 180.0;
-        write_field(&mut plain, Field::Note, &"word ".repeat(60));
+        write_field(&mut plain, Field::Note, &"word ".repeat(60), &guess());
         assert_eq!(plain.h, 180.0);
     }
 
@@ -11100,13 +13112,13 @@ mod rope_tests {
         });
         let on = Subject::Rope("a".into(), "b".into());
 
-        write_to(&mut board, &on, "  same    shelf \n ");
+        write_to(&mut board, &on, "  same    shelf \n ", &guess());
         assert_eq!(board.connections[0].meta.label.as_deref(), Some("same shelf"));
 
         // Cleared to absent rather than to an empty string: the format writes
         // the key only when there is one, so an emptied label has to take the
         // connection back to being a bare pair.
-        write_to(&mut board, &on, "   ");
+        write_to(&mut board, &on, "   ", &guess());
         assert_eq!(board.connections[0].meta.label, None);
         assert!(board.connections[0].meta.is_default());
     }
@@ -11406,7 +13418,7 @@ mod hex_tests {
     #[test]
     fn a_colour_typed_into_a_swatch_becomes_its_colour() {
         let mut swatch = Item::new("s", ItemType::Swatch);
-        write_field(&mut swatch, Field::Name, "#3A5F2C");
+        write_field(&mut swatch, Field::Name, "#3A5F2C", &guess());
         assert_eq!(swatch.meta.get("hex").and_then(|v| v.as_str()), Some("#3a5f2c"));
         assert_eq!(swatch.name, "#3A5F2C", "the name carries the same value, uppercased");
     }
@@ -11414,7 +13426,7 @@ mod hex_tests {
     #[test]
     fn the_short_spelling_is_stored_the_long_way() {
         let mut swatch = Item::new("s", ItemType::Swatch);
-        write_field(&mut swatch, Field::Name, "#fa0");
+        write_field(&mut swatch, Field::Name, "#fa0", &guess());
         assert_eq!(swatch.meta.get("hex").and_then(|v| v.as_str()), Some("#ffaa00"));
     }
 
@@ -11422,7 +13434,7 @@ mod hex_tests {
     fn something_that_is_not_a_colour_is_just_a_name() {
         let mut swatch = Item::new("s", ItemType::Swatch);
         swatch.meta.insert("hex".into(), serde_json::json!("#123456"));
-        write_field(&mut swatch, Field::Name, "warm grey");
+        write_field(&mut swatch, Field::Name, "warm grey", &guess());
         assert_eq!(swatch.name, "warm grey");
         assert_eq!(
             swatch.meta.get("hex").and_then(|v| v.as_str()),
@@ -11435,7 +13447,7 @@ mod hex_tests {
     fn only_a_swatch_gets_this_treatment() {
         // A photograph called `#ff0000.png` is a photograph.
         let mut photo = Item::new("p", ItemType::Image);
-        write_field(&mut photo, Field::Name, "#ff0000");
+        write_field(&mut photo, Field::Name, "#ff0000", &guess());
         assert_eq!(photo.name, "#ff0000");
         assert!(photo.meta.get("hex").is_none());
     }
@@ -11443,7 +13455,7 @@ mod hex_tests {
     #[test]
     fn a_notes_words_go_where_the_format_keeps_them() {
         let mut note = Item::new("n", ItemType::Note);
-        write_field(&mut note, Field::Note, "some words");
+        write_field(&mut note, Field::Note, "some words", &guess());
         assert_eq!(note.note_text(), Some("some words"));
         assert_eq!(note.name, "", "the name is not the words");
     }
@@ -11500,23 +13512,60 @@ mod zoom_tests {
     }
 
     #[test]
+    fn a_label_wraps_where_the_words_run_out_of_card_not_where_a_count_does() {
+        // The same claim as `editor.rs`'s own version of this test, on the
+        // label path: two labels of ten characters each, one of them twice as
+        // wide as the other, must not break in the same place.
+        use crate::metrics::Ragged;
+        let wide = wrap("WWWWW WWWWW", 6.0, 1.0, 9, &Ragged);
+        let narrow = wrap("iiiii iiiii", 6.0, 1.0, 9, &Ragged);
+        assert_eq!(wide.len(), 2, "ten ems of W do not fit in six");
+        assert_eq!(narrow.len(), 1, "two and a bit ems of i do");
+    }
+
+    #[test]
+    fn a_fitted_note_of_wide_words_is_taller_than_one_of_narrow_words() {
+        // And the same thing again where it is most visible: the height a note
+        // gives itself. Under a count of characters these two were the same
+        // note and got the same height, so one of them was cut off.
+        use crate::metrics::Ragged;
+        let note = |text: &str| {
+            let mut item = Item::new("n", ItemType::Note);
+            item.kind = ItemType::Note;
+            item.w = 60.0;
+            item.meta.insert(FIT_TEXT.into(), serde_json::Value::Bool(true));
+            item.meta.insert("text".into(), serde_json::Value::String(text.into()));
+            item
+        };
+        let wide = fitted_height(&note("WWWW WWWW WWWW WWWW"), &Ragged).unwrap();
+        let narrow = fitted_height(&note("iiii iiii iiii iiii"), &Ragged).unwrap();
+        assert!(wide > narrow, "wide {wide} should need more rows than narrow {narrow}");
+    }
+
+    #[test]
     fn scaled_text_wraps_to_the_same_line_at_every_zoom() {
-        // The re-flow this setting exists to stop. Columns come from the card
-        // measured in screen pixels over the font measured in screen pixels,
-        // so if the two scale together the answer cannot depend on the zoom —
-        // and the padding clamp is linear in the zoom too, so it does not
-        // reintroduce the dependence it looks like it might.
+        // The re-flow this setting exists to stop. The room comes from the
+        // card measured in screen pixels and a character from the font
+        // measured in screen pixels, so if the two scale together the answer
+        // cannot depend on the zoom — and the padding clamp is linear in the
+        // zoom too, so it does not reintroduce the dependence it looks like it
+        // might.
+        //
+        // Asserted as the *wrap itself* rather than as a column count, now
+        // that the wrap is a measurement: what has to hold is that the words
+        // break in the same places, whatever the words are.
         let mut note = Item::new("n", ItemType::Note);
         note.w = 300.0;
         note.h = 30.0;
-        let columns = |zoom: f32| {
+        let words = "the quick brown fox jumps over the lazy dog and keeps going";
+        let broke = |zoom: f32| {
             let (font, pad) = card_text(&note, zoom, note.h * zoom);
-            let inner = (note.w * zoom - pad * 2.0).max(1.0);
-            (inner / (font * AVERAGE_ADVANCE)).floor().max(1.0) as usize
+            wrap(words, text_room(note.w * zoom, pad), font, 99, &guess())
         };
-        let at_one = columns(1.0);
+        let at_one = broke(1.0);
+        assert!(at_one.len() > 1, "the fixture has to actually wrap for this to say anything");
         for zoom in [0.3, 0.5, 2.0, 7.5, 40.0] {
-            assert_eq!(columns(zoom), at_one, "the line re-broke at {zoom}x");
+            assert_eq!(broke(zoom), at_one, "the line re-broke at {zoom}x");
         }
     }
 
