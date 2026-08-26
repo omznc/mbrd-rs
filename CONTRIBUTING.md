@@ -63,7 +63,6 @@ geometry, history <- model <- {schema, index, viewport, naming} <- state <- mbrd
 | `core/index.rs` | the spatial index: which cards are near a place |
 | `core/naming.rs` | a title to a filename, a clock to a timestamp |
 | `core/fence.rs` | which fence a card is in — **measured**, never stored |
-| `core/stick.rs` | which card a note is pinned to, and what `loose` means |
 | `core/rope.rs` | the curve a connection draws when nothing is in the way |
 | `core/route.rs` | the orthogonal router, for when something is |
 | `core/align.rs` | align, distribute, and pushing overlaps apart |
@@ -126,14 +125,20 @@ drawn from one counter for the whole process, so "the same number" means "the
 same board, unchanged" rather than merely "some board, unchanged".
 
 **Membership is measured, and `meta` only records it.** A card is in a fence
-when its centre is inside the fence; a note is stuck to a card when enough of it
-lies over one. `meta.fence` and `meta.stuckTo` are written on the way out as a
-record of that measurement and are never read as the authority for it, which is
+when its centre is inside the fence. `meta.fence` is written on the way out as a
+record of that measurement and is never read as the authority for it, which is
 what stops a board from arriving with a card that claims to be in a fence it is
-nowhere near. The one exception is deliberate: `meta.loose` is a *decision*
-rather than a measurement, because a note you have just unstuck is normally
-still lying on the card you unstuck it from, and without the flag it would pin
-itself straight back.
+nowhere near.
+
+**A decision is stored, and nothing may infer it.** The other half of the same
+rule, and the reason the two are written down together: `meta.locked` says an
+author nailed a card down, and nothing about where the card sits or what it lies
+on may set it or clear it. Notes used to have a second one — `meta.sticky`, which
+pinned a note to the card under it — and it is gone: what it bought was a note
+that travelled with a photograph, and what it cost was a drag that took hold of
+more than what was pressed, for a reason nothing on screen could explain. A
+board that still carries `sticky`, `stuckTo` or the older `loose` keeps them,
+untouched and unread, the way `meta` keeps every key it does not know.
 
 **An unknown item `type` and an unknown `meta` key must round-trip untouched.**
 That is the format's extension point — it is what let `swatch` and then

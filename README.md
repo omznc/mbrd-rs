@@ -21,6 +21,13 @@ cargo run -p mbrd -- some-board.mbrd    # a real one
 Building from source on Linux needs one extra package — see
 [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
+## Themes
+
+*Settings → Application → Appearance* — a light theme and a dark one, and
+whether to follow your desktop or pin one. Drop a `.json` in your themes
+folder for your own; [`THEMES.md`](THEMES.md) is every colour there is and
+what it draws.
+
 ## Controls
 
 | | |
@@ -39,16 +46,18 @@ Building from source on Linux needs one extra package — see
 | arrows | nudge; `Shift` moves a whole grid step |
 | `0` / `F` | recenter / fit everything on screen |
 | `Ctrl`+`A` / `Esc` / `Del` | select all / clear / delete — `Ctrl`+`Z` is the way back |
-| right-click | everything else, next to what it acts on |
-| double-click a card, or `F2` | type into it |
-| `N` / `K` / `E` | new sticky note / new color / new fence |
+| right-click | everything else, next to what it acts on — the list shows what applies to whatever you pressed and leaves out what does not |
+| double-click a card, or `O` | open it on the whole window — a document gets set as a page, a file gets its source, a picture gets contained, and everything gets an Edit button and an info rail |
+| `F2` or `Enter` | type into a card without leaving the board |
+| `N` / `K` / `E` | new note / new color / new fence |
 | `T` | next tint, on a note |
 | `Ctrl`+`G` / `Ctrl`+`Shift`+`G` | group what is selected into a fence / dissolve it |
 | double-click a card in a fence | steps inside, so presses reach what is in it; `Esc` steps back out |
 | hover a card, drag a mark | pull a rope to another card |
 | `J` | join what is selected, with the shortest set of ropes |
 | double-click a rope, or `F2` | label it; right-click it for color, arrows, style |
-| `U` / `W` | unstick a note / show or hide the ropes |
+| `L` | lock what is selected, or let it go — a locked card wears a padlock, refuses every drag and handle, and layouts go around it |
+| `W` | show or hide the ropes |
 | `1`–`4`, or `V` / `H` / `C` | select / pan / connect / note |
 | `Ctrl`+`C` / `Ctrl`+`X` / `Ctrl`+`D` | copy / cut / duplicate |
 | `[` / `]` | send to back / bring to front |
@@ -75,7 +84,7 @@ myboard.mbrd
 ├── manifest.json               what this file is
 ├── board.json                  the board itself
 ├── assets/<slug>--<hash>.<ext> embedded bytes, deduped by content hash
-├── notes/<slug>--<id>.md       one sticky note, as Markdown
+├── notes/<slug>--<id>.md       one note, as Markdown
 └── waveforms/<hash>.json       one audio file's measured readings
 ```
 

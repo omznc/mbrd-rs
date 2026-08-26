@@ -38,6 +38,7 @@ format's promise even though we do nothing with it.
 | Sound cues | An entire synthesis engine for interface feedback. |
 | Quality tiers (the three-step performance setting) | It exists because the browser could not be relied on. Native should just be fast; if it is not, that is a bug to fix rather than a setting to offer. |
 | Service worker, offline shell, QR / phone sharing, mobile web | Meaningless natively. |
+| The Mobile profile: the column packer, per-layout geometry, switching between profiles | No phone runs this build, so there is no device to switch it for. `layouts.mobile`, `settings.mobile`, `mobile_header` and `mobile_columns` still round-trip. |
 
 **Kept but late:** stickers and swatches. Decorative, but they are items a person
 places, and they cost almost nothing once note editing exists.
@@ -90,6 +91,21 @@ software rasteriser into a texture.
 
 **Recommendation: defer to last, and be willing to cut.** If it stays, do the
 parsers early (they are pure and testable) and the rendering last.
+
+**Settled, and the recommendation above is overtaken: it stays, as a software
+rasteriser.** Of the two options named, the second turns out not to be the
+consolation prize. A *still* of a mesh needs no render pass, no blade and no GPU
+— transform, cull, z-buffer, flat-shade into an `RgbaImage`, hand it over as a
+`RenderImage`. That is arithmetic against a vertex buffer, so it is
+`mbrd-core`-shaped work of exactly the kind this decision already called good,
+and it is testable by rasterising a cube and asserting pixels. `live.rs` was
+built to hold the result and names the mesh rasteriser in its own header.
+
+Two things this decision got wrong, both recorded in `VIEWING.md`: "no 3D" was
+read as "no mesh preview", and the eleven formats are not eleven readers —
+`stl`, `obj` and `glb` cover the ground, and half the others are text and have
+been opening as editable source since `preview::of` grew its bytes test. See
+`VIEWING.md`, tranche 5.
 
 ---
 
@@ -184,8 +200,12 @@ it everywhere else.
 - ~~Drag-and-drop of files and folders; paste from the clipboard.~~ A folder
   brings what is directly in it and goes no deeper: somebody who drops their
   home directory by accident should get a shrug, not a frozen window. A paste is
-  a picture, an address, or some words, in that order. **A file picker via the
-  XDG portal is still to do.**
+  a picture, an address, or some words, in that order — and an address that
+  points at a file is *followed*: a pasted MP4, GIF or `.obj` is fetched and
+  becomes that card, because a link to a video is a video somebody meant to put
+  on their board. `Ctrl Shift V` is how to say you meant the link. See
+  `fetch.rs` for the bounds on it. **A file picker via the XDG portal is still
+  to do.**
 - ~~Classify by extension and magic bytes into an `ItemType`.~~ The bytes get the
   first word — a `.jpg` that is really a PNG is common, and a pasted screenshot
   has no name at all. **The catalogue is a hand-written subset**, not the
@@ -274,13 +294,23 @@ the app's first.
   a two-bend elbow — so the worst outcome is a line that goes *behind* something
   rather than no line at all. Arrowheads, the four styles, five colours, three
   weights and labels are all in.
-- ~~Sticky notes pinned to a host~~ — `core/stick.rs`. `stuckTo` is measured the
-  way fence membership is: a note is pinned when enough of it lies over a card.
-  `loose` is the one thing about stickiness that *is* stored, because it is a
-  decision rather than a measurement — a note you have just unstuck is normally
-  still lying on the card you unstuck it from, so without the flag it would pin
-  itself straight back. Dragging a pinned note takes its host; dropping a note
-  on a card pins it.
+- ~~Sticky notes pinned to a host~~ — **removed, and not coming back.** It
+  shipped twice and was wrong both times. First as a measurement, where any note
+  lying on a card was pinned to it and `meta.loose` was the opt-out: what
+  everybody hit was two things that merely overlapped refusing to move apart,
+  for a reason nothing on screen could explain. Then as a decision, `meta.sticky`
+  off by default and set from the note's own menu, which fixed the surprise and
+  left a feature nobody reached for — a menu row, a keystroke, a drop preview,
+  a rule in every layout pass and a special case in every gesture that moves
+  something, to buy a caption that travels with a photograph. A fence already
+  does that, is visible, and is asked for the same way every other grouping is.
+  `core/stick.rs` is gone; the keys it wrote ride through `meta` untouched.
+- ~~Locking~~ — `meta.locked`, and the shape the sticky flag should have had:
+  a decision, stored, that nothing measured may set. A locked card cannot be
+  dragged, resized, nudged or binned, no layout deals it a slot — it goes in as
+  an obstacle instead, the way the title card does — and it wears a padlock in
+  its top corner so that being unable to move it is never a mystery. Still
+  selectable, because unlocking is a thing you do to it.
 - ~~z-order~~ — done in Phase 4.
 - ~~Align, distribute, and overlap separation.~~ `core/align.rs`, all measured on
   the *tilted* box so a turned card aligns by what it covers. Distribute equalises
@@ -317,20 +347,19 @@ the rope's rows tick to show the colour, style, weight and arrows it already has
 
 ---
 
-## Phase 6 — Arrangements and the second layout
+## Phase 6 — Arrangements — **done**
 
 - The seven arrangements, each a pure `(items, opts) -> Vec<Point>` in `core`.
   Spiral, grid, masonry, by type, by date, scattered, free. Whole board or just
-  the selection.
-- The Mobile profile: per-layout geometry, the column packer, 6 or 8 columns,
-  the ordering-not-shape rule for `layouts.mobile.arrangement`.
-- Switching between profiles. Which one is shown is a device preference and is
-  deliberately **not** saved.
+  the selection. (An eighth, by tag, joined them the same way — `Arrangement`
+  is a closed enum with an `ALL` menu-mapping tested against the `Layout`
+  menu's own entry count, so nothing here can drift out of sync with what the
+  engine actually offers.)
 
-**Note:** Mobile is a layout a phone would use, and there is no phone here. It
-is still worth doing — the format carries both profiles, and a desktop build
-that silently drops the Mobile layout on every save is corrupting other people's
-files.
+**Note:** the Mobile profile — the column packer, per-layout geometry, and
+switching between profiles — is out of scope; see the table above. `settings`
+and `layouts` still carry a `mobile` side so a file that has one is not
+corrupted on save, but nothing here reads it as a second layout to show.
 
 ---
 
@@ -368,10 +397,38 @@ files.
 
 ---
 
-## Phase 9 — Real-world size
+## Phase 9 — Real-world size ◐
 
 Scale calibration against a sheet of paper, the paper outlines, the scale bar,
 the HUD, metric and imperial. Small, self-contained, and pleasant.
+
+The maths and the outline are done: `mbrd_core::paper` carries a seven-sheet
+catalogue (`a3` through `tabloid`, the ids `schema::is_paper_id` already
+whitelisted), turns a sheet plus `BoardSettings::scale` into a world-space
+rectangle, and picks a scale bar's nice round length off a 1-2-5 sequence in
+either metric or imperial. `paint_board` outlines the sheet around the origin
+whenever `paper` names one, in the same stroke-only style as the axes.
+
+The bar is painted too, now that `hud` has something to mean: `ToggleHud` is a
+command exactly the way `ToggleGrid` and `ToggleWeb` are — a key-less row on
+the View menu and in the palette, since the letters worth spending are gone —
+and `status_bar` draws a segment beside the zoom reading, its own width the
+bar's length in screen pixels, whenever it is on.
+
+And now a way to set them, not through `settings.rs` but the way `Arrange`
+already answers the same question for the eight layouts: `Command::Paper`
+carries a `PaperSize` mapped over `mbrd_core::paper::PaperSize::ALL`, a
+`Paper` submenu on `View` names the sheet it is closed on, and
+`ToggleLandscape` and `ToggleUnits` sit beside it as plain switches — the
+`bool` and the two-spelling string that a submenu of one choice each would
+have been a worse way to show. All three go through `BoardView::set_paper` /
+`toggle_setting` / `toggle_units`, the same one-door `board.edit` every other
+board setting already goes through.
+
+Left, and the only piece of Phase 9 still open: the calibration gesture
+itself — draw a line against the paper, say what it measures, and `scale`
+follows. That one wants a real window to get right and is the riskiest piece
+left in the whole phase.
 
 ---
 
@@ -382,9 +439,48 @@ it, and is undoable. Depends on Phase 1 for the undo half.
 
 ---
 
-## Phase 11 — 3D
+## Phase 11 — 3D — **done**
 
-See decision 3. Parsers early if at all, rendering last.
+See decision 3, and its settlement: a software rasteriser rather than a render
+pass, which takes this out of "willing to cut" and into ordinary work. The plan
+lived in `VIEWING.md` as tranche 5 — `stl` first because it is only triangles,
+then `obj` and `glb` as two more front-ends onto the same vertex buffer, all
+three now wired into `images::decode` the same way `resvg` is for an SVG:
+
+- **`stl`** — a binary STL's facets, read straight off their fixed 50-byte
+  layout with no vertex shared between two triangles, because the format
+  shares none either.
+- **`obj`** — a face fanned from its first corner regardless of how many
+  corners it names, and a negative index counted back from whichever vertex
+  was most recently read. No `.mtl`, no texture coordinates: one file was
+  dropped, and one file is what there is, the same note the module header
+  gives for every format here.
+- **`glb`** — the `JSON` chunk's `meshes`/`primitives`/`accessors` walked by
+  hand (`serde_json::Value`, no schema crate — the whole of what is read is
+  four fields deep) to find each primitive's `POSITION` and, where it has one,
+  its `indices`; every mesh in the file concatenates into one vertex buffer,
+  offset so a second mesh's triangles still point at its own vertices. No
+  materials and no textures read even though this is the one format that
+  carries its own — a rasteriser with no GPU has nowhere to put them
+  regardless.
+
+All three are tested in `mbrd-core` with no window anywhere near them: `stl`
+and the rasteriser itself against a cube, `obj` against a fanned quad and a
+face naming a corner that does not exist yet, `glb` against a hand-built
+container exercising both the indexed and unindexed paths and two meshes
+sharing one buffer.
+
+The still it opened with is not the still it kept: `mbrd_core::media::Orbit`
+gives every mesh card a camera — yaw, pitch and a bounding-sphere-relative
+distance, clamped and persisted per item — and a drag orbits it, a scroll
+dollies it, both in the opened page always and on the board's own small
+thumbnail behind a right-click "Position" toggle (`Command::Position`) that
+hands a card's drag over from moving it to turning it. Still orthographic,
+on purpose — see the mesh-camera plan's own note on that trade-off — so the
+rasteriser's projection and z-buffer are untouched; only what feeds them a
+rotation changed.
+
+Still last in this list, and no longer last because it is doubtful.
 
 ---
 
@@ -394,8 +490,8 @@ See decision 3. Parsers early if at all, rendering last.
 rendering before content, content before everything. **1, 2 and most of 3 are
 done**, so is most of **4**, and **5** is done — structure between things, which
 is what a moodboard is *for* once the things are on it. So the next thing is
-**6**, the largest remaining chunk of the original's character, and **7–11** are
-breadth. What is left of 3 and 4 — the XDG portal, the generated format
+**6**, the seven arrangements, and **7–11** are breadth. What is left of 3 and
+4 — the XDG portal, the generated format
 catalogue, rich notes, sticker shapes — can be picked up any time; none of it
 blocks anything. **Rotation drawing is the one genuine dependency**: it is
 blocked on GPUI's scene primitives, and it blocks the rotate gesture.
@@ -410,9 +506,10 @@ Roughly, and worth watching — the split is what keeps the format testable.
 | 2 ✓ | spatial index | painted layer, decode cache |
 | 3 ◐ | classify, ceilings *(catalogue partial)* | drop targets *(portal to do)* |
 | 4 ◐ | *(the stored rich-note model, still ahead)* | grips ✓, the text input ✓, Markdown ✓ |
-| 5 ✓ | fence measurement, the router, align/distribute, sticking, snap | the ribbon, the anchors, the rope menu |
-| 6 | all seven arrangements, the mobile packer | switching |
-| 9 | scale and paper maths | the bar and the HUD |
+| 5 ✓ | fence measurement, the router, align/distribute, locking, snap | the ribbon, the anchors, the rope menu |
+| 6 ✓ | all eight arrangements | — |
+| 9 ◐ | scale and paper maths ✓ | the outline ✓, the status bar's scale segment ✓, the Paper/Landscape/Units menu ✓, the calibration gesture *(still ahead)* |
+| 11 ✓ | the rasteriser, `stl`, `obj`, `glb` | the decode dispatch, the picture pipeline |
 
 If a phase turns out to be mostly right-hand column, that is usually a sign
 something pure is hiding in it that has not been pulled out yet.

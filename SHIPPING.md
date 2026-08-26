@@ -245,8 +245,7 @@ feature that can be added later — either the key survives or people reinstall.
 
 - **When.** Once on launch, a few seconds after the window is up so it never
   competes with the first paint, and on demand from a new
-  `Command::CheckForUpdates`. `Ctrl`+`U` is free — plain `u` is `Unstick` and
-  nothing claims the modified form.
+  `Command::CheckForUpdates`. `Ctrl`+`U` is free, and nothing claims it.
 - **How often.** At most once a day, stamped in the state directory. **Never on
   the first run**: an app whose first act is to phone home is a poor first
   impression, and it has nothing to report anyway.
@@ -271,6 +270,12 @@ what Zed does and is more machinery than two GET requests deserve. `ureq` is
 blocking, shares the `rustls 0.23` already in the tree, and runs on
 `cx.background_executor().spawn` exactly like the image decode in
 `board_view.rs:3635` does.
+
+It is no longer only the update path. `fetch.rs` uses the same agent, the same
+executor and the same reasoning to follow a pasted address that points at a
+file — but with its own bounds, because the update path follows one URL this
+project signed and that one follows whatever is on somebody's clipboard. The
+difference between the two is written down there rather than here.
 
 ### 6. The download and the swap — `update/install.rs` — done
 
@@ -352,7 +357,7 @@ strongest argument for the updater in a world with no Developer ID.
 
 | crate | why | roughly |
 | --- | --- | --- |
-| `ureq` (rustls) | two GET requests | ~300 KB, shares the existing `rustls 0.23` |
+| `ureq` (rustls) | the update check, and following a pasted link | ~300 KB, shares the existing `rustls 0.23` |
 | `minisign-verify` | verify the manifest | ~20 KB, verify-only |
 | `tar` + `flate2` | the macOS and Linux payloads | ~150 KB |
 | `embed-resource` (build) | the Windows icon | build-time only |
