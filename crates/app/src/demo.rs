@@ -40,7 +40,7 @@ pub fn board() -> Document {
         "items": [
             { "id": "hello", "type": "note", "x": -260, "y": 150, "w": 260, "h": 190, "z": 3,
               "name": "hello",
-              "meta": { "text": "# mbrd\n\ndrag empty space to pan, wheel to zoom.\npress n for a note, right-click for the rest.\ndouble-click to type.\nctrl z takes anything back. shift shift for everything else." } },
+              "meta": { "text": "# mbrd\n\ndrag empty space to pan, wheel to zoom.\npress n for a note, right-click for the rest.\ndouble-click to open a card.\nctrl z takes anything back. shift shift for everything else." } },
             { "id": "photo1", "type": "image", "x": 90, "y": 170, "w": 300, "h": 220, "z": 2,
               "name": "kitchen-window.jpg",
               "asset": { "hash": kitchen, "embedded": true } },
@@ -81,10 +81,13 @@ pub fn board() -> Document {
             // dragging a photograph out of it leaves.
             { "id": "pen", "type": "fence", "x": -60, "y": 140, "w": 700, "h": 460, "z": -1,
               "name": "the shelf" },
-            // Lying across a photograph, so it is pinned to it: dragging the
-            // picture takes the caption along. `core::stick` measures that too.
+            // Locked, so the demonstration board has one of those on it: it
+            // wears a padlock, refuses every drag and every handle, and a
+            // whole-board relayout lays the rest out around it. `meta.locked`
+            // is the whole of the feature — see `Command::ToggleLock`.
             { "id": "caption", "type": "note", "x": -170, "y": 60, "w": 180, "h": 90, "z": 9,
-              "meta": { "tint": 2, "text": "**stuck** to the picture under it" } }
+              "meta": { "tint": 2, "locked": true,
+                        "text": "**locked** — press `L` to let it go" } }
         ],
         "connections": [
             ["hello", "photo1"],

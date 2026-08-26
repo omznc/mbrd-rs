@@ -115,7 +115,7 @@ fn the_archive_is_legible_to_anything_that_can_open_a_zip() {
     assert!(names.contains(&"board.json".to_string()));
     assert!(
         names.iter().any(|n| n.starts_with("notes/") && n.ends_with(".md")),
-        "a sticky note must land as readable Markdown, got {names:?}"
+        "a note must land as readable Markdown, got {names:?}"
     );
     assert!(
         names.iter().any(|n| n.starts_with("assets/") && n.ends_with(".jpg")),

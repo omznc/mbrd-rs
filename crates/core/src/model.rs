@@ -20,7 +20,7 @@
 
 use serde_json::{Map, Value};
 
-/// The longest a sticky note may be, enforced at every door onto the board.
+/// The longest a note may be, enforced at every door onto the board.
 pub const NOTE_MAX: usize = 512;
 /// The longest a board's title may be. Also bounds the exported filename.
 pub const BOARD_TITLE_MAX: usize = 32;
@@ -217,6 +217,20 @@ impl Item {
     pub fn fence(&self) -> Option<&str> {
         self.meta.get("fence").and_then(Value::as_str)
     }
+
+    /// Whether the author has nailed this item down.
+    ///
+    /// **A decision, never a measurement**, which is what separates it from
+    /// `fence` above: nothing about where the item sits can imply it, and
+    /// nothing but the author asking may set it. A locked item cannot be
+    /// moved, resized or binned, and no layout deals it a new slot — it is
+    /// still selectable, because unlocking it is a thing you do to it.
+    ///
+    /// Off unless the key is there and true, so a board that has never heard
+    /// of locking reads as a board with nothing locked.
+    pub fn locked(&self) -> bool {
+        self.meta.get("locked").and_then(Value::as_bool).unwrap_or(false)
+    }
 }
 
 /// Which of the two geometry profiles is being talked about.
@@ -308,6 +322,8 @@ pub struct BoardSettings {
     /// that is the key an older build reads; renaming it would open every board
     /// that had them switched on with nothing between the cards.
     pub web: bool,
+    /// Whether the scale bar is drawn over the canvas — see `paper::scale_bar`
+    /// for the length and label it reads off `scale` and `units` below.
     pub hud: bool,
     /// Whether a dragged card lines itself up with its neighbours, and draws a
     /// rule to say what it lined up with. See [`crate::guides`].
@@ -719,5 +735,36 @@ impl Board {
             }
         }
         seen
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Locking is a decision, and only a decision.
+    ///
+    /// Which is the whole of the rule: nothing about where an item sits may
+    /// imply it, an absent key means unlocked, and a key holding anything but
+    /// `true` is not an author saying yes. The last of those matters because
+    /// `meta` is the format's extension point — an unknown key rides through
+    /// untouched, so a later build's `locked: "sometimes"` must not read here
+    /// as a card nobody can move.
+    #[test]
+    fn an_item_is_locked_only_where_its_author_said_so() {
+        let mut item = Item::new("a", ItemType::Note);
+        assert!(!item.locked(), "a board that has never heard of locking");
+
+        item.meta.insert("locked".into(), Value::Bool(true));
+        assert!(item.locked());
+
+        item.meta.insert("locked".into(), Value::Bool(false));
+        assert!(!item.locked());
+
+        item.meta.insert("locked".into(), Value::String("yes".into()));
+        assert!(!item.locked(), "a value from somewhere else is not a yes");
+
+        item.meta.remove("locked");
+        assert!(!item.locked());
     }
 }
