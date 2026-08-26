@@ -1,16 +1,17 @@
-//! Markdown, as much of it as a sticky note wants.
+//! Markdown on a card: as much of it as a note has room for.
 //!
-//! A note is stored as plain text and always has been — `meta.text` in the
-//! format, one `.md` file per note in the archive — so this is not a change to
-//! what a note *is*. It is the reader that was missing: the words were being
-//! drawn exactly as typed, asterisks and all, and the only nod to any of it was
-//! a line in the label builder that deleted `# ` so a heading did not read as a
-//! hash. This module is that line, done properly.
+//! The reading is not done here. [`mbrd_core::markdown::parse`] turns a note
+//! into blocks with every marker already off and every character already
+//! carrying its style, and this module answers the *other* question — what
+//! those blocks look like on a rectangle a few hundred pixels wide, with a
+//! fixed number of body lines to spend.
 //!
 //! ## What it takes and what it hands back
 //!
-//! In: the note's text, and how many `columns` and `rows` of body text the card
-//! has room for. Out: [`Line`]s that are already wrapped, already elided if
+//! In: the note's text, how wide the card is in pixels, and how many `rows` of
+//! body text it has room for — plus a [`crate::metrics::Advance`], which is
+//! what says how wide a character is and therefore where a line breaks. Out:
+//! [`Line`]s that are already wrapped, already elided if
 //! there were more of them than fit, and already broken into [`Span`]s that are
 //! each set one way. The painter shapes a run per span and never has to know
 //! what an asterisk meant.
@@ -19,42 +20,44 @@
 //!
 //! Because a style crosses a line break. Wrapping first and parsing per line
 //! would end a bold at the wrap, and parsing first and wrapping the plain text
-//! afterwards would lose which characters the bold was on. So the text is
-//! parsed to a style *per character*, folded into lines at that granularity,
-//! and only then grouped back into runs — which also makes the fold itself
-//! ordinary, since a `Vec` of characters wraps the same way a string does.
+//! afterwards would lose which characters the bold was on. So a block's spans
+//! are spread back out to a style *per character*, folded into lines at that
+//! granularity, and only then grouped into runs again — which also makes the
+//! fold itself ordinary, since a `Vec` of characters wraps the same way a
+//! string does.
 //!
-//! ## What is deliberately not here
+//! ## A card is a level of detail, not a document
 //!
-//! No tables, no reference links, no HTML, no nested blockquotes. A note is
-//! capped at [`NOTE_MAX`](mbrd_core::model::NOTE_MAX) characters and lives on a
-//! card a few hundred pixels wide; the parts of Markdown it can hold are the
-//! parts that are worth the ambiguity.
+//! Everything the parser can produce arrives here, including the things a card
+//! plainly cannot show properly — a table, a heading six deep, a list four
+//! levels in. None of them are refused, because a card that silently dropped
+//! part of a note would be lying about what the note says. They are *flattened*
+//! instead: a table becomes its rows with the columns divided, a deep heading
+//! becomes bold body text, nesting becomes indentation. Open the card and the
+//! full window sets the same blocks properly. See `opened.rs`.
 
-/// How a run of characters is set.
+use crate::metrics::Advance;
+use mbrd_core::markdown::{Block, Marker, Run, Table};
+
+pub use mbrd_core::markdown::{Span, Style};
+
+/// How much larger than body text each heading level is set.
 ///
-/// A set of flags rather than an enum because they genuinely combine: bold
-/// inside a link inside a heading is all three at once.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Style {
-    pub bold: bool,
-    pub italic: bool,
-    /// Backticks. Drawn as a wash behind the characters rather than in another
-    /// face, because a face this build cannot be sure is installed is a face
-    /// that silently comes out as the body one.
-    pub code: bool,
-    pub strike: bool,
-    /// The visible half of `[text](url)`. The address is dropped: there is
-    /// nowhere on a card to put it and nothing yet to do with it.
-    pub link: bool,
-}
+/// Wider at the top than the ramp this replaces, whose bottom two steps — 1.25
+/// and 1.1 — sat close enough together that an H3 read as body text with a hash
+/// quietly in front of it rather than as its own level. Flat from the fourth
+/// down: a card is not a document, and the difference between an H4 and an H5
+/// on something this size is a difference nobody can see. They stay bold, which
+/// is what makes them still read as headings.
+const HEADINGS: [f32; 6] = [1.6, 1.3, 1.12, 1.0, 1.0, 1.0];
 
-/// A run of characters that are all set the same way.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Span {
-    pub text: String,
-    pub style: Style,
-}
+/// The bar in front of a quote, and the space after it.
+const QUOTE: &str = "\u{258f} ";
+
+/// What divides two cells of a table on a card. A table is drawn as its rows
+/// here — there is no room to align columns on a note — so the divider
+/// is what is left of the grid.
+const CELL: &str = " \u{2502} ";
 
 /// One line of a note, as it will be drawn.
 #[derive(Debug, Clone, PartialEq)]
@@ -75,7 +78,7 @@ impl Line {
             spans: if text.is_empty() {
                 Vec::new()
             } else {
-                vec![Span { text, style: Style::default() }]
+                vec![Span::new(text, Style::default())]
             },
             scale: 1.0,
             muted: false,
@@ -94,33 +97,36 @@ impl Line {
 
 /// The whole job: text in, drawable lines out.
 ///
-/// `columns` and `rows` are in body-sized characters and lines. A heading takes
-/// more than one row's worth of height, and is charged for it — see the budget
-/// in the loop — so a card does not overflow just because somebody started
-/// their note with a `#`.
-pub fn lay_out(text: &str, columns: usize, rows: usize) -> Vec<Line> {
-    let columns = columns.max(1);
+/// `width` is in pixels and `size` is the body font size in pixels; `rows` is
+/// still a count of body-sized lines, because that is a budget rather than a
+/// measurement. A heading takes more than one row's worth of height, and is
+/// charged for it — see the budget in the loop — so a card does not overflow
+/// just because somebody started their note with a `#`.
+///
+/// `adv` is what makes the wrap a measurement instead of a division; see
+/// [`crate::metrics`] for why it is a parameter and not a constant.
+pub fn lay_out(text: &str, width: f32, size: f32, rows: usize, adv: &dyn Advance) -> Vec<Line> {
+    let width = width.max(1.0);
+    let mut pieces = Vec::new();
+    flatten(&mbrd_core::markdown::parse(text), &Where::default(), width, size, adv, &mut pieces);
+
     let mut out: Vec<Line> = Vec::new();
     let mut left = rows as f32;
-    let mut fenced = false;
     let mut clipped = false;
 
-    'outer: for raw in text.split('\n') {
-        // A fence is a switch, not a line. Everything between two of them is
-        // taken as typed — the whole point of asking for it.
-        if raw.trim().starts_with("```") {
-            fenced = !fenced;
-            continue;
-        }
-        let block = if fenced { verbatim(raw) } else { classify(raw, columns) };
+    'outer: for piece in &pieces {
+        // A heading's letters are larger, so its own characters are measured
+        // at its own size — but its marker and its indent are body-sized, and
+        // are measured at `size`.
+        let em = size * piece.scale;
+        // The room this piece's own lines get, after its bullet or its quote
+        // mark. Never nothing: a card narrower than its own marker still has
+        // to put a character somewhere, and the painter clips the overflow.
+        let head = format!("{}{}", " ".repeat(piece.indent), piece.prefix);
+        let room = (width - adv.width(&head, size)).max(em);
+        let hang = hang(piece, size, adv);
 
-        // The room this block's own lines get, after its bullet or its quote
-        // mark and after the width a heading's larger letters cost.
-        let room = ((columns as f32 / block.scale).floor() as usize)
-            .saturating_sub(block.prefix.chars().count() + block.indent)
-            .max(1);
-
-        for (n, run) in fold(&block.body, room).into_iter().enumerate() {
+        for (n, run) in fold(&piece.body, room, em, adv).into_iter().enumerate() {
             // `!out.is_empty()`, so the first line is always drawn however
             // little room there is. Without it a note that opens with a
             // heading — which costs more than one row — came back *empty* the
@@ -128,26 +134,22 @@ pub fn lay_out(text: &str, columns: usize, rows: usize) -> Vec<Line> {
             // written without the `#` still showed its first line. A card
             // going blank is not a level of detail, it is a card that has lost
             // its contents, and the painter clips what overflows anyway.
-            if left < block.scale && !out.is_empty() {
+            if left < piece.scale && !out.is_empty() {
                 clipped = true;
                 break 'outer;
             }
-            left -= block.scale;
+            left -= piece.scale;
 
             // The marker on the first line and an indent under it on the rest,
             // so a bullet that wraps hangs rather than starting back at the
             // margin and reading as a second bullet.
-            let lead = if n == 0 {
-                format!("{}{}", " ".repeat(block.indent), block.prefix)
-            } else {
-                " ".repeat(block.indent + block.prefix.chars().count())
-            };
+            let lead = if n == 0 { head.clone() } else { hang.clone() };
             let mut spans = Vec::new();
             if !lead.trim().is_empty() || (!lead.is_empty() && n > 0) {
-                spans.push(Span { text: lead, style: block.marker });
+                spans.push(Span::new(lead, piece.marker));
             }
             spans.extend(group(&run));
-            out.push(Line { spans, scale: block.scale, muted: block.muted });
+            out.push(Line { spans, scale: piece.scale, muted: piece.muted });
         }
     }
 
@@ -155,18 +157,40 @@ pub fn lay_out(text: &str, columns: usize, rows: usize) -> Vec<Line> {
     // mid-sentence with no ellipsis is a card that looks complete and is not.
     if clipped {
         if let Some(last) = out.last_mut() {
-            if let Some(span) = last.spans.last_mut() {
-                span.text.push('\u{2026}');
-            } else {
-                last.spans.push(Span { text: "\u{2026}".into(), style: Style::default() });
+            match last.spans.last_mut() {
+                Some(span) => span.text.push('\u{2026}'),
+                None => last.spans.push(Span::new("\u{2026}", Style::default())),
             }
         }
+    }
+    // An empty note is one empty line rather than none, so that a card being
+    // typed into has somewhere to put its caret.
+    if out.is_empty() {
+        out.push(Line::plain(""));
     }
     out
 }
 
-/// One line of the source, once it is known what kind of line it is.
-struct Block {
+/// The spaces a wrapped line hangs by: as near the marker's own width as a run
+/// of spaces can get.
+///
+/// Counted rather than assumed. In a proportional face `- ` and two spaces are
+/// not the same width, and a bullet whose second line started a few pixels off
+/// the first reads as a second bullet rather than as the same one continuing.
+fn hang(piece: &Piece, size: f32, adv: &dyn Advance) -> String {
+    let space = adv.of(' ', size);
+    let marker = adv.width(&piece.prefix, size);
+    let wide = if space > 0.0 { (marker / space).round() as usize } else { 0 };
+    " ".repeat(piece.indent + wide)
+}
+
+// ---------------------------------------------------------------------------
+// Flattening
+// ---------------------------------------------------------------------------
+
+/// One line's worth of block, once it is known what kind of block it came from.
+#[derive(Debug)]
+struct Piece {
     /// The bullet, the number, the quote bar. Drawn, and not part of the text.
     prefix: String,
     /// How the marker itself is set, which is not how the words are.
@@ -178,250 +202,231 @@ struct Block {
     body: Vec<(char, Style)>,
 }
 
-impl Block {
-    fn body(body: Vec<(char, Style)>) -> Block {
-        Block {
-            prefix: String::new(),
-            marker: Style::default(),
-            indent: 0,
+impl Piece {
+    fn new(body: Vec<(char, Style)>, at: &Where) -> Piece {
+        Piece {
+            prefix: at.prefix.clone(),
+            marker: at.marker,
+            indent: at.depth * 2,
             scale: 1.0,
-            muted: false,
+            muted: at.muted,
             body,
         }
     }
 }
 
-/// Inside a fence: the characters, exactly, set as code.
-fn verbatim(raw: &str) -> Block {
-    let style = Style { code: true, ..Style::default() };
-    Block::body(raw.chars().map(|c| (c, style)).collect())
-}
-
-/// What kind of line this is, and what is left of it once the marker is off.
-fn classify(raw: &str, columns: usize) -> Block {
-    let trimmed = raw.trim_end();
-    let body = trimmed.trim_start();
-    // Two spaces to a level, which is what every editor's tab key does here.
-    let indent = (trimmed.chars().count() - body.chars().count()) / 2 * 2;
-
-    // A rule. Three or more of one mark and nothing else, drawn as the line it
-    // stands for rather than as the marks somebody typed.
-    if body.chars().count() >= 3 && ['-', '*', '_'].iter().any(|m| body.chars().all(|c| c == *m)) {
-        let mut block =
-            Block::body(std::iter::repeat_n(('\u{2500}', Style::default()), columns).collect());
-        block.muted = true;
-        return block;
-    }
-
-    // A heading. One to three, because a card is not a document and a fourth
-    // level would be body text with a hash in front of it.
-    let hashes = body.chars().take_while(|c| *c == '#').count();
-    if (1..=3).contains(&hashes) && body.chars().nth(hashes) == Some(' ') {
-        let rest: String = body.chars().skip(hashes + 1).collect();
-        let mut block = Block::body(bolden(inline(&rest)));
-        // Wider than the ramp this replaces, whose bottom two steps — 1.25
-        // and 1.1 — sat close enough together that an H3 read as body text
-        // with a hash quietly in front of it rather than as its own level.
-        block.scale = [1.6, 1.3, 1.12][hashes - 1];
-        block.indent = indent;
-        return block;
-    }
-
-    // A quote. The bar is the mark, and the words go quiet with it.
-    if let Some(rest) = body.strip_prefix('>') {
-        let mut block = Block::body(inline(rest.trim_start()));
-        block.prefix = "\u{258f} ".into();
-        block.muted = true;
-        block.indent = indent;
-        return block;
-    }
-
-    // A task, before a bullet, because a task is a bullet with a box on it.
-    for (mark, box_) in [("- [ ] ", "\u{2610} "), ("- [x] ", "\u{2611} "), ("- [X] ", "\u{2611} ")]
-    {
-        if let Some(rest) = body.strip_prefix(mark) {
-            let mut block = Block::body(inline(rest));
-            block.prefix = box_.into();
-            block.indent = indent;
-            return block;
-        }
-    }
-
-    // A bullet. The space after the mark is required, which is what keeps
-    // `*emphasis*` at the start of a line from becoming a list.
-    for mark in ['-', '*', '+'] {
-        if let Some(rest) = body.strip_prefix(&format!("{mark} ")) {
-            let mut block = Block::body(inline(rest));
-            block.prefix = "\u{2022} ".into();
-            block.marker = Style { bold: true, ..Style::default() };
-            block.indent = indent;
-            return block;
-        }
-    }
-
-    // A numbered item. The number somebody typed, not one counted here: a list
-    // that renumbers itself would be a list that argues with the text.
-    let digits = body.chars().take_while(char::is_ascii_digit).count();
-    if digits > 0 && body.chars().skip(digits).take(2).collect::<String>() == ". " {
-        let rest: String = body.chars().skip(digits + 2).collect();
-        let mut block = Block::body(inline(&rest));
-        block.prefix = format!("{}. ", &body[..digits]);
-        block.indent = indent;
-        return block;
-    }
-
-    let mut block = Block::body(inline(body));
-    block.indent = indent;
-    block
-}
-
-/// Everything in a heading, set bold, whatever else it already was.
-fn bolden(mut chars: Vec<(char, Style)>) -> Vec<(char, Style)> {
-    for (_, style) in &mut chars {
-        style.bold = true;
-    }
-    chars
-}
-
-/// The inline pass: markers off, a style on every character that is left.
+/// Where in the nesting a block is being flattened, which is everything a
+/// block needs to know about its ancestors.
 ///
-/// A marker only opens where a matching one closes later on the same line, so
-/// a lone asterisk in the middle of a sentence stays an asterisk instead of
-/// italicising the rest of the note. That is the difference between a reader
-/// and a parser: this one is being shown half-finished text constantly, and
-/// half-finished text has to look like what it is.
-fn inline(text: &str) -> Vec<(char, Style)> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = Vec::with_capacity(chars.len());
-    let mut style = Style::default();
-    let mut i = 0;
+/// Carried down rather than fixed up afterwards, because a bullet inside a
+/// quote wants `▎ • ` — one prefix built on the way in — rather than two
+/// prefixes fought over on the way out.
+#[derive(Debug, Default, Clone)]
+struct Where {
+    prefix: String,
+    marker: Style,
+    depth: usize,
+    muted: bool,
+}
 
-    while i < chars.len() {
-        let c = chars[i];
+impl Where {
+    /// A level deeper, with whatever marker this level puts in front.
+    fn under(&self, prefix: &str, marker: Style) -> Where {
+        Where {
+            prefix: format!("{}{}", self.prefix, prefix),
+            marker,
+            depth: self.depth,
+            muted: self.muted,
+        }
+    }
 
-        // Inside backticks nothing is a marker except the closing backtick.
-        if style.code {
-            if c == '`' {
-                style.code = false;
-            } else {
-                out.push((c, style));
+    /// The same place, with nothing more to put in front — what a list item's
+    /// second and later blocks get, so a paragraph under a bullet does not
+    /// grow a second bullet.
+    fn again(&self) -> Where {
+        Where { prefix: " ".repeat(self.prefix.chars().count()), ..self.clone() }
+    }
+}
+
+fn flatten(
+    blocks: &[Block],
+    at: &Where,
+    width: f32,
+    size: f32,
+    adv: &dyn Advance,
+    out: &mut Vec<Piece>,
+) {
+    for block in blocks {
+        match block {
+            Block::Gap => out.push(Piece::new(Vec::new(), at)),
+            Block::Paragraph(runs) => {
+                for run in runs {
+                    out.push(Piece::new(spread(run, Style::default()), at));
+                }
             }
-            i += 1;
-            continue;
+            Block::Heading { level, runs } => {
+                // Bold throughout, whatever the words were already set as: a
+                // heading on a card has to read as one at a glance, and the
+                // scale alone does not carry the bottom half of the ramp.
+                let scale = HEADINGS[(*level as usize).clamp(1, 6) - 1];
+                for run in runs {
+                    let mut piece =
+                        Piece::new(spread(run, Style { bold: true, ..Style::default() }), at);
+                    piece.scale = scale;
+                    out.push(piece);
+                }
+            }
+            Block::Quote(inner) => {
+                let mut under = at.under(QUOTE, at.marker);
+                under.muted = true;
+                flatten(inner, &under, width, size, adv, out);
+            }
+            // `ordered` says nothing a card can use: the marker on each entry
+            // already carries the number that was typed, and a bullet and a
+            // number are drawn the same way here.
+            Block::List { items, .. } => {
+                for entry in items {
+                    let (prefix, marker) = match &entry.marker {
+                        Marker::Bullet => {
+                            ("\u{2022} ".to_string(), Style { bold: true, ..Style::default() })
+                        }
+                        Marker::Number(typed) => (format!("{typed}. "), at.marker),
+                        Marker::Task(false) => ("\u{2610} ".to_string(), at.marker),
+                        Marker::Task(true) => ("\u{2611} ".to_string(), at.marker),
+                    };
+                    let first = at.under(&prefix, marker);
+                    // Only the item's *first* block wears the marker. Everything
+                    // else under the same bullet — a second paragraph, a nested
+                    // list — is set at the width of the marker instead, which is
+                    // what indents it under the words rather than under the dot.
+                    // That is also the whole of the nesting: a list four levels
+                    // in is four markers' worth of spaces, arrived at by the
+                    // same rule each time rather than by counting depth twice.
+                    let rest = first.again();
+                    for (n, block) in entry.blocks.iter().enumerate() {
+                        flatten(
+                            std::slice::from_ref(block),
+                            if n == 0 { &first } else { &rest },
+                            width,
+                            size,
+                            adv,
+                            out,
+                        );
+                    }
+                }
+            }
+            Block::Code { lines, .. } => {
+                let style = Style { code: true, ..Style::default() };
+                for line in lines {
+                    out.push(Piece::new(line.chars().map(|c| (c, style)).collect(), at));
+                }
+            }
+            Block::Rule => {
+                // Drawn as the line it stands for rather than as the marks
+                // somebody typed.
+                // As many box-drawing characters as fit the room left over
+                // once the quote bar or the nesting has had its share.
+                let lead = format!("{}{}", " ".repeat(at.depth * 2), at.prefix);
+                let unit = adv.of('\u{2500}', size);
+                let room = (width - adv.width(&lead, size)).max(0.0);
+                let count = if unit > 0.0 { (room / unit).floor() as usize } else { 0 };
+                let mut piece = Piece::new(
+                    std::iter::repeat_n(('\u{2500}', Style::default()), count.max(1)).collect(),
+                    at,
+                );
+                piece.muted = true;
+                out.push(piece);
+            }
+            Block::Table(table) => flatten_table(table, at, out),
         }
+    }
+}
 
-        // A backslash spends itself on the next character, whatever it is.
-        if c == '\\' && i + 1 < chars.len() {
-            out.push((chars[i + 1], style));
-            i += 2;
-            continue;
+/// A table, as the rows it is made of.
+///
+/// No column alignment, because a card has no room to hold columns apart and
+/// padding them to a common width would spend most of a narrow card on spaces.
+/// The header row keeps its weight, which is what still makes it read as one.
+fn flatten_table(table: &Table, at: &Where, out: &mut Vec<Piece>) {
+    let mut row = |cells: &[Run], bold: bool| {
+        let mut body: Vec<(char, Style)> = Vec::new();
+        for (n, cell) in cells.iter().enumerate() {
+            if n > 0 {
+                body.extend(CELL.chars().map(|c| (c, Style::default())));
+            }
+            body.extend(spread(cell, Style { bold, ..Style::default() }));
         }
+        out.push(Piece::new(body, at));
+    };
+    if !table.head.is_empty() {
+        row(&table.head, true);
+    }
+    for cells in &table.rows {
+        row(cells, false);
+    }
+}
 
-        let pair = chars.get(i + 1) == Some(&c);
-        let two = |mark: char, on: bool, at: usize| -> bool {
-            on || closes(&chars, at + 2, &[mark, mark])
+/// A run's spans back out to one style per character, with `over` folded in.
+///
+/// `over` is what the *block* imposes on everything in it — bold, for a
+/// heading — and it is an or rather than a replacement, so a link inside a
+/// heading is still a link.
+fn spread(run: &Run, over: Style) -> Vec<(char, Style)> {
+    let mut out = Vec::new();
+    for span in run {
+        let style = Style {
+            bold: span.style.bold || over.bold,
+            italic: span.style.italic || over.italic,
+            code: span.style.code || over.code,
+            strike: span.style.strike || over.strike,
+            link: span.style.link || over.link,
         };
-
-        match c {
-            '*' | '_' if pair && two(c, style.bold, i) => {
-                style.bold = !style.bold;
-                i += 2;
-            }
-            '~' if pair && two('~', style.strike, i) => {
-                style.strike = !style.strike;
-                i += 2;
-            }
-            // `_` only between words, so `snake_case` is a name and not an
-            // italic. `*` has no such rule because nothing is spelt with one.
-            '*' | '_' if !pair && (c == '*' || word_edge(&chars, i)) => {
-                if style.italic || closes(&chars, i + 1, &[c]) {
-                    style.italic = !style.italic;
-                    i += 1;
-                } else {
-                    out.push((c, style));
-                    i += 1;
-                }
-            }
-            '`' if closes(&chars, i + 1, &['`']) => {
-                style.code = true;
-                i += 1;
-            }
-            '[' => match link(&chars, i) {
-                Some((text, next)) => {
-                    let mut linked = style;
-                    linked.link = true;
-                    out.extend(text.into_iter().map(|c| (c, linked)));
-                    i = next;
-                }
-                None => {
-                    out.push((c, style));
-                    i += 1;
-                }
-            },
-            _ => {
-                out.push((c, style));
-                i += 1;
-            }
-        }
+        out.extend(span.text.chars().map(|c| (c, style)));
     }
     out
 }
 
-/// Whether `mark` appears again from `from` on. What makes an opener an opener.
-fn closes(chars: &[char], from: usize, mark: &[char]) -> bool {
-    if from >= chars.len() {
-        return false;
-    }
-    chars[from..].windows(mark.len()).any(|w| w == mark)
-}
-
-/// Whether an underscore here is between words rather than inside one.
-fn word_edge(chars: &[char], at: usize) -> bool {
-    let before = at.checked_sub(1).and_then(|i| chars.get(i));
-    !before.is_some_and(|c| c.is_alphanumeric())
-}
-
-/// `[text](url)` from `at`, as the characters to draw and where to carry on.
-fn link(chars: &[char], at: usize) -> Option<(Vec<char>, usize)> {
-    let close = (at + 1..chars.len()).find(|i| chars[*i] == ']')?;
-    if chars.get(close + 1) != Some(&'(') {
-        return None;
-    }
-    let end = (close + 2..chars.len()).find(|i| chars[*i] == ')')?;
-    let text: Vec<char> = chars[at + 1..close].to_vec();
-    // `[](url)` has nothing to show, so it is not a link — it is two brackets.
-    (!text.is_empty()).then_some((text, end + 1))
-}
+// ---------------------------------------------------------------------------
+// Wrapping
+// ---------------------------------------------------------------------------
 
 /// Break styled characters into lines of at most `columns` of them.
 ///
 /// Greedy, by word, with a hard break for a word longer than a whole line — the
 /// same rules the plain label wrap uses, and for the same reasons, but carrying
 /// a style along with every character.
-fn fold(body: &[(char, Style)], columns: usize) -> Vec<Vec<(char, Style)>> {
-    // An empty source line is a paragraph break and has to survive as one.
+fn fold(body: &[(char, Style)], room: f32, em: f32, adv: &dyn Advance) -> Vec<Vec<(char, Style)>> {
+    // An empty block is a paragraph break and has to survive as one.
     if body.is_empty() {
         return vec![Vec::new()];
     }
 
+    let wide = |run: &[(char, Style)]| -> f32 { run.iter().map(|(c, _)| adv.of(*c, em)).sum() };
+    let space = adv.of(' ', em);
+
     let mut out: Vec<Vec<(char, Style)>> = Vec::new();
     let mut line: Vec<(char, Style)> = Vec::new();
+    let mut so_far = 0.0f32;
 
     for word in body.split(|(c, _)| *c == ' ').filter(|w| !w.is_empty()) {
         let mut word = word;
+        let mut word_wide = wide(word);
         // Too long for a line of its own: cut it, or the greedy loop below
         // would never place it and would spin.
-        while word.len() > columns {
+        while word_wide > room {
             if !line.is_empty() {
                 out.push(std::mem::take(&mut line));
+                so_far = 0.0;
             }
-            let (head, tail) = word.split_at(columns);
-            out.push(head.to_vec());
-            word = tail;
+            let cut = fits(word, room, em, adv);
+            out.push(word[..cut].to_vec());
+            word = &word[cut..];
+            word_wide = wide(word);
         }
-        let would_be = if line.is_empty() { word.len() } else { line.len() + 1 + word.len() };
-        if would_be > columns && !line.is_empty() {
+        let would_be = if line.is_empty() { word_wide } else { so_far + space + word_wide };
+        if would_be > room && !line.is_empty() {
             out.push(std::mem::take(&mut line));
+            so_far = 0.0;
         }
         if let Some((_, before)) = line.last().copied() {
             // The space between two words is set the way *both* of them are,
@@ -430,13 +435,32 @@ fn fold(body: &[(char, Style)], columns: usize) -> Vec<Vec<(char, Style)>> {
             // which for a strikethrough or a link is a visible tail.
             let after = word.first().map(|(_, s)| *s).unwrap_or_default();
             line.push((' ', shared(before, after)));
+            so_far += space;
         }
         line.extend_from_slice(word);
+        so_far += word_wide;
     }
     if !line.is_empty() || out.is_empty() {
         out.push(line);
     }
     out
+}
+
+/// How many characters of `run` fit in `room` — at least one, whatever the
+/// answer, because the caller is cutting a word that does not fit and a cut of
+/// nothing would leave it doing that forever.
+fn fits(run: &[(char, Style)], room: f32, em: f32, adv: &dyn Advance) -> usize {
+    let mut wide = 0.0;
+    let mut count = 0;
+    for (c, _) in run {
+        let next = wide + adv.of(*c, em);
+        if next > room && count > 0 {
+            break;
+        }
+        wide = next;
+        count += 1;
+    }
+    count.max(1).min(run.len().saturating_sub(1)).max(1)
 }
 
 /// What two neighbours agree about, for the space between them.
@@ -456,7 +480,7 @@ fn group(run: &[(char, Style)]) -> Vec<Span> {
     for (c, style) in run {
         match out.last_mut() {
             Some(span) if span.style == *style => span.text.push(*c),
-            _ => out.push(Span { text: c.to_string(), style: *style }),
+            _ => out.push(Span::new(c.to_string(), *style)),
         }
     }
     out
@@ -465,13 +489,24 @@ fn group(run: &[(char, Style)]) -> Vec<Span> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::Estimate;
+
+    /// [`lay_out`] measured in characters rather than pixels.
+    ///
+    /// Every assertion below is about *where the words broke*, and a test that
+    /// had to know how wide an `m` is in whatever face the machine running it
+    /// happens to have would be a test about that machine. [`Estimate::columns`]
+    /// makes one character one unit wide, so `columns` here means columns.
+    fn lay_out(text: &str, columns: usize, rows: usize) -> Vec<Line> {
+        super::lay_out(text, columns as f32, 1.0, rows, &Estimate::columns())
+    }
 
     /// The text of every line, which is what a card visibly says.
     fn text(lines: &[Line]) -> Vec<String> {
         lines.iter().map(Line::text).collect()
     }
 
-    /// Every span, as `(text, "bic-l")` — the flags that are on, in order.
+    /// Every span, as `(text, "bics-l")` — the flags that are on, in order.
     fn spans(line: &Line) -> Vec<(String, String)> {
         line.spans
             .iter()
@@ -528,8 +563,8 @@ mod tests {
 
     #[test]
     fn an_underscore_inside_a_word_is_part_of_the_word() {
-        let out = lay_out("call board_view once", 40, 8);
-        assert_eq!(text(&out), ["call board_view once"]);
+        let out = lay_out("call board_view_now once", 40, 8);
+        assert_eq!(text(&out), ["call board_view_now once"]);
         assert_eq!(spans(&out[0]).len(), 1, "no italics in a snake_case name");
     }
 
@@ -558,11 +593,14 @@ mod tests {
     }
 
     #[test]
-    fn a_fourth_level_heading_is_not_one() {
-        // A card is not a document, and `#### ` would be body text with four
-        // hashes in front of it either way.
+    fn a_deep_heading_is_bold_rather_than_hashes() {
+        // The line reader this replaces stopped at three levels and showed
+        // `#### deep` with its hashes on, which is the one thing a reader must
+        // never do: print the syntax at somebody.
         let out = lay_out("#### deep", 40, 8);
-        assert_eq!(text(&out), ["#### deep"]);
+        assert_eq!(text(&out), ["deep"]);
+        assert_eq!(out[0].scale, 1.0, "a card has no fourth size");
+        assert!(out[0].spans.iter().all(|s| s.style.bold));
     }
 
     #[test]
@@ -575,6 +613,12 @@ mod tests {
     fn a_wrapped_bullet_hangs_under_itself() {
         let out = lay_out("- one two three four", 12, 8);
         assert_eq!(text(&out), ["\u{2022} one two", "  three four"]);
+    }
+
+    #[test]
+    fn a_list_inside_a_list_is_indented_under_it() {
+        let out = lay_out("- one\n  - inner\n- two", 40, 8);
+        assert_eq!(text(&out), ["\u{2022} one", "  \u{2022} inner", "\u{2022} two"]);
     }
 
     #[test]
@@ -617,6 +661,15 @@ mod tests {
     }
 
     #[test]
+    fn a_table_is_flattened_to_its_rows() {
+        // A card cannot hold columns apart, so it says the same thing in the
+        // shape it does have room for rather than dropping the table.
+        let out = lay_out("| a | b |\n|---|---|\n| 1 | 2 |", 40, 8);
+        assert_eq!(text(&out), ["a \u{2502} b", "1 \u{2502} 2"]);
+        assert!(out[0].spans.iter().any(|s| s.style.bold), "the header keeps its weight");
+    }
+
+    #[test]
     fn a_style_survives_the_line_it_is_wrapped_across() {
         // The reason the parse happens per character and the fold happens
         // after it: a bold that spans a wrap is bold on both lines.
@@ -639,6 +692,14 @@ mod tests {
     }
 
     #[test]
+    fn a_line_break_is_a_line_break() {
+        // CommonMark would run these together. A note does not: see the
+        // core module's header.
+        let out = lay_out("one\ntwo", 40, 8);
+        assert_eq!(text(&out), ["one", "two"]);
+    }
+
+    #[test]
     fn what_does_not_fit_says_so() {
         let out = lay_out("one\ntwo\nthree\nfour", 40, 2);
         assert_eq!(out.len(), 2);
@@ -649,8 +710,8 @@ mod tests {
     fn a_heading_is_charged_for_the_height_it_takes() {
         // Otherwise a card with room for four lines would happily draw four
         // headings and spill them out of the bottom of itself.
-        let out = lay_out("# one\n# two\n# three\n# four", 40, 4);
-        assert!(out.len() < 4, "{out:?}");
+        let out = lay_out("# one\n\n# two\n\n# three\n\n# four", 40, 4);
+        assert!(out.len() < 7, "{out:?}");
     }
 
     #[test]
