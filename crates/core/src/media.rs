@@ -54,6 +54,13 @@ pub const DIST_MAX: f32 = 12.0;
 /// whole of the fix.
 pub const PITCH_LIMIT: f32 = 89.0;
 
+/// How far the look-at point may be shifted off the mesh's own centre, in
+/// fractions of its silhouette span at the current turn. Scale-free the same
+/// way `DIST_MIN`/`DIST_MAX` are: `1.0` is "off the edge of the mesh's own
+/// extent," which is already generous room to look at a corner up close, and
+/// past a couple of multiples of that a pan has nothing left to show.
+pub const PAN_LIMIT: f32 = 1.5;
+
 /// Whether a card of this type is something that can play.
 ///
 /// `Image` is in the list, which surprises people: an animated GIF is an image
@@ -237,6 +244,11 @@ pub struct Orbit {
     pub yaw: f32,
     pub pitch: f32,
     pub dist: f32,
+    /// The look-at point's shift off the mesh's own centre, in fractions of
+    /// its silhouette span — see [`PAN_LIMIT`]. `(0.0, 0.0)` is dead centre,
+    /// which is what every mesh card had before panning existed.
+    pub pan_x: f32,
+    pub pan_y: f32,
 }
 
 impl Default for Orbit {
@@ -244,7 +256,7 @@ impl Default for Orbit {
     /// tells you the most about an unfamiliar shape — straight on, a box and a
     /// cylinder are the same rectangle.
     fn default() -> Self {
-        Self { yaw: 30.0, pitch: 20.0, dist: 2.6 }
+        Self { yaw: 30.0, pitch: 20.0, dist: 2.6, pan_x: 0.0, pan_y: 0.0 }
     }
 }
 
@@ -254,7 +266,7 @@ impl Orbit {
         Self {
             yaw: wrap_degrees(self.yaw + dyaw),
             pitch: (self.pitch + dpitch).clamp(-PITCH_LIMIT, PITCH_LIMIT),
-            dist: self.dist,
+            ..self
         }
     }
 
@@ -265,6 +277,20 @@ impl Orbit {
             false => self.dist,
         };
         Self { dist, ..self }
+    }
+
+    /// Shifted by some fraction of the mesh's own span, held inside
+    /// [`PAN_LIMIT`]. Non-finite input leaves the pan where it was, the same
+    /// guard `dollied` holds a bad factor to.
+    pub fn panned(self, dx: f32, dy: f32) -> Self {
+        let shift = |v: f32, d: f32| {
+            if d.is_finite() {
+                (v + d).clamp(-PAN_LIMIT, PAN_LIMIT)
+            } else {
+                v
+            }
+        };
+        Self { pan_x: shift(self.pan_x, dx), pan_y: shift(self.pan_y, dy), ..self }
     }
 }
 
@@ -285,6 +311,8 @@ pub fn orbit(item: &Item) -> Orbit {
         yaw: wrap_degrees(read("yaw", fallback.yaw)),
         pitch: read("pitch", fallback.pitch).clamp(-PITCH_LIMIT, PITCH_LIMIT),
         dist: read("dist", fallback.dist).clamp(DIST_MIN, DIST_MAX),
+        pan_x: read("pan_x", fallback.pan_x).clamp(-PAN_LIMIT, PAN_LIMIT),
+        pan_y: read("pan_y", fallback.pan_y).clamp(-PAN_LIMIT, PAN_LIMIT),
     }
 }
 
@@ -293,6 +321,8 @@ pub fn set_orbit(item: &mut Item, orbit: Orbit) {
     out.insert("yaw".into(), json_number(round_to(orbit.yaw, 100.0) as f64));
     out.insert("pitch".into(), json_number(round_to(orbit.pitch, 100.0) as f64));
     out.insert("dist".into(), json_number(round_to(orbit.dist, 1000.0) as f64));
+    out.insert("pan_x".into(), json_number(round_to(orbit.pan_x, 1000.0) as f64));
+    out.insert("pan_y".into(), json_number(round_to(orbit.pan_y, 1000.0) as f64));
     item.meta.insert("orbit".into(), Value::Object(out));
 }
 
@@ -540,12 +570,25 @@ mod tests {
     #[test]
     fn a_camera_survives_a_round_trip_through_meta() {
         let mut it = item(ItemType::Model);
-        let sent = Orbit::default().turned(-95.0, 12.0).dollied(0.6);
+        let sent = Orbit::default().turned(-95.0, 12.0).dollied(0.6).panned(0.4, -0.2);
         set_orbit(&mut it, sent);
         let back = orbit(&it);
         assert!((back.yaw - sent.yaw).abs() < 0.01, "{back:?} != {sent:?}");
         assert!((back.pitch - sent.pitch).abs() < 0.01, "{back:?} != {sent:?}");
         assert!((back.dist - sent.dist).abs() < 0.01, "{back:?} != {sent:?}");
+        assert!((back.pan_x - sent.pan_x).abs() < 0.01, "{back:?} != {sent:?}");
+        assert!((back.pan_y - sent.pan_y).abs() < 0.01, "{back:?} != {sent:?}");
+    }
+
+    #[test]
+    fn a_camera_cannot_be_panned_off_into_the_distance() {
+        let far = Orbit::default().panned(400.0, -400.0);
+        assert_eq!(far.pan_x, PAN_LIMIT);
+        assert_eq!(far.pan_y, -PAN_LIMIT);
+        // A nonsense shift leaves it where it was, same as `dollied`'s guard.
+        let unmoved = Orbit::default().panned(f32::NAN, f32::NAN);
+        assert_eq!(unmoved.pan_x, Orbit::default().pan_x);
+        assert_eq!(unmoved.pan_y, Orbit::default().pan_y);
     }
 
     #[test]

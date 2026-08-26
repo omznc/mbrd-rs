@@ -28,11 +28,15 @@
 //! [`Live::sweep`] hands that queue to the window once a frame from the one
 //! place in `render` that has one. Both halves are needed; either alone leaks.
 
-// Nothing produces a live frame yet: the video decoder and the mesh rasteriser
-// are what fill this, and neither has landed. It is here ahead of them rather
-// than alongside them because the discipline above is the part that is easy to
-// get wrong under time pressure, and because it is testable now — the five
-// tests below are what say the tiles are released, and they run today.
+// Nothing produces a live frame yet: the video decoder and a *turning* mesh
+// view are what would fill this, and neither has landed. A mesh rasteriser
+// has, in `mbrd_core::mesh` and `images::decode` — but as a fixed three-quarter
+// still, keyed by content hash like any other picture, because `VIEWING.md`
+// chose to start fixed. A draggable view is what would move it here. This
+// module is ahead of both rather than alongside them because the discipline
+// above is the part that is easy to get wrong under time pressure, and
+// because it is testable now — the five tests below are what say the tiles
+// are released, and they run today.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
