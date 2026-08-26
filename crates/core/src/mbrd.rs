@@ -6,7 +6,7 @@
 //! ├── manifest.json               what this file is
 //! ├── board.json                  the board itself
 //! ├── assets/<slug>--<hash>.<ext> embedded bytes, deduped by content hash
-//! ├── notes/<slug>--<id>.md       one sticky note, as Markdown
+//! ├── notes/<slug>--<id>.md       one note, as Markdown
 //! └── waveforms/<hash>.json       one audio file's measured readings
 //! ```
 //!
@@ -33,7 +33,7 @@ use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use crate::model::{Board, ItemType, NOTE_MAX};
+use crate::model::{Board, ItemAsset, ItemType, NOTE_MAX};
 use crate::schema;
 use crate::state::{self, BoardState};
 
@@ -226,18 +226,40 @@ pub fn read_watched<R: Read + Seek>(
     // rezip, and the board opens with your edit. That is the entire point of
     // writing them, and it is the one place in this reader where a sidecar wins
     // over the record it was derived from.
+    //
+    // **A note with no asset that has grown past `NOTE_MAX` is promoted, not
+    // clipped.** A typed note's only copy of its words used to be `meta.text`
+    // itself, so a person who opened the `.md` by hand and kept writing had
+    // everything past the 512th character silently dropped on the next open —
+    // the one case this format's "legible archive" promise was actually a trap.
+    // The fix mirrors what already happens to a dropped `.md` file: the full
+    // text becomes an asset, keyed by its own hash like any other embedded
+    // bytes, and `meta.text` steps down to being the derived head it already is
+    // for every asset-backed note. This runs once — the moment it does, the
+    // note has an asset, and every path above and below this one already knows
+    // to prefer it (see `opened::words_of` in the app crate).
     for item in &mut board.items {
         if item.kind != ItemType::Note {
             continue;
         }
-        if let Some(text) = notes.get(&item.id) {
-            let text: String = text.trim_end_matches('\n').chars().take(NOTE_MAX).collect();
-            item.meta.insert("text".into(), Value::String(text));
-            // `rich` flattens to `text` and is authoritative over it, so a hand
-            // edit to the Markdown has to drop it or the edit would be shown
-            // only until the next render.
-            item.meta.remove("rich");
+        let Some(raw) = notes.get(&item.id) else { continue };
+        let text = raw.trim_end_matches('\n');
+        if item.asset.is_none() && text.chars().count() > NOTE_MAX {
+            let bytes = text.as_bytes().to_vec();
+            let hash = hash_bytes(&bytes);
+            assets.entry(hash.clone()).or_insert(Asset {
+                bytes,
+                ext: "md".into(),
+                label: String::new(),
+            });
+            item.asset = Some(ItemAsset::Embedded { hash, family: None });
         }
+        let head: String = text.chars().take(NOTE_MAX).collect();
+        item.meta.insert("text".into(), Value::String(head));
+        // `rich` flattens to `text` and is authoritative over it, so a hand
+        // edit to the Markdown has to drop it or the edit would be shown
+        // only until the next render.
+        item.meta.remove("rich");
     }
 
     // Where the title is missing from the board, the manifest supplies one.
@@ -356,13 +378,12 @@ pub fn write<W: Write + Seek>(writer: W, doc: &Document, now: &str) -> Result<()
         }
     }
 
-    // The two measurements the file records rather than derives. Both are
-    // stamped here and nowhere else, because here is where the board stops
-    // being something being edited and becomes something somebody else will
-    // open — possibly straight into a layout where the measurement cannot be
-    // taken. See `fence` and `stick` for why each is written down at all.
+    // The one measurement the file records rather than derives. It is stamped
+    // here and nowhere else, because here is where the board stops being
+    // something being edited and becomes something somebody else will open —
+    // possibly straight into a layout where the measurement cannot be taken.
+    // See `fence` for why it is written down at all.
     crate::fence::stamp(&mut board.items);
-    crate::stick::stamp(&mut board.items);
 
     // **The bin does not go in the file.** It is a within-a-session thing here
     // — see `model::TrashEntry`, which is where the reasoning is written down —
@@ -719,6 +740,49 @@ mod tests {
         let back = read(Cursor::new(rezipped)).unwrap();
         let note = back.board.item("p81m4x").unwrap();
         assert_eq!(note.note_text(), Some("# get the big one after all"));
+    }
+
+    #[test]
+    fn a_hand_edited_note_that_grows_past_note_max_is_promoted_not_clipped() {
+        // Before this fix, a note's only copy of its words was `meta.text`
+        // itself, so growing the `.md` sidecar past 512 characters by hand and
+        // reopening it silently dropped everything past the 512th character.
+        let doc = doc_with_a_photo_and_a_note();
+        let packed = to_bytes(&doc, "now").unwrap();
+
+        let mut zip = ZipArchive::new(Cursor::new(packed)).unwrap();
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 0..zip.len() {
+            let mut e = zip.by_index(i).unwrap();
+            let name = e.name().to_string();
+            let mut b = Vec::new();
+            e.read_to_end(&mut b).unwrap();
+            entries.push((name, b));
+        }
+
+        let long = "x".repeat(NOTE_MAX * 3);
+        let mut out = ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, body) in entries {
+            out.start_file(&name, SimpleFileOptions::default()).unwrap();
+            if name.starts_with("notes/") {
+                out.write_all(long.as_bytes()).unwrap();
+            } else {
+                out.write_all(&body).unwrap();
+            }
+        }
+        let rezipped = out.finish().unwrap().into_inner();
+
+        let back = read(Cursor::new(rezipped)).unwrap();
+        let note = back.board.item("p81m4x").unwrap();
+
+        // `meta.text` is now the derived head, not the whole thing.
+        assert_eq!(note.note_text().unwrap().chars().count(), NOTE_MAX);
+
+        // The full text survived, as the note's own asset.
+        let hash = note.asset.as_ref().and_then(ItemAsset::hash).expect("promoted to an asset");
+        let asset = back.assets.get(hash).expect("the asset's bytes are in the archive");
+        assert_eq!(asset.bytes, long.as_bytes());
+        assert_eq!(asset.ext, "md");
     }
 
     #[test]
