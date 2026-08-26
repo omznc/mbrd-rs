@@ -62,6 +62,12 @@ pub struct Ready {
     /// `None` means nobody managed to look, which the card reads as "assume
     /// there is sound" — see [`mbrd_core::sound`].
     pub sound: Option<bool>,
+    /// A PDF's page count, where the file could be parsed.
+    pub pages: Option<u64>,
+    /// A font's own family name, read out of its `name` table.
+    pub family: Option<String>,
+    /// A binary STL's triangle count, read off its header alone.
+    pub triangles: Option<u32>,
 }
 
 impl Ready {
@@ -101,6 +107,37 @@ pub fn ready(name: &str, bytes: Vec<u8>) -> Ready {
     // into — and that is a walk of the track list, not a decode.
     let sound = matches!(kind, ItemType::Video).then(|| mbrd_core::sound::sniff(&bytes)).flatten();
 
+    // The page count, not the pages: a page count is a fact the information
+    // rail can say without opening the file at every frame it is drawn on
+    // (see `mbrd_core::facts`), while the text on the page is decoded from
+    // scratch each time the card is opened, in `opened.rs`, the same split
+    // `naturalWidth` keeps with the pixels of a picture.
+    let pages = (ext == "pdf").then(|| page_count(&bytes)).flatten();
+
+    // Only the raw SFNT shapes here — `font_family` cannot open a WOFF any
+    // more than `Preview::Font` claims to, see `preview::is_font`.
+    let family =
+        matches!(ext.as_str(), "ttf" | "otf" | "ttc").then(|| font_family(&bytes)).flatten();
+
+    // A binary STL's count is four bytes read, not a mesh parsed — the same
+    // "measured, not decoded" split `pages` and `family` keep above. An OBJ or
+    // a GLB have no such shortcut, so their count costs the same parse
+    // `images::decode` will do again at the first frame that wants to draw
+    // one; both still happen once here rather than on every frame the rail is
+    // redrawn. A `.stl` that turned out to be the ASCII variant, or an `.obj`
+    // or `.glb` that will not parse, is still a `Model` card, just one with no
+    // count and no rasterised still yet. See `mbrd_core::mesh`.
+    let triangles = match ext.as_str() {
+        "stl" if mbrd_core::mesh::is_stl(&bytes) => mbrd_core::mesh::triangle_count(&bytes),
+        "obj" if mbrd_core::mesh::is_obj(&bytes) => {
+            mbrd_core::mesh::obj(&bytes).map(|m| m.triangles.len() as u32)
+        }
+        "glb" if mbrd_core::mesh::is_glb(&bytes) => {
+            mbrd_core::mesh::glb(&bytes).map(|m| m.triangles.len() as u32)
+        }
+        _ => None,
+    };
+
     Ready {
         kind,
         described,
@@ -110,7 +147,33 @@ pub fn ready(name: &str, bytes: Vec<u8>) -> Ready {
         name: name.to_string(),
         text,
         sound,
+        pages,
+        family,
+        triangles,
     }
+}
+
+/// How many pages a PDF has, without extracting anything out of them.
+fn page_count(bytes: &[u8]) -> Option<u64> {
+    Some(lopdf::Document::load_mem(bytes).ok()?.get_pages().len() as u64)
+}
+
+/// A font's own name for itself, preferring the typographic family — the one
+/// meant for display — over the compatibility name some fonts still carry
+/// from the sixteen-style-per-family era.
+fn font_family(bytes: &[u8]) -> Option<String> {
+    let face = ttf_parser::Face::parse(bytes, 0).ok()?;
+    let mut family = None;
+    let mut typographic = None;
+    for name in face.names() {
+        if name.name_id == ttf_parser::name_id::FAMILY && family.is_none() {
+            family = name.to_string();
+        }
+        if name.name_id == ttf_parser::name_id::TYPOGRAPHIC_FAMILY && typographic.is_none() {
+            typographic = name.to_string();
+        }
+    }
+    typographic.or(family)
 }
 
 /// Everything a drop points at, as a list of files to read.
@@ -194,6 +257,26 @@ pub fn card(ready: &Ready, id: String, at: mbrd_core::geometry::Point, z: f32) -
     if let Some(sound) = ready.sound {
         mbrd_core::media::set_has_sound(&mut item, sound);
     }
+    // The picture's own size, under the names the web platform uses for it —
+    // this format came from a browser and a reader that has seen a DOM already
+    // knows what `naturalWidth` means. Written because it is otherwise thrown
+    // away the moment the card has been shaped by it, and because the size a
+    // card was *dropped* at says nothing about the size of the file: an
+    // information rail that could not say how big a photograph is would be a
+    // rail missing the first thing anybody asks. See `mbrd_core::facts`.
+    if let Some((w, h)) = ready.natural {
+        item.meta.insert("naturalWidth".into(), serde_json::Value::from(w));
+        item.meta.insert("naturalHeight".into(), serde_json::Value::from(h));
+    }
+    if let Some(pages) = ready.pages {
+        item.meta.insert("pages".into(), serde_json::Value::from(pages));
+    }
+    if let Some(family) = &ready.family {
+        item.meta.insert("family".into(), serde_json::Value::from(family.clone()));
+    }
+    if let Some(triangles) = ready.triangles {
+        item.meta.insert("triangles".into(), serde_json::Value::from(triangles));
+    }
 
     item.asset = Some(ItemAsset::Embedded { hash: ready.hash.clone(), family: None });
     item
@@ -248,11 +331,27 @@ fn stem(name: &str) -> String {
 
 /// The extension, lowercased, or `bin` for a file that has none.
 fn extension(name: &str) -> String {
-    Path::new(name)
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .filter(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()) && e.len() <= 12)
-        .unwrap_or_else(|| "bin".into())
+    fn valid(s: &str) -> bool {
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric()) && s.len() <= 12
+    }
+    let path = Path::new(name);
+    if let Some(e) = path.extension() {
+        let e = e.to_string_lossy().to_lowercase();
+        if valid(&e) {
+            return e;
+        }
+    }
+    // A dotless name can still be a recognised convention — `Dockerfile`,
+    // `Makefile` — rather than nothing, and the same filter that keeps a
+    // stray path out of an extension keeps a stray sentence out of this
+    // fallback: `no-extension-at-all` has a hyphen and stays `bin`.
+    if let Some(base) = path.file_name() {
+        let base = base.to_string_lossy().to_lowercase();
+        if valid(&base) {
+            return base;
+        }
+    }
+    "bin".into()
 }
 
 /// What kind of thing this is: the card type, a name for it, and the extension
@@ -289,9 +388,11 @@ fn sniff(bytes: &[u8]) -> Option<(ItemType, &'static str, &'static str)> {
         _ if starts(b"BM") => (ItemType::Image, "bitmap image", "bmp"),
         _ if starts(b"II*\0") || starts(b"MM\0*") => (ItemType::Image, "TIFF image", "tiff"),
         _ if starts(b"qoif") => (ItemType::Image, "QOI image", "qoi"),
-        _ if brand == Some(b"avif") => (ItemType::Image, "AVIF image", "avif"),
+        // Named, but not `Image` — see `by_extension` for why these four are the
+        // one family this build classifies away from what they truthfully are.
+        _ if brand == Some(b"avif") => (ItemType::Generic, "AVIF image", "avif"),
         _ if matches!(brand, Some(b"heic") | Some(b"heix") | Some(b"mif1")) => {
-            (ItemType::Image, "HEIF image", "heic")
+            (ItemType::Generic, "HEIF image", "heic")
         }
 
         _ if matches!(brand, Some(b"qt  ")) => (ItemType::Video, "QuickTime video", "mov"),
@@ -313,8 +414,17 @@ fn sniff(bytes: &[u8]) -> Option<(ItemType, &'static str, &'static str)> {
             (ItemType::Audio, "MPEG audio", "mp3")
         }
 
-        _ if starts(b"glTF") => (ItemType::Model, "glTF model", "glb"),
+        _ if mbrd_core::mesh::is_glb(bytes) => (ItemType::Model, "glTF model", "glb"),
+        _ if mbrd_core::mesh::is_stl(bytes) => (ItemType::Model, "STL mesh", "stl"),
         _ if starts(b"%PDF-") => (ItemType::Generic, "PDF document", "pdf"),
+
+        _ if starts(b"OTTO") => (ItemType::Generic, "OpenType font", "otf"),
+        _ if starts(&[0x00, 0x01, 0x00, 0x00]) || starts(b"true") => {
+            (ItemType::Generic, "TrueType font", "ttf")
+        }
+        _ if starts(b"ttcf") => (ItemType::Generic, "TrueType collection", "ttc"),
+        _ if starts(b"wOFF") => (ItemType::Generic, "WOFF font", "woff"),
+        _ if starts(b"wOF2") => (ItemType::Generic, "WOFF2 font", "woff2"),
         _ => return None,
     })
 }
@@ -322,11 +432,19 @@ fn sniff(bytes: &[u8]) -> Option<(ItemType, &'static str, &'static str)> {
 /// What the name claims, for bytes that gave nothing away.
 fn by_extension(ext: &str) -> (ItemType, &'static str) {
     match ext {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "avif" | "heic"
-        | "heif" | "qoi" | "ico" | "tga" | "exr" | "hdr" | "jxl" => (ItemType::Image, "image"),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "qoi" | "ico"
+        | "tga" | "exr" | "hdr" => (ItemType::Image, "image"),
         // Vector, so it never has magic bytes worth trusting — an SVG is XML
         // and may start with a comment, a declaration or the tag itself.
         "svg" => (ItemType::Image, "SVG image"),
+        // Real pictures that nothing in this tree can decode: AVIF wants
+        // `dav1d`, and HEIC and JPEG XL the `image` crate does not do at all.
+        // Calling them images would put a card on the board that can never draw
+        // — a permanently empty frame, which is worse than the named file card
+        // every other unopenable format already gets. Reclassified rather than
+        // dropped: the bytes are kept, so a build that grows a decoder can call
+        // them images again. See `VIEWING.md`.
+        "avif" | "heic" | "heif" | "jxl" => (ItemType::Generic, "image"),
 
         "mp4" | "m4v" | "mov" | "webm" | "mkv" | "avi" | "wmv" | "flv" | "mpg" | "mpeg" | "ogv"
         | "3gp" | "mts" => (ItemType::Video, "video"),
@@ -339,9 +457,11 @@ fn by_extension(ext: &str) -> (ItemType, &'static str) {
 
         "md" | "markdown" | "txt" | "text" | "rst" | "org" => (ItemType::Note, "text"),
 
-        "ttf" | "otf" | "woff" | "woff2" => (ItemType::Generic, "font"),
+        "ttf" | "otf" | "ttc" | "woff" | "woff2" => (ItemType::Generic, "font"),
         "pdf" => (ItemType::Generic, "PDF document"),
-        "zip" | "tar" | "gz" | "7z" | "rar" | "xz" | "zst" => (ItemType::Generic, "archive"),
+        "zip" | "tar" | "gz" | "tgz" | "7z" | "rar" | "xz" | "zst" => {
+            (ItemType::Generic, "archive")
+        }
 
         // Not a failure. An unknown file arrives as a named card holding its own
         // bytes, which is what lets a board be a place you put things before you
@@ -408,6 +528,123 @@ mod tests {
         assert_eq!(ext, "xyzzy");
     }
 
+    /// A PDF with `n` empty pages and nothing in them — page count only reads
+    /// the page tree, not a single content stream, so that is all this builds.
+    fn built_pdf(n: usize) -> Vec<u8> {
+        use lopdf::{dictionary, Document, Object};
+
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let kids: Vec<Object> = (0..n)
+            .map(|_| doc.add_object(dictionary! { "Type" => "Page", "Parent" => pages_id }).into())
+            .collect();
+        let tree = dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => n as i64 };
+        doc.objects.insert(pages_id, Object::Dictionary(tree));
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn a_pdfs_page_count_is_read_at_import() {
+        let file = ready("report.pdf", built_pdf(3));
+        assert_eq!(file.pages, Some(3));
+    }
+
+    #[test]
+    fn a_file_that_is_not_really_a_pdf_gets_no_page_count() {
+        let file = ready("report.pdf", b"not actually a pdf".to_vec());
+        assert_eq!(file.pages, None);
+    }
+
+    #[test]
+    fn a_true_type_or_open_type_font_says_its_own_family_name() {
+        // Built by hand-writing a valid `name` table is its own small project,
+        // so this reads one of whatever real fonts the machine running the
+        // test already has, and checks `font_family` against `fontdb`'s own
+        // reading of the same file — two independent parsers of the same
+        // bytes, agreeing.
+        let mut db = resvg::usvg::fontdb::Database::new();
+        db.load_system_fonts();
+        let agree = db.faces().find_map(|face| {
+            let resvg::usvg::fontdb::Source::File(path) = &face.source else { return None };
+            let bytes = std::fs::read(path).ok()?;
+            let ours = font_family(&bytes)?;
+            Some((ours, face.families.first()?.0.clone()))
+        });
+        let (ours, fontdbs) = agree.expect("a dev machine has at least one file-backed TTF or OTF");
+        assert_eq!(ours, fontdbs);
+    }
+
+    #[test]
+    fn a_font_that_will_not_parse_has_no_family_name() {
+        assert_eq!(font_family(b"not a font at all"), None);
+    }
+
+    fn binary_stl(triangles: u32) -> Vec<u8> {
+        let mut out = vec![0_u8; 84];
+        out[80..84].copy_from_slice(&triangles.to_le_bytes());
+        out.resize(84 + triangles as usize * 50, 0);
+        out
+    }
+
+    #[test]
+    fn a_binary_stls_triangle_count_is_read_at_import() {
+        let file = ready("part.stl", binary_stl(6));
+        assert_eq!(file.triangles, Some(6));
+        assert_eq!(file.kind, ItemType::Model);
+    }
+
+    #[test]
+    fn an_ascii_stl_gets_no_triangle_count_yet() {
+        let file = ready("part.stl", b"solid part\nendsolid part\n".to_vec());
+        assert_eq!(file.triangles, None);
+    }
+
+    #[test]
+    fn an_objs_triangle_count_is_read_at_import() {
+        let obj = b"v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3 4\n".to_vec();
+        let file = ready("part.obj", obj);
+        assert_eq!(file.triangles, Some(2), "a quad fans into two triangles");
+        assert_eq!(file.kind, ItemType::Model);
+    }
+
+    #[test]
+    fn a_file_named_obj_that_is_not_one_gets_no_triangle_count() {
+        let file = ready("part.obj", b"this is not a wavefront file at all\n".to_vec());
+        assert_eq!(file.triangles, None);
+    }
+
+    #[test]
+    fn a_glbs_triangle_count_is_read_at_import() {
+        let json = br#"{"bufferViews":[],"accessors":[],"meshes":[]}"#;
+        let mut glb = Vec::new();
+        glb.extend_from_slice(b"glTF");
+        glb.extend_from_slice(&2_u32.to_le_bytes());
+        glb.extend_from_slice(&(12 + 8 + json.len() as u32).to_le_bytes());
+        glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"JSON");
+        glb.extend_from_slice(json);
+        // No meshes at all, so no triangles — the count is still `None`
+        // rather than the import failing, the same as the ASCII STL above.
+        let file = ready("model.glb", glb);
+        assert_eq!(file.triangles, None);
+        assert_eq!(file.kind, ItemType::Model, "the magic alone is enough to classify it");
+    }
+
+    #[test]
+    fn a_dotless_convention_name_is_its_own_extension() {
+        // `LANGUAGES` in `preview.rs` carries `dockerfile` and `makefile` rows
+        // precisely so these are not stranded as `bin`.
+        let (_, _, ext) = classify("Dockerfile", b"FROM rust:latest\n");
+        assert_eq!(ext, "dockerfile");
+        let (_, _, ext) = classify("Makefile", b"all:\n\techo hi\n");
+        assert_eq!(ext, "makefile");
+    }
+
     #[test]
     fn an_extension_that_is_not_one_does_not_become_an_archive_entry() {
         // `ext` ends up in a path inside the ZIP, so a name like
@@ -430,10 +667,16 @@ mod tests {
         m4a.extend_from_slice(b"\0\0\0\0");
         assert_eq!(classify("track", &m4a).0, ItemType::Audio);
 
+        // Told apart from an MP4, and still not classified as an image: nothing
+        // in this tree can decode AVIF, and a card that can never draw is worse
+        // than a named file card. The description is what keeps the knowledge.
         let mut avif = vec![0, 0, 0, 0x18];
         avif.extend_from_slice(b"ftypavif");
         avif.extend_from_slice(b"\0\0\0\0");
-        assert_eq!(classify("photo", &avif).0, ItemType::Image);
+        let (kind, described, ext) = classify("photo", &avif);
+        assert_eq!(kind, ItemType::Generic);
+        assert_eq!(described, "AVIF image");
+        assert_eq!(ext, "avif");
 
         let mut wav = b"RIFF".to_vec();
         wav.extend_from_slice(&[0, 0, 0, 0]);

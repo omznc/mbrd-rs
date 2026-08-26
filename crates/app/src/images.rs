@@ -65,7 +65,7 @@ const BUDGET: usize = 250 * 1024 * 1024;
 /// inside [`BUDGET`], which is why zooming *in* cannot thrash the cache either.
 /// Raising this would drop that ceiling quadratically and raise the resting
 /// cost quadratically; lowering it does the reverse.
-const THUMB_SIDE: u32 = 256;
+pub(crate) const THUMB_SIDE: u32 = 256;
 
 /// The longest side the **sharp** copy of an image is kept at, in pixels.
 ///
@@ -93,7 +93,7 @@ const THUMB_SIDE: u32 = 256;
 ///
 /// This is the copy that is evicted under pressure, and the only one. See
 /// [`THUMB_SIDE`], which is the floor it falls back to.
-const LONGEST_SIDE: u32 = 1024;
+pub(crate) const LONGEST_SIDE: u32 = 1024;
 
 /// The longest side an **animated** picture's frames are kept at.
 ///
@@ -226,8 +226,8 @@ enum Sharp {
 /// What a decode produced: the thumbnail, and the sharp copy if the picture is
 /// large enough for the two to differ.
 pub struct Decoded {
-    thumb: Arc<RenderImage>,
-    sharp: Option<Arc<RenderImage>>,
+    pub(crate) thumb: Arc<RenderImage>,
+    pub(crate) sharp: Option<Arc<RenderImage>>,
 }
 
 /// Decoded pictures, keyed by content hash, oldest thrown out first.
@@ -660,7 +660,11 @@ fn cost_of(image: &Arc<RenderImage>) -> usize {
 ///
 /// Returns `None` for anything that is not a picture this build can read, which
 /// includes every video and audio file — those cards draw their `meta.cover`
-/// instead, and the cover is a picture.
+/// instead, and the cover is a picture — and every mesh. A mesh's raster
+/// depends on which way its camera is turned, which is a fact about the
+/// *card*, not about its bytes, so meshes are decoded in `mesh_cache` instead
+/// of here: this function stays a pure function of bytes alone, which every
+/// other picture in this cache still is.
 ///
 /// **A picture may be more than one frame.** A GIF, an APNG and an animated
 /// WebP come back with every frame and the delay between each, because
@@ -669,6 +673,13 @@ fn cost_of(image: &Arc<RenderImage>) -> usize {
 /// here: no decoder, no dependency, and a card that was showing a still frame
 /// of a GIF now shows the GIF.
 pub fn decode(bytes: &[u8]) -> Option<Decoded> {
+    // Asked first and by the bytes, the same rule every other classification in
+    // this tree follows: `image::ImageReader` cannot guess a text format at
+    // all, so this is not a shortcut past its sniffing, it is the only sniffing
+    // there is going to be.
+    if is_svg(bytes) {
+        return svg(bytes);
+    }
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
     // The catalogue is not trusted for this — the extension in the archive is
     // a hint for rebuilding a media type, not a promise about the contents.
@@ -781,6 +792,160 @@ fn moving(bytes: &[u8], format: Option<image::ImageFormat>) -> Option<Vec<Frame>
     })
 }
 
+// ---------------------------------------------------------------------------
+// Vector
+// ---------------------------------------------------------------------------
+
+/// Whether these bytes are (probably) SVG.
+///
+/// `image::ImageReader` has no way to guess a text format at all — there is no
+/// magic byte for XML — so this is the whole of the sniffing that decides
+/// whether a card's asset is handed to `resvg` or to the raster path below.
+/// Only the common case is covered: a document opening straight into `<?xml`
+/// or `<svg`, past an optional UTF-8 BOM. A file that leads with a comment
+/// before either still opens as `Source` today, which is the same "close but
+/// not universal" trade the rest of this crate's sniffing already makes.
+fn is_svg(bytes: &[u8]) -> bool {
+    let mut b = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    while let Some((&c, rest)) = b.split_first() {
+        if !c.is_ascii_whitespace() {
+            break;
+        }
+        b = rest;
+    }
+    b.starts_with(b"<?xml") || b.starts_with(b"<svg")
+}
+
+/// A process-wide font database, built once.
+///
+/// Loading every system font is not cheap, and unlike a decoded picture this
+/// has nothing to do with any one asset's content hash — the same fonts serve
+/// every SVG this session ever rasterises, so it is built at most once rather
+/// than once per unique file. Most board SVGs are icons and logos with no
+/// `<text>` at all, but the ones that do carry text want real fonts rather
+/// than silently missing words.
+fn fontdb() -> (Arc<resvg::usvg::fontdb::Database>, Option<String>) {
+    static DB: std::sync::OnceLock<(Arc<resvg::usvg::fontdb::Database>, Option<String>)> =
+        std::sync::OnceLock::new();
+    DB.get_or_init(|| {
+        let mut db = resvg::usvg::fontdb::Database::new();
+        db.load_system_fonts();
+        let default_family = set_generic_families(&mut db);
+        (Arc::new(db), default_family)
+    })
+    .clone()
+}
+
+/// Point `fontdb`'s generic families at whatever is actually installed, and
+/// hand back a serif (or, failing that, sans-serif) family name to use as the
+/// document default.
+///
+/// `fontdb`'s own generic defaults are Windows font names — serif is "Times
+/// New Roman", sans-serif is "Arial" — and `load_system_fonts` only loads
+/// what is actually on the machine; unlike `fontconfig`, it does not alias one
+/// to the other. Left alone, a Linux box that has never heard of "Times New
+/// Roman" resolves nothing for a `<text>` element that does not name its own
+/// font, and the words are silently absent rather than merely in the wrong
+/// face. This is a heuristic — matching on a loaded face's own family name —
+/// rather than a real font-matching engine, but it is what turns "no font
+/// found" into "some reasonable font found" on every platform this build
+/// ships for, `fontconfig` or none.
+fn set_generic_families(db: &mut resvg::usvg::fontdb::Database) -> Option<String> {
+    let mut serif = None;
+    let mut sans = None;
+    let mut mono = None;
+    for face in db.faces() {
+        let Some((name, _)) = face.families.first() else { continue };
+        let lower = name.to_ascii_lowercase();
+        if face.monospaced && mono.is_none() {
+            mono = Some(name.clone());
+        } else if lower.contains("sans") && sans.is_none() {
+            sans = Some(name.clone());
+        } else if lower.contains("serif") && !lower.contains("sans") && serif.is_none() {
+            serif = Some(name.clone());
+        }
+        if serif.is_some() && sans.is_some() && mono.is_some() {
+            break;
+        }
+    }
+    // Cursive and fantasy have no naming convention reliable enough to search
+    // for, so they are left at `fontdb`'s own guess.
+    if let Some(name) = &serif {
+        db.set_serif_family(name.clone());
+    }
+    if let Some(name) = &sans {
+        db.set_sans_serif_family(name.clone());
+    }
+    if let Some(name) = mono {
+        db.set_monospace_family(name);
+    }
+    serif.or(sans)
+}
+
+/// Rasterise an SVG at both tiers.
+///
+/// Unlike a raster picture, a vector has no native resolution to be short of —
+/// `resvg` re-renders the whole document from its paths at whatever size is
+/// asked for, so both tiers are rendered directly from the one parsed tree
+/// rather than one being resampled from the other the way [`shrink`] resamples
+/// a decoded raster. There is no "already smaller than a thumbnail" case to
+/// skip a second copy for, either: rendering a vector twice costs the same
+/// either way its target size compares to the document's own.
+fn svg(bytes: &[u8]) -> Option<Decoded> {
+    let mut opt = resvg::usvg::Options::default();
+    let (fontdb, default_family) = fontdb();
+    opt.fontdb = fontdb;
+    if let Some(family) = default_family {
+        opt.font_family = family;
+    }
+    let tree = resvg::usvg::Tree::from_data(bytes, &opt).ok()?;
+
+    let size = tree.size();
+    let longest = size.width().max(size.height());
+    if longest.is_nan() || longest <= 0.0 {
+        return None;
+    }
+    let thumb = one_svg(&tree, longest, THUMB_SIDE)?;
+    let sharp = one_svg(&tree, longest, LONGEST_SIDE)?;
+    Some(Decoded { thumb, sharp: Some(sharp) })
+}
+
+/// One rendering of a parsed tree, scaled so its longest side lands on
+/// `target`.
+fn one_svg(tree: &resvg::usvg::Tree, longest: f32, target: u32) -> Option<Arc<RenderImage>> {
+    let scale = target as f32 / longest;
+    let size = tree.size();
+    let w = ((size.width() * scale).round() as u32).max(1);
+    let h = ((size.height() * scale).round() as u32).max(1);
+
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h)?;
+    resvg::render(
+        tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+
+    let mut rgba = straighten(pixmap.take(), w, h);
+    to_bgra(&mut rgba);
+    Some(Arc::new(RenderImage::new(vec![Frame::new(rgba)])))
+}
+
+/// `tiny_skia` hands back premultiplied RGBA; every raster decoder in this
+/// crate hands back straight alpha, which is the convention [`to_bgra`] and
+/// the atlas beyond it are written against. Converting once here is cheaper
+/// than teaching the rest of the pipeline a second convention for one source.
+fn straighten(mut data: Vec<u8>, w: u32, h: u32) -> RgbaImage {
+    for px in data.as_chunks_mut::<4>().0 {
+        let a = u32::from(px[3]);
+        if a != 0 && a != 255 {
+            px[0] = ((u32::from(px[0]) * 255) / a) as u8;
+            px[1] = ((u32::from(px[1]) * 255) / a) as u8;
+            px[2] = ((u32::from(px[2]) * 255) / a) as u8;
+        }
+    }
+    RgbaImage::from_raw(w, h, data).expect("a pixmap's own dimensions fit its own buffer")
+}
+
 /// Halve an animation in place, keeping every other frame and giving each of
 /// them the time the frame it replaced would have had.
 ///
@@ -814,7 +979,7 @@ fn thin(held: &mut Vec<(RgbaImage, Duration)>) -> usize {
 ///
 /// Done here rather than at paint time so it is paid once, off the main thread,
 /// instead of on every upload.
-fn to_bgra(rgba: &mut RgbaImage) {
+pub(crate) fn to_bgra(rgba: &mut RgbaImage) {
     for pixel in rgba.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
@@ -860,6 +1025,84 @@ mod tests {
         let size = image.size(0);
         size.width.0.max(size.height.0)
     }
+
+    /// A tiny SVG: a red square on a transparent field, wide rather than
+    /// square, so the two axes are told apart in a test.
+    fn svg_bytes(w: u32, h: u32) -> Vec<u8> {
+        format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">
+                <rect width="{w}" height="{h}" fill="#ff0000"/>
+            </svg>"##
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn svg_bytes_are_recognised_with_or_without_a_prolog() {
+        assert!(is_svg(b"<svg width=\"1\" height=\"1\"/>"));
+        assert!(is_svg(b"<?xml version=\"1.0\"?><svg/>"));
+        assert!(is_svg(b"  \n\t<svg/>"), "leading whitespace should not matter");
+        assert!(is_svg(b"\xEF\xBB\xBF<svg/>"), "nor a UTF-8 BOM");
+        assert!(!is_svg(&png(4, 4)), "a real PNG must not be mistaken for one");
+        assert!(!is_svg(b"just some words"));
+    }
+
+    #[test]
+    fn an_svg_rasterises_to_both_tiers_at_the_right_proportions() {
+        // Twice as wide as it is tall, so width rather than height is the
+        // longest side both tiers are scaled to.
+        let decoded = decode(&svg_bytes(200, 100)).expect("that is an svg");
+        let thumb = decoded.thumb.size(0);
+        assert_eq!(thumb.width.0, THUMB_SIDE as i32);
+        assert_eq!(thumb.height.0, (THUMB_SIDE / 2) as i32);
+
+        let sharp = decoded.sharp.expect("a vector always gets a second tier").size(0);
+        assert_eq!(sharp.width.0, LONGEST_SIDE as i32);
+        assert_eq!(sharp.height.0, (LONGEST_SIDE / 2) as i32);
+    }
+
+    #[test]
+    fn an_svgs_fill_colour_survives_un_premultiplying_and_the_channel_swap() {
+        let decoded = decode(&svg_bytes(64, 64)).expect("that is an svg");
+        let size = decoded.thumb.size(0);
+        let bytes = decoded.thumb.as_bytes(0).expect("one frame");
+        let (x, y) = (size.width.0 as usize / 2, size.height.0 as usize / 2);
+        let at = (y * size.width.0 as usize + x) * 4;
+        // BGRA: opaque red is (0, 0, 255, 255) once the channels are swapped.
+        assert_eq!(&bytes[at..at + 4], [0, 0, 255, 255], "got {:?}", &bytes[at..at + 4]);
+    }
+
+    #[test]
+    fn something_that_starts_like_svg_and_is_not_fails_quietly() {
+        assert!(decode(b"<svg this is not actually valid xml").is_none());
+    }
+
+    #[test]
+    fn text_with_no_font_family_still_draws_something() {
+        // `usvg`'s own default is the literal string "Times New Roman", which
+        // resolves to nothing at all on a Linux box that has never heard of
+        // it — the fix in `set_generic_families` is what makes this test's
+        // plain, font-family-less `<text>` paint any foreground pixels at all
+        // rather than leaving the field solid background.
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="40">
+            <rect width="100" height="40" fill="#000000"/>
+            <text x="5" y="28" font-size="24" fill="#ffffff">Hi</text>
+        </svg>"##;
+        let decoded = decode(svg).expect("svg decodes");
+        let size = decoded.thumb.size(0);
+        let bytes = decoded.thumb.as_bytes(0).expect("one frame");
+        let lit = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .take((size.width.0 * size.height.0) as usize)
+            .any(|px| px[0] > 40 || px[1] > 40 || px[2] > 40);
+        assert!(lit, "no pixel brighter than the black background — the text never painted");
+    }
+
+    // STL/OBJ/GLB rasterisation used to be tested here; `decode` no longer
+    // touches meshes at all (see `mesh_cache`, where those three tests moved
+    // along with the fixtures they used).
 
     #[test]
     fn a_small_picture_is_held_once_and_at_the_size_it_was() {
