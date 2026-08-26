@@ -109,6 +109,17 @@ icons! {
     // the five above are: a caret is a shape rather than a picture of one.
     CaretDown => "regular/caret-down",
     CaretRight => "regular/caret-right",
+    // The pair of carets every dropdown in the world wears, which is the whole
+    // reason it is a different mark from `CaretDown`: one caret says "this
+    // opens downwards" and two say "this is a value you can change to another
+    // one off a list", and the settings page has both on the same screen.
+    CaretUpDown => "regular/caret-up-down",
+
+    // The settings page's search field. Regular rather than the duotone
+    // `Zoom`, which is the same glass and means something else: that one is a
+    // *reading* of how far the board is zoomed, sitting in the status bar
+    // beside a number, and this is a place to type.
+    Search => "regular/magnifying-glass",
 
     // The wordless buttons beside the project switcher.
     Commands => "duotone/command",
@@ -135,6 +146,9 @@ icons! {
     Sound => "duotone/speaker-high",
     Muted => "duotone/speaker-slash",
     Loop => "duotone/repeat",
+
+    // The mark a locked card wears in its top corner. See `Command::ToggleLock`.
+    Locked => "duotone/lock-simple",
 
     // What kind of thing a row in a list is.
     Image => "duotone/image",

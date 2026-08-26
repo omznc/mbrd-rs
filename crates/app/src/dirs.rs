@@ -102,6 +102,18 @@ pub fn config() -> Option<PathBuf> {
     Some(dir)
 }
 
+/// Where somebody's own themes go. See `themes.rs`.
+///
+/// Under [`config`] rather than beside it, because a theme is a choice in
+/// exactly the sense that module's note means: somebody wrote it or somebody
+/// downloaded it, and a backup of their settings should carry it. The plural
+/// directory rather than a key in `settings.json` because a theme is a
+/// *document* — it is written in an editor, sent to other people, and dropped
+/// in by hand, none of which is true of a boolean.
+pub fn themes() -> Option<PathBuf> {
+    Some(config()?.join("themes"))
+}
+
 /// What the app noticed. See `recent.rs`.
 pub fn state() -> Option<PathBuf> {
     #[cfg(target_os = "linux")]

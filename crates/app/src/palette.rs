@@ -113,9 +113,17 @@ impl Mode {
 /// One line of an open palette.
 #[derive(Debug, Clone)]
 pub enum What {
-    /// Something to do. Drawn dimmed when it would not achieve anything, for
-    /// the reason `Entry::available` gives: a list that changes shape as you
-    /// work is a list you have to read every time instead of aiming at.
+    /// Something to do. Drawn dimmed when it would not achieve anything,
+    /// **which is the opposite of what the context menu does with the same
+    /// answer** — see `Entry::shown`, which leaves those rows out entirely.
+    ///
+    /// The two are different surfaces answering different questions. A menu
+    /// is about the thing under the pointer, so a row that does not apply to
+    /// it is noise. This is the whole table, and the reason somebody opens it
+    /// is often to find out *whether* a thing exists and why it is not
+    /// working — so a command that vanished here would be a command you
+    /// cannot be told about. Dimmed says "yes, and not right now"; absent
+    /// says "no such thing".
     Does(Command),
     /// Somewhere to go, named by the item's id.
     Goes { id: String, title: String, kind: &'static str, mark: Icon },
@@ -414,20 +422,50 @@ fn cut(text: &str) -> String {
 /// `switcher.rs`'s query is the same one-line field with the same caret and
 /// selection, and drawing it a second way there would be two chances for the
 /// two to drift apart instead of one place that both call.
+/// `focused` is what decides whether the caret and the selection wash are
+/// drawn at all. The palette and the switcher are modes — while one is up it
+/// is the only thing taking keys, so they pass `true` and never think about
+/// it. The settings page is not a mode: it is a page with a search field on
+/// it, and a caret parked in that field on every frame it is open says the
+/// page has been seized by its own search box.
 pub(crate) fn query_line(
     editor: &Editor,
     placeholder: &str,
+    size: f32,
+    focused: bool,
     theme: &crate::theme::Theme,
 ) -> gpui::AnyElement {
-    let caret = || div().w(px(2.0)).h(px(17.0)).bg(theme.accent);
+    // Three pixels taller than the letters, which is roughly the line box they
+    // sit in: a caret the exact height of the text reads as a short tick, and
+    // one of a fixed height reads as the wrong caret in every field but the
+    // one it was measured against — which is what happened when the settings
+    // page became the third caller at the third size.
+    let caret = || div().flex_none().w(px(2.0)).h(px(size + 3.0)).bg(theme.accent);
     let text = editor.text().to_string();
 
     if text.is_empty() {
         return div()
             .flex()
             .items_center()
-            .child(caret())
-            .child(div().pl(px(4.0)).text_color(theme.muted).child(placeholder.to_string()))
+            .text_size(px(size))
+            .when(focused, |d| d.child(caret()))
+            .child(
+                div()
+                    .when(focused, |d| d.pl(px(4.0)))
+                    .text_color(theme.muted)
+                    .child(placeholder.to_string()),
+            )
+            .into_any_element();
+    }
+
+    // Nothing to mark up: no caret to place and no selection to wash, because
+    // neither exists anywhere but in the field somebody is in.
+    if !focused {
+        return div()
+            .flex()
+            .items_center()
+            .text_size(px(size))
+            .child(div().child(text))
             .into_any_element();
     }
 
@@ -436,7 +474,11 @@ pub(crate) fn query_line(
     let (from, to) = editor.selection().unwrap_or((at, at));
     let wash = theme.accent.opacity(0.30);
 
-    let mut row = div().flex().items_center().child(div().child(text[..from].to_string()));
+    let mut row = div()
+        .flex()
+        .items_center()
+        .text_size(px(size))
+        .child(div().child(text[..from].to_string()));
     if from == to {
         row = row.child(caret());
     } else {
@@ -468,10 +510,8 @@ pub fn render(
         .enumerate()
         .map(|(i, row)| {
             let highlighted = i == palette.cursor;
-            // A command that would achieve nothing draws dimmed and does
-            // nothing when pressed, rather than being left out — see
-            // `Entry::available`, which is the same rule the context menu
-            // follows and for the same reason.
+            // Dimmed rather than left out, which is deliberately not what a
+            // menu does with the same answer. See `What::Does`.
             let live = match &row.what {
                 What::Does(command) => command.available(view),
                 What::Goes { .. } => true,
@@ -613,7 +653,7 @@ pub fn render(
                 .bg(theme.chrome)
                 .border_1()
                 .border_color(theme.chrome_edge)
-                .shadow(crate::theme::shadow_large())
+                .shadow(theme.shadow_large())
                 .text_color(theme.text)
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 // Nothing in here has a context menu, and the board behind it
@@ -642,12 +682,14 @@ pub fn render(
                                 .rounded(px(4.0))
                                 .bg(theme.accent.opacity(0.14))
                                 .text_size(px(10.0))
-                                .text_color(theme.accent)
+                                .text_color(theme.accent_text)
                                 .child(palette.mode.chip()),
                         )
                         .child(div().flex_1().min_w_0().child(query_line(
                             &palette.query,
                             palette.mode.prompt(),
+                            14.0,
+                            true,
                             &theme,
                         ))),
                 )

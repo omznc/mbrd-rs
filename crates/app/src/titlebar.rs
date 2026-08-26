@@ -425,7 +425,7 @@ fn update_badge(view: &BoardView, cx: &mut Context<BoardView>) -> Option<gpui::A
 
     Some(match badge {
         UpdateBadge::Available { version } => pill
-            .text_color(theme.accent)
+            .text_color(theme.accent_text)
             .bg(theme.accent.opacity(0.10))
             .hover(|s| s.bg(theme.accent.opacity(0.18)))
             .active(|s| s.bg(theme.accent.opacity(0.26)))
@@ -458,7 +458,7 @@ fn update_badge(view: &BoardView, cx: &mut Context<BoardView>) -> Option<gpui::A
             .into_any_element(),
 
         UpdateBadge::Ready { version } => pill
-            .text_color(theme.accent)
+            .text_color(theme.accent_text)
             .bg(theme.accent.opacity(0.14))
             .hover(|s| s.bg(theme.accent.opacity(0.22)))
             .active(|s| s.bg(theme.accent.opacity(0.30)))

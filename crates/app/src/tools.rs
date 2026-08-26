@@ -32,7 +32,7 @@ pub enum Tool {
     Pan,
     /// Drag from one card to another to join them.
     Connect,
-    /// Press to put a sticky note down where you pressed.
+    /// Press to put a note down where you pressed.
     Note,
 }
 
@@ -149,7 +149,7 @@ pub fn render(view: &BoardView, cx: &mut Context<BoardView>) -> impl IntoElement
         .bg(theme.chrome)
         .border_1()
         .border_color(theme.chrome_edge)
-        .shadow(crate::theme::shadow_medium())
+        .shadow(theme.shadow_medium())
         .text_size(px(11.0))
         // The canvas beneath listens on mouse-down, so without this a press on
         // the strip would also start a gesture on the board behind it — which

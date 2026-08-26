@@ -48,7 +48,7 @@ impl Render for Tip {
             .bg(theme.chrome)
             .border_1()
             .border_color(theme.chrome_edge)
-            .shadow(crate::theme::shadow_small())
+            .shadow(theme.shadow_small())
             .text_size(px(11.0))
             .text_color(theme.text)
             .child(self.what.clone())

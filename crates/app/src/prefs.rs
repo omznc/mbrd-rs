@@ -17,12 +17,87 @@
 
 use std::path::PathBuf;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::dirs;
+use crate::themes::{Appearance, DEFAULT_DARK, DEFAULT_LIGHT};
+
+/// Which appearance the app wears, and whether it is being told by the
+/// desktop.
+///
+/// Three values rather than a bool with a separate "follow the system" switch,
+/// because the three are one question — *what decides?* — and splitting it in
+/// two produces a pair of controls where one of them is sometimes meaningless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Whatever the desktop says, and changing when it changes.
+    System,
+    Light,
+    Dark,
+}
+
+impl Mode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+        }
+    }
+
+    /// Which palette to wear, given what the desktop currently says.
+    ///
+    /// The `system` argument is only consulted for [`Mode::System`], which is
+    /// the point of passing it in rather than asking the window here: this
+    /// function is then pure, and the one place that has to know how to ask a
+    /// window what it looks like is the one place that has a window.
+    pub fn appearance(self, system: Appearance) -> Appearance {
+        match self {
+            Self::System => system,
+            Self::Light => Appearance::Light,
+            Self::Dark => Appearance::Dark,
+        }
+    }
+
+    fn parse(word: &str) -> Option<Self> {
+        match word {
+            "system" => Some(Self::System),
+            "light" => Some(Self::Light),
+            "dark" => Some(Self::Dark),
+            _ => None,
+        }
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+}
+
+/// Which preference something in the environment might be pinning.
+///
+/// This used to be a `bool` naming one of two settings, which worked for
+/// exactly as long as there were two. A name per setting rather than a
+/// position, so that adding a third is adding an arm rather than remembering
+/// which way round `true` meant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Setting {
+    Motion,
+    Update,
+    Theme,
+    Appearance,
+}
 
 /// What somebody has chosen.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// Not `Copy` any more, which it was until it carried two theme *names*. The
+/// alternative was interning them or holding a pair of indices into a registry
+/// that is rebuilt when somebody edits a file, and a `String` in a struct read
+/// a handful of times per frame is not worth either.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Prefs {
     /// Whether the interface is allowed to move.
     ///
@@ -33,6 +108,15 @@ pub struct Prefs {
     /// the distinction the reduced-motion setting on every platform draws, and
     /// getting it wrong by also removing the feedback is the usual way of
     /// making the accessible path the worse one.
+    ///
+    /// **Off by default.** It was on, on the usual reasoning that motion is
+    /// what tells you a camera travelled rather than teleported, and the
+    /// default was changed because that reasoning is about the *first* time
+    /// somebody sees a transition rather than the ten-thousandth. A board is a
+    /// tool somebody is inside all day, and every settle is a wait between
+    /// having decided something and being able to act on it. The switch is
+    /// still here, and on is still a good answer — it is just no longer the
+    /// one nobody chose.
     pub motion: bool,
 
     /// Whether to find out that a new version exists.
@@ -45,11 +129,48 @@ pub struct Prefs {
     /// a property of how the app was installed rather than of what anybody
     /// chose — see `update/eligible.rs`.
     pub update: bool,
+
+    /// Whether the app is light, dark, or doing as the desktop does.
+    ///
+    /// **Dark by default, not `System`.** `System` is the answer this ought to
+    /// have, and it is not the default for a reason that is specific rather
+    /// than cautious: on Linux gpui reads the appearance from the XDG desktop
+    /// portal, a desktop that expresses *no* preference is reported as
+    /// `Light`, and so is every window before the portal has answered at all.
+    /// This app has been dark since it existed. Defaulting to `System` would
+    /// mean a share of people opening an app they had been using for months
+    /// and finding it white, having changed nothing — which is a worse
+    /// first-run than the one it fixes. The switch is right there, and
+    /// choosing it is a decision somebody makes once.
+    pub mode: Mode,
+
+    /// The theme worn when the app is dark, by name.
+    ///
+    /// A name rather than a palette, and that is the whole design: a name is
+    /// what survives the file it came from being edited under it, and it is
+    /// also the only thing that can still be written down when the theme is
+    /// somebody else's file that this build has never seen. What happens when
+    /// the name points at nothing is `themes::Registry::resolve`'s problem,
+    /// and it falls back rather than blanking.
+    pub theme: String,
+    /// The theme worn when the app is light.
+    ///
+    /// A second field rather than one that is rewritten as the mode changes,
+    /// because the pair is the point: somebody who follows their desktop has
+    /// chosen *two* themes, and an app that remembered only the current one
+    /// would forget the other every sunset.
+    pub theme_light: String,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { motion: true, update: true }
+        Self {
+            motion: false,
+            update: true,
+            mode: Mode::Dark,
+            theme: DEFAULT_DARK.into(),
+            theme_light: DEFAULT_LIGHT.into(),
+        }
     }
 }
 
@@ -60,11 +181,29 @@ impl Prefs {
     /// that lies, so whatever offers one has to be able to say "this is being
     /// forced elsewhere". Answers the variable's name, which is the only useful
     /// thing to tell somebody: it is what they have to go and unset.
-    pub fn forced(motion: bool) -> Option<&'static str> {
-        match motion {
-            true if std::env::var_os("MBRD_MOTION").is_some() => Some("MBRD_MOTION"),
-            false if std::env::var_os("MBRD_NO_UPDATE").is_some() => Some("MBRD_NO_UPDATE"),
-            _ => None,
+    pub fn forced(what: Setting) -> Option<&'static str> {
+        let name = match what {
+            Setting::Motion => "MBRD_MOTION",
+            Setting::Update => "MBRD_NO_UPDATE",
+            Setting::Theme => "MBRD_THEME",
+            Setting::Appearance => "MBRD_APPEARANCE",
+        };
+        std::env::var_os(name).is_some().then_some(name)
+    }
+
+    /// Which theme name this appearance wears.
+    pub fn theme_for(&self, appearance: Appearance) -> &str {
+        match appearance {
+            Appearance::Light => &self.theme_light,
+            Appearance::Dark => &self.theme,
+        }
+    }
+
+    /// Choose the theme for one appearance, leaving the other alone.
+    pub fn set_theme(&mut self, appearance: Appearance, name: impl Into<String>) {
+        match appearance {
+            Appearance::Light => self.theme_light = name.into(),
+            Appearance::Dark => self.theme = name.into(),
         }
     }
 }
@@ -92,6 +231,27 @@ pub fn load() -> Prefs {
                 if let Some(update) = value.get("update").and_then(Value::as_bool) {
                     prefs.update = update;
                 }
+                // A mode this build does not recognise leaves the default
+                // standing rather than being coerced to one of the three —
+                // the same rule every other key here follows, and the reason
+                // a settings file from a later build is survivable.
+                if let Some(mode) = value.get("mode").and_then(Value::as_str).and_then(Mode::parse)
+                {
+                    prefs.mode = mode;
+                }
+                // Not checked against the registry here, deliberately. This
+                // module knows nothing about which themes exist — it reads a
+                // name somebody wrote down, and whether that name still points
+                // at anything is a question for whoever has the registry. A
+                // theme file that is missing this morning may be back this
+                // afternoon, and a `load` that "corrected" the name would have
+                // thrown the choice away in between.
+                if let Some(name) = value.get("theme").and_then(Value::as_str) {
+                    prefs.theme = name.to_string();
+                }
+                if let Some(name) = value.get("theme_light").and_then(Value::as_str) {
+                    prefs.theme_light = name.to_string();
+                }
             }
         }
     }
@@ -108,6 +268,27 @@ pub fn load() -> Prefs {
         prefs.update = false;
     }
 
+    // The same argument `MBRD_MOTION` makes, for the same people: somebody who
+    // cannot look at a bright screen should not have to look at one in order
+    // to find the switch that stops it. Set in a launcher, a shell profile or
+    // a desktop entry, and it needs nothing from this app.
+    if let Some(word) =
+        std::env::var("MBRD_APPEARANCE").ok().and_then(|w| Mode::parse(&w.to_lowercase()))
+    {
+        prefs.mode = word;
+    }
+
+    // A *name*, and it lands in both slots because the variable is one string
+    // and there are two of them. A name that only exists as a dark theme
+    // simply falls back to the light base when the app is light — which is
+    // `Registry::resolve`'s ordinary behaviour rather than a special case.
+    if let Ok(name) = std::env::var("MBRD_THEME") {
+        if !name.is_empty() {
+            prefs.theme = name.clone();
+            prefs.theme_light = name;
+        }
+    }
+
     prefs
 }
 
@@ -117,20 +298,21 @@ pub fn load() -> Prefs {
 /// that cannot be written is a setting that does not persist, which is worth
 /// less than an app that refuses to toggle it.
 ///
-/// **Unknown keys are carried through.** The file is read back, the two keys
-/// this build knows are replaced, and everything else is left exactly as it
+/// **Unknown keys are carried through.** The file is read back, the keys this
+/// build knows are replaced, and everything else is left exactly as it
 /// arrived — the same bargain `mbrd-core` makes with the board format, and for
 /// the same reason: a settings file written by a newer build should survive
 /// being opened by an older one rather than being quietly trimmed to whatever
 /// this binary happens to understand.
 ///
-/// Note what this cannot do. `MBRD_MOTION` and `MBRD_NO_UPDATE` win at load,
+/// Note what this cannot do. `MBRD_MOTION`, `MBRD_NO_UPDATE`, `MBRD_THEME` and
+/// `MBRD_APPEARANCE` all win at load,
 /// so toggling a setting that an environment variable is forcing will write the
 /// choice and then appear not to have taken effect on the next run. That is the
 /// right precedence — a variable in a launcher or a desktop entry is a
 /// deliberate override by whoever set it up — but it does mean the two can
 /// disagree, which is why [`Prefs::forced`] exists to say so.
-pub fn save(prefs: Prefs) {
+pub fn save(prefs: &Prefs) {
     let Some(path) = store() else { return };
 
     // Read first, so that keys this build does not know about survive.
@@ -139,15 +321,32 @@ pub fn save(prefs: Prefs) {
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
     {
         Some(Value::Object(map)) => map,
-        _ => serde_json::Map::new(),
+        _ => Map::new(),
     };
     out.insert("motion".into(), Value::Bool(prefs.motion));
     out.insert("update".into(), Value::Bool(prefs.update));
+    out.insert("mode".into(), Value::String(prefs.mode.word().into()));
+    out.insert("theme".into(), Value::String(prefs.theme.clone()));
+    out.insert("theme_light".into(), Value::String(prefs.theme_light.clone()));
 
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(&path, Value::Object(out).to_string());
+    // Indented, with a newline at the end. It was one long line until the
+    // settings page grew a button that opens this file in a text editor, at
+    // which point "what the machine can read" stopped being the only
+    // requirement — and it was never really the only one, because the way
+    // anybody has ever changed a setting that has no switch is by opening this
+    // file and typing in it.
+    //
+    // `to_string_pretty` cannot fail on a value that came out of a `Map`, but
+    // the fallback is *the same settings on one line* rather than an `unwrap`
+    // or an empty object: this whole function is best-effort by design, and the
+    // one thing it must never do is turn "could not be formatted" into "your
+    // settings are gone".
+    let value = Value::Object(out);
+    let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+    let _ = std::fs::write(&path, text + "\n");
 }
 
 /// Whether an environment variable is saying no.
@@ -160,8 +359,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn motion_is_on_until_somebody_says_otherwise() {
-        assert!(Prefs::default().motion);
+    fn the_interface_holds_still_until_somebody_asks_it_not_to() {
+        assert!(!Prefs::default().motion);
     }
 
     #[test]
@@ -202,13 +401,84 @@ mod tests {
     }
 
     #[test]
+    fn the_file_is_written_for_somebody_to_read() {
+        // The settings page has a button that opens this file in a text
+        // editor, so "what the machine can read" was never the only
+        // requirement — and the way anybody has ever changed a setting with no
+        // switch is by opening it and typing.
+        //
+        // Exercised against the formatting rather than the filesystem, for the
+        // reason the test below gives: `save` writes to the real config
+        // directory and a test that did that would clobber whatever the person
+        // running it had chosen.
+        let mut out = Map::new();
+        out.insert("motion".into(), Value::Bool(false));
+        out.insert("theme".into(), Value::String("Ink".into()));
+        let value = Value::Object(out);
+        let text = serde_json::to_string_pretty(&value).expect("a map is always writable");
+
+        assert!(text.contains("\n"), "it is not one long line");
+        assert!(text.contains("  \"motion\""), "the keys are indented");
+        // And it still reads back as the same settings, which is the only
+        // thing prettiness is not allowed to cost.
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), value);
+    }
+
+    #[test]
     fn an_environment_variable_that_is_not_set_forces_nothing() {
         // `forced` is what stops a toggle lying about having taken effect. In
-        // a test environment neither variable is set, so both answer None —
-        // and the point of the test is that it asks about *both*, so a third
-        // preference added without a `forced` arm shows up here.
-        assert_eq!(Prefs::forced(true), None);
-        assert_eq!(Prefs::forced(false), None);
+        // a test environment none of the variables are set, so all four answer
+        // None — and the point of the test is that it asks about *all* of
+        // them. It used to be the only thing that made a preference added
+        // without a `forced` arm show up; now that the argument is an enum,
+        // the compiler catches that and this checks the arms are right.
+        for what in [Setting::Motion, Setting::Update, Setting::Theme, Setting::Appearance] {
+            assert_eq!(Prefs::forced(what), None, "{what:?}");
+        }
+    }
+
+    #[test]
+    fn the_app_is_dark_until_somebody_asks_it_to_follow_the_desktop() {
+        // Not `System`, and the field's own note says why at length: on Linux
+        // a desktop with no stated preference reads as *light*, and so does
+        // every window before the portal has answered. Defaulting to `System`
+        // would turn an app somebody has been using for months white on the
+        // strength of a question their desktop never answered.
+        assert_eq!(Prefs::default().mode, Mode::Dark);
+    }
+
+    #[test]
+    fn following_the_desktop_is_the_only_mode_that_listens_to_it() {
+        // The other two are answers, not preferences with an override.
+        for system in [Appearance::Light, Appearance::Dark] {
+            assert_eq!(Mode::System.appearance(system), system);
+            assert_eq!(Mode::Light.appearance(system), Appearance::Light);
+            assert_eq!(Mode::Dark.appearance(system), Appearance::Dark);
+        }
+    }
+
+    #[test]
+    fn the_two_themes_are_remembered_apart() {
+        // The reason there are two fields rather than one that is rewritten as
+        // the mode changes: somebody who follows their desktop has chosen a
+        // pair, and an app that kept only the current one would forget the
+        // other every sunset.
+        let mut prefs = Prefs::default();
+        prefs.set_theme(Appearance::Dark, "Ink");
+        assert_eq!(prefs.theme_for(Appearance::Dark), "Ink");
+        assert_eq!(prefs.theme_for(Appearance::Light), DEFAULT_LIGHT, "the other is untouched");
+    }
+
+    #[test]
+    fn a_mode_this_build_does_not_recognise_leaves_the_default_standing() {
+        // The same promise the rest of this file makes about a settings file
+        // written by a later build: a word that means nothing here is ignored,
+        // not coerced into one of the three.
+        assert_eq!(Mode::parse("dusk"), None);
+        assert_eq!(Mode::parse("Dark"), None, "the file's spelling is lowercase");
+        for word in ["system", "light", "dark"] {
+            assert_eq!(Mode::parse(word).map(Mode::word), Some(word));
+        }
     }
 
     #[test]

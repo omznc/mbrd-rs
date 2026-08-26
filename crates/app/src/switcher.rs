@@ -434,7 +434,7 @@ pub fn render(
                         .flex_none()
                         .max_w(px(240.0))
                         .text_size(px(11.0))
-                        .text_color(theme.accent)
+                        .text_color(theme.accent_text)
                         .truncate()
                         .child(reason.to_string())
                         .into_any_element(),
@@ -535,7 +535,7 @@ pub fn render(
                 .bg(theme.chrome)
                 .border_1()
                 .border_color(theme.chrome_edge)
-                .shadow(crate::theme::shadow_large())
+                .shadow(theme.shadow_large())
                 .text_color(theme.text)
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 // Nothing here has a context menu, and the board behind it has
@@ -561,6 +561,8 @@ pub fn render(
                             crate::palette::query_line(
                                 &switcher.query,
                                 "open a board\u{2026}",
+                                14.0,
+                                true,
                                 &theme,
                             ),
                         ))

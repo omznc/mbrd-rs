@@ -1,0 +1,50 @@
+{
+  "name": "Ink",
+  "author": "mbrd",
+  "themes": [
+    {
+      "name": "Ink",
+      "appearance": "dark",
+      "style": {
+        "ground": "#0e1014ff",
+        "grid": "#dfe4ef00",
+        "axis": "#dfe4ef22",
+
+        "chrome": "#161a23ff",
+        "chrome_edge": "#dfe4ef16",
+
+        "card": "#1e2330ff",
+        "card_edge": "#dfe4ef1f",
+        "selected_edge": "#5a8de0ff",
+
+        "text": "#dee4efff",
+        "muted": "#9aa5baff",
+        "tertiary": "#6d7789ff",
+        "accent": "#5a8de0ff",
+        "accent_text": "#7fa9ecff",
+
+        "note": "#2b3142ff",
+        "image": "#1c333dff",
+        "video": "#32243fff",
+        "audio": "#1d3a32ff",
+        "link": "#272b4aff",
+        "fence": "#5a8de014",
+
+        "quote": "#b4becfff",
+        "note_link": "#9dc2f2ff",
+
+        "rope_line": "#dfe4ef66",
+        "rope_accent": "#5a8de0ff",
+        "rope_warm": "#c9913fff",
+        "rope_leaf": "#6f9455ff",
+        "rope_danger": "#bf4a4aff",
+        "anchor": "#dfe4ef59",
+        "guide": "#dfe4ef59",
+
+        "notes": ["#3a3b2bff", "#26402aff", "#25384aff", "#42293aff"],
+        "swatch_fallback": "#8c8c94ff",
+        "shadow": "#000000ff"
+      }
+    }
+  ]
+}

@@ -4,14 +4,38 @@
 //! built: **Board** rows write into the `.mbrd` through the ledger — they
 //! travel with the file and undo can take them back — and **Application**
 //! rows are about the person sitting here, live in their config directory,
-//! and do neither. Each is a section in the sidebar, so the split is
-//! navigation rather than small print.
+//! and do neither. Each is a group in the sidebar, so the split is navigation
+//! rather than small print.
 //!
 //! The shape is the one settings screens have converged on — a nav column on
 //! the left, and on the right a column of rows where each setting is a name
 //! with a sentence under it and its control at the far edge. The sentence is
 //! the point: a switch called "Axes" tells you nothing at 2am, and this page
 //! is the one place in the app with room to say what a thing does.
+//!
+//! ## Why the sidebar has two levels
+//!
+//! It had one, with two entries on it, which was the right shape for eight
+//! rows and stopped being it somewhere around fifteen. A flat list scales by
+//! making each page longer, and a page long enough to scroll is one where the
+//! nav column has stopped answering "where is that setting" — the two-level
+//! version answers it in the sidebar instead, which is what every settings
+//! screen with more than a screenful of settings ends up doing.
+//!
+//! The groups are the two that already existed and the split they already
+//! meant. Nothing was regrouped; the sections underneath are the *pages* that
+//! used to be scroll positions.
+//!
+//! ## Why there is a search field
+//!
+//! Because two levels of navigation is two levels of guessing. Somebody
+//! looking for the grid step knows the words "grid step" and does not
+//! necessarily know it lives under Board rather than Application — so typing
+//! flattens the whole page back into one list, and matches on the
+//! descriptions as well as the titles, which is where the words people
+//! actually remember tend to be. It is the same `fuzzy` matcher the palette
+//! and the switcher use, over the same rows this page was going to draw
+//! anyway.
 //!
 //! An overlay like the palette and the switcher — see `Overlay` in
 //! `board_view.rs` for why there can only ever be one — but a whole page
@@ -25,24 +49,32 @@
 //! its `Command` — current state and effect both read from the same table
 //! the menus and the palette read — so this page cannot drift from what `G`
 //! or the View menu does. The rows that are not commands (grid step, card
-//! gap, media fit) go through their own `BoardView` setters, which go
-//! through the one door every board edit goes through.
+//! gap, media fit, the two themes) go through their own `BoardView` setters,
+//! which go through the one door their kind of change goes through.
 
-use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, MouseButton, SharedString};
+use std::collections::HashMap;
+
+use gpui::{
+    div, prelude::*, px, AnyElement, Context, FontWeight, Modifiers, MouseButton, SharedString,
+};
 
 use crate::board_view::{BoardView, UpdateBadge};
 use crate::command::Command;
+use crate::editor::{self, Editor};
 use crate::icons::{icon, Icon};
+use crate::prefs::Mode;
 use crate::theme::Theme;
+use crate::themes::Appearance;
 
-/// One of the sidebar's entries.
+/// One of the two halves the sidebar is divided into, which is the same
+/// division `prefs.rs` is built on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Section {
+pub enum Group {
     Board,
     Application,
 }
 
-impl Section {
+impl Group {
     pub const ALL: [Self; 2] = [Self::Board, Self::Application];
 
     pub fn label(self) -> &'static str {
@@ -52,13 +84,146 @@ impl Section {
         }
     }
 
+    /// Which slot of [`Page::open`] says whether this group is expanded.
+    fn slot(self) -> usize {
+        match self {
+            Self::Board => 0,
+            Self::Application => 1,
+        }
+    }
+
+    fn sections(self) -> &'static [Section] {
+        match self {
+            Self::Board => &[Section::Canvas, Section::Arranging, Section::Media],
+            Self::Application => &[Section::General, Section::Appearance, Section::Updates],
+        }
+    }
+}
+
+/// One of the sidebar's pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Canvas,
+    Arranging,
+    Media,
+    General,
+    Appearance,
+    Updates,
+}
+
+impl Section {
+    pub fn group(self) -> Group {
+        match self {
+            Self::Canvas | Self::Arranging | Self::Media => Group::Board,
+            Self::General | Self::Appearance | Self::Updates => Group::Application,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Canvas => "Canvas",
+            Self::Arranging => "Arranging",
+            Self::Media => "Media",
+            Self::General => "General",
+            Self::Appearance => "Appearance",
+            Self::Updates => "Updates",
+        }
+    }
+
     /// The sentence under the section's title, which is where the
     /// board/person split gets said in words.
     fn blurb(self) -> &'static str {
         match self {
-            Self::Board => "Saved in the board's own file. These travel with the .mbrd, and undo can take them back.",
-            Self::Application => "About this computer, not the board. Kept in your config directory and never saved into a file.",
+            Self::Canvas => "The lattice behind the board, and what a drag lines up with. Saved in the board's own file, where undo can take it back.",
+            Self::Arranging => "What Rearrange leaves between cards. Saved in the board's own file, where undo can take it back.",
+            Self::Media => "How photographs and videos sit in their cards. Saved in the board's own file, where undo can take it back.",
+            Self::General => "About this computer, not the board. Kept in your config directory and never saved into a file you send.",
+            Self::Appearance => "What colours the app is made of, and who decides — you or your desktop.",
+            Self::Updates => "Whether this build goes looking for a newer one, and the button that fetches it.",
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The page's own state
+// ---------------------------------------------------------------------------
+
+/// A theme being chosen off a list.
+///
+/// Its own small modal *inside* the page rather than a popup hanging off the
+/// row, and that is a deliberate departure from the screen this page is
+/// modelled on. Two reasons, and neither is taste. The rows scroll, and a
+/// popup anchored to a row is a popup clipped by the container the row
+/// scrolls in — which is fine until the row somebody wants is the last one.
+/// And the list has no bound: a dropdown is the right control for three
+/// choices and the wrong one for however many theme files a person has
+/// collected, which is what makes a *searchable* list the honest shape.
+///
+/// The button that opens it still wears the two carets a dropdown wears,
+/// because from where somebody is sitting that is what it is.
+#[derive(Debug, Clone)]
+pub struct Picker {
+    /// Which of the two slots is being filled. Not necessarily the one the
+    /// app is currently wearing — somebody pinned to dark can still be
+    /// choosing what their light one will be.
+    pub appearance: Appearance,
+    pub query: Editor,
+    /// Which of the *matches* is highlighted, not which of the themes.
+    pub cursor: usize,
+    /// The name that was chosen when this opened.
+    ///
+    /// What abandoning it puts back. Kept here rather than read off the prefs
+    /// when needed, because that is exactly what it is protecting: the point
+    /// of a picker that previews live is that the app is wearing something
+    /// nobody has agreed to yet, and the only record of what they had is the
+    /// one taken before the first preview.
+    pub was: String,
+}
+
+impl Picker {
+    /// Open on the theme that is already chosen, rather than at the top.
+    ///
+    /// A list of forty that always opened at the first row would make
+    /// "where am I" the first question every time, and — because arrowing
+    /// previews — would leave somebody who opened it to look at their options
+    /// one keystroke away from having silently changed nothing back.
+    fn open(appearance: Appearance, was: impl Into<String>, names: &[String]) -> Self {
+        let was = was.into();
+        let cursor = names.iter().position(|name| *name == was).unwrap_or(0);
+        Self { appearance, query: Editor::new("", 64, false), cursor, was }
+    }
+
+    /// The theme names on offer, narrowed by what has been typed.
+    ///
+    /// Names rather than palettes, because the caller has the registry and
+    /// this does not — and because a name is what ends up written down. With
+    /// an empty query the order is the registry's, which puts the built-in
+    /// first.
+    fn matches(&self, names: &[String]) -> Vec<String> {
+        let query = self.query.text().to_lowercase();
+        if query.is_empty() {
+            return names.to_vec();
+        }
+        // Folded on both sides, for the reason the page's own search gives:
+        // `fuzzy::subsequence` takes two lowercase strings and every theme in
+        // the list is named with a capital letter.
+        let mut scored: Vec<(i32, &String)> = names
+            .iter()
+            .filter_map(|name| {
+                crate::fuzzy::subsequence(&query, &name.to_lowercase()).map(|s| (s, name))
+            })
+            .collect();
+        scored.sort_by_key(|a| std::cmp::Reverse(a.0));
+        scored.into_iter().map(|(_, name)| name.clone()).collect()
+    }
+
+    fn step(&mut self, by: isize, len: usize) {
+        if len == 0 {
+            self.cursor = 0;
+            return;
+        }
+        let at = self.cursor as isize + by;
+        self.cursor = at.clamp(0, len as isize - 1) as usize;
     }
 }
 
@@ -66,11 +231,198 @@ impl Section {
 #[derive(Debug, Clone)]
 pub struct Page {
     pub section: Section,
+    /// Which groups are expanded, by [`Group::slot`].
+    ///
+    /// Both, until somebody folds one. A settings page that opens with its
+    /// contents hidden is one where the first thing everybody does is open
+    /// them again.
+    pub open: [bool; 2],
+    /// The sidebar's search field. Empty on nearly every frame.
+    pub query: Editor,
+    /// Whether the search field is wearing the keyboard.
+    ///
+    /// The page routes every press to `query` regardless — there is nothing
+    /// else on it to type into, and being able to open Settings and start
+    /// typing is the whole point of a search field over a nav. So this does
+    /// not decide *where the keys go*; it decides whether the field is drawn
+    /// as one somebody is in. Without it the caret sits there permanently on
+    /// an empty field, which reads as a text box that has seized the page
+    /// rather than one waiting to be used.
+    pub focused: bool,
+    pub picking: Option<Picker>,
 }
 
 impl Page {
     pub fn open() -> Self {
-        Self { section: Section::Board }
+        Self {
+            section: Section::Canvas,
+            open: [true; 2],
+            query: Editor::new("", 64, false),
+            focused: false,
+            picking: None,
+        }
+    }
+
+    /// Open straight onto one section.
+    pub fn onto(section: Section) -> Self {
+        Self { section, ..Self::open() }
+    }
+
+    /// Whether the page is showing search results rather than a section.
+    pub fn searching(&self) -> bool {
+        !self.query.text().trim().is_empty()
+    }
+
+    /// Fold or unfold one group.
+    pub fn fold(&mut self, group: Group) {
+        let slot = group.slot();
+        self.open[slot] = !self.open[slot];
+    }
+
+    /// Start choosing a theme for one of the two slots.
+    pub fn pick_theme(&mut self, appearance: Appearance, was: &str, names: &[String]) {
+        self.picking = Some(Picker::open(appearance, was, names));
+    }
+}
+
+/// What a key press on the settings page meant.
+///
+/// Richer than a text field's reply, because this page has two things that
+/// take keys and one of them changes what the app *looks like* as the
+/// highlight moves. The view resolves the names — it is the one holding the
+/// registry — which is why these carry a name rather than a palette.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reply {
+    /// Dealt with. Nothing for the view to do but repaint.
+    Held,
+    /// Put the page away.
+    Close,
+    /// The picker's highlight moved. Try this on, without choosing it.
+    Preview(Appearance, String),
+    /// The picker was accepted.
+    Choose(Appearance, String),
+    /// The picker was abandoned. Go back to this, which is what was chosen
+    /// before it opened.
+    Cancel(Appearance, String),
+    ///
+    /// All three carry the appearance rather than leaving the view to work it
+    /// out. By the time any of them is returned the picker has already been
+    /// closed — so the only place the answer still existed was inside the
+    /// thing that was just thrown away, and a view left to guess would guess
+    /// the appearance it is *wearing*. That is right until somebody pinned to
+    /// dark edits their light theme, which is exactly what the second row on
+    /// the Appearance page is for.
+    /// Ctrl V, which needs the clipboard, which is the view's.
+    Paste,
+}
+
+impl Page {
+    /// One key press.
+    ///
+    /// `names` is every theme of the appearance the picker is filling, in the
+    /// order the list shows them. Passed in rather than looked up, because
+    /// the registry lives on the view and this is a plain struct — the same
+    /// division `palette.rs` draws with the command table.
+    pub fn key(
+        &mut self,
+        key: &str,
+        mods: Modifiers,
+        text: Option<&str>,
+        names: &[String],
+    ) -> Reply {
+        if self.picking.is_some() {
+            return self.picker_key(key, mods, text, names);
+        }
+
+        // Escape clears the search before it closes the page. Somebody who
+        // has typed something and wants the whole page back should not have
+        // to reopen it, and the two meanings never collide: an empty field
+        // has nothing to clear.
+        if key == "escape" {
+            if self.searching() {
+                self.query = Editor::new("", 64, false);
+                self.focused = false;
+                return Reply::Held;
+            }
+            return Reply::Close;
+        }
+
+        let reply = self.query.key(key, editor::Mods::from(mods), text);
+        // A press the field did something with is somebody using the field,
+        // whether or not they ever pointed at it. A press it ignored — an
+        // arrow key, a bare modifier — is not, and must not light it up.
+        if reply != editor::Reply::Ignored {
+            self.focused = true;
+        }
+        if reply == editor::Reply::Ignored && mods.secondary() && key == "v" {
+            return Reply::Paste;
+        }
+        Reply::Held
+    }
+
+    fn picker_key(
+        &mut self,
+        key: &str,
+        mods: Modifiers,
+        text: Option<&str>,
+        names: &[String],
+    ) -> Reply {
+        let Some(picker) = &mut self.picking else { return Reply::Held };
+        match key {
+            "escape" => {
+                let (appearance, was) = (picker.appearance, picker.was.clone());
+                self.picking = None;
+                return Reply::Cancel(appearance, was);
+            }
+            "enter" => {
+                let chosen = picker.matches(names).get(picker.cursor).cloned();
+                let (appearance, was) = (picker.appearance, picker.was.clone());
+                self.picking = None;
+                // Enter on a list with nothing in it is not a choice. It puts
+                // back what was there, which is the same thing Escape does —
+                // there is no third answer to "keep the theme you cannot see".
+                return match chosen {
+                    Some(name) => Reply::Choose(appearance, name),
+                    None => Reply::Cancel(appearance, was),
+                };
+            }
+            "up" | "down" | "pageup" | "pagedown" => {
+                let matched = picker.matches(names);
+                let by = match key {
+                    "up" => -1,
+                    "down" => 1,
+                    "pageup" => -10,
+                    _ => 10,
+                };
+                picker.step(by, matched.len());
+                return match matched.get(picker.cursor) {
+                    Some(name) => Reply::Preview(picker.appearance, name.clone()),
+                    None => Reply::Held,
+                };
+            }
+            _ => {}
+        }
+
+        let reply = picker.query.key(key, editor::Mods::from(mods), text);
+        if reply == editor::Reply::Ignored && mods.secondary() && key == "v" {
+            return Reply::Paste;
+        }
+        // Typing narrows the list, which moves what is under the highlight
+        // even though the highlight itself did not move — so the preview
+        // follows the *row*, not the keystroke.
+        picker.cursor = 0;
+        match picker.matches(names).first() {
+            Some(name) => Reply::Preview(picker.appearance, name.clone()),
+            None => Reply::Held,
+        }
+    }
+
+    /// Paste into whichever field is currently taking keys.
+    pub fn insert(&mut self, text: &str) {
+        match &mut self.picking {
+            Some(picker) => picker.query.insert(text),
+            None => self.query.insert(text),
+        }
     }
 }
 
@@ -85,15 +437,41 @@ const GRID_STEPS: [f32; 5] = [32.0, 48.0, 64.0, 96.0, 128.0];
 /// The gaps the arrangement engine can be told to leave between cards.
 const GAPS: [f32; 7] = [0.0, 4.0, 8.0, 12.0, 16.0, 24.0, 32.0];
 
+// ---------------------------------------------------------------------------
+// The page
+// ---------------------------------------------------------------------------
+
 pub fn render(page: &Page, view: &BoardView, cx: &mut Context<BoardView>) -> impl IntoElement {
     let theme = view.theme;
-    let presence = view.overlay_presence.value();
-    let section = page.section;
+    let arriving = crate::board_view::arrival(view.overlay_presence.value());
 
-    let rows: Vec<AnyElement> = match section {
-        Section::Board => board_rows(view, cx),
-        Section::Application => application_rows(view, cx),
+    // Every row on the page, every frame. Cheap — fifteen rows of `div` — and
+    // it is what makes searching possible at all: a row that was only built
+    // when its own section was showing could not be matched against while a
+    // different section is.
+    let all = rows(view, cx);
+    let searching = page.searching();
+    let shown: Vec<AnyElement> = if searching {
+        // Folded on both sides, which `fuzzy::subsequence` requires and does
+        // not do: its two arguments are documented as already lowercase,
+        // because a caller matching several fields against one query would
+        // otherwise fold the query once per field. This is such a caller —
+        // two fields per row — so it folds the query once, here, and each
+        // field as it goes. Handing it the words as written is why typing
+        // `grid` used to find nothing at all: there is no lowercase `g`
+        // anywhere in "Grid step".
+        let query = page.query.text().trim().to_lowercase();
+        let mut hits: Vec<(i32, Spec)> =
+            all.into_iter().filter_map(|spec| score(&query, &spec).map(|s| (s, spec))).collect();
+        hits.sort_by_key(|a| std::cmp::Reverse(a.0));
+        hits.into_iter().map(|(_, spec)| spec.into_row(true, theme)).collect()
+    } else {
+        all.into_iter()
+            .filter(|spec| spec.section == page.section)
+            .map(|spec| spec.into_row(false, theme))
+            .collect()
     };
+    let nothing_matched = shown.is_empty();
 
     div()
         .absolute()
@@ -105,26 +483,36 @@ pub fn render(page: &Page, view: &BoardView, cx: &mut Context<BoardView>) -> imp
         .justify_center()
         // A page, not a panel: it owns the whole space below the titlebar,
         // so the ground is solid and there is nothing behind to scrim.
-        .bg(theme.ground)
+        .bg(theme.ground.opacity(arriving.ground))
         .text_color(theme.text)
-        .opacity(presence)
         // The wheel and both buttons end here — the board underneath still
         // exists, and a press that fell through would land on a card nobody
         // can see.
         .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        // A press anywhere else on the page is somebody who has finished with
+        // the search field, so it stops being drawn as one they are in. The
+        // field's own handler stops the press before it reaches here.
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _event, _window, cx| {
+                this.blur_settings_search(cx);
+                cx.stop_propagation();
+            }),
+        )
         .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
         .child(
             div()
                 .w_full()
-                .max_w(px(880.0))
+                .max_w(px(920.0))
                 .h_full()
                 .flex()
-                // The same 8px arrival slide as the palette and the
-                // switcher: one function of the current presence, so the
-                // exit is the entrance played backwards.
-                .mt(px(-(8.0 * (1.0 - presence))))
-                .child(sidebar(section, view, cx))
+                // The page's contents, over a ground that is already
+                // solid: they fade and rise the last few pixels into place
+                // rather than dissolving with the board. See
+                // `board_view::Arrival`.
+                .opacity(arriving.content)
+                .mt(px(arriving.rise))
+                .child(sidebar(page, view, cx))
                 .child(
                     div()
                         .flex_1()
@@ -134,56 +522,7 @@ pub fn render(page: &Page, view: &BoardView, cx: &mut Context<BoardView>) -> imp
                         .flex_col()
                         .pl(px(32.0))
                         .pr(px(24.0))
-                        .child(
-                            div()
-                                .flex()
-                                .items_start()
-                                .justify_between()
-                                .pt(px(26.0))
-                                .pb(px(14.0))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(3.0))
-                                        .child(
-                                            div()
-                                                .text_size(px(16.0))
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .child(section.label()),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(11.0))
-                                                .text_color(theme.muted)
-                                                .child(section.blurb()),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .id("settings-close")
-                                        .flex_none()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .size(px(26.0))
-                                        .rounded(px(crate::theme::RADIUS_SM))
-                                        .hover(|s| s.bg(theme.accent.opacity(0.10)))
-                                        .active(|s| s.bg(theme.accent.opacity(0.18)))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _event, _window, cx| {
-                                                this.close_settings();
-                                                cx.notify();
-                                            }),
-                                        )
-                                        .child(icon(
-                                            Icon::Close,
-                                            crate::icons::ICON_MD,
-                                            theme.muted,
-                                        )),
-                                ),
-                        )
+                        .child(header(page, view, cx))
                         .child(
                             div()
                                 .id("settings-rows")
@@ -198,70 +537,201 @@ pub fn render(page: &Page, view: &BoardView, cx: &mut Context<BoardView>) -> imp
                                 // curve of its own track.
                                 .pr(px(4.0))
                                 .overflow_y_scroll()
-                                .children(rows),
+                                .children(shown)
+                                .when(nothing_matched, |d| {
+                                    d.child(
+                                        div()
+                                            .pt(px(22.0))
+                                            .text_size(px(12.0))
+                                            .text_color(theme.muted)
+                                            .child("No setting says that."),
+                                    )
+                                }),
                         ),
                 ),
         )
+        .when_some(page.picking.as_ref(), |d, picker| d.child(picker_panel(picker, view, cx)))
+}
+
+// ---------------------------------------------------------------------------
+// The header
+// ---------------------------------------------------------------------------
+
+/// The strip above the rows: where this section's answers end up, and the way
+/// out.
+///
+/// The two chips are this page's version of the ones the screen it is
+/// modelled on puts there. On that screen they name the *scope* being edited —
+/// the user's settings, or the project's. Here they say the same thing in
+/// this app's terms, which is the Board/Application split the module note is
+/// about: a Board section writes into the `.mbrd` and names it, an
+/// Application section writes into `settings.json` and names that. It is the
+/// one place on the page that answers "where does this end up" without
+/// somebody having to read a blurb.
+fn header(page: &Page, view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
+    let theme = view.theme;
+    let section = page.section;
+    let application = section.group() == Group::Application;
+    let scope = if application { "You" } else { "Board" };
+    let lands_in: SharedString =
+        if application { "settings.json".into() } else { view.doc.board.title.clone().into() };
+    let (title, blurb): (SharedString, SharedString) = if page.searching() {
+        ("Search".into(), "Every setting whose name or description says that.".into())
+    } else {
+        (section.label().into(), section.blurb().into())
+    };
+
+    div()
+        .flex()
+        .items_start()
+        .justify_between()
+        .gap(px(16.0))
+        .pt(px(26.0))
+        .pb(px(14.0))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                // Room, because the chip row is a different *kind* of thing
+                // from the title under it: one says where this page's answers
+                // are kept and the other is the page. At the gap the rest of
+                // this file uses between related lines the two read as one
+                // stacked heading, which is exactly what they are not.
+                .gap(px(18.0))
+                .min_w_0()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(7.0))
+                        .child(
+                            div()
+                                .px(px(6.0))
+                                .py(px(1.0))
+                                .rounded(px(crate::theme::RADIUS_XS))
+                                .bg(theme.accent.opacity(0.16))
+                                .text_size(px(10.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.accent_text)
+                                .child(scope),
+                        )
+                        .child(div().text_size(px(11.0)).text_color(theme.muted).child(lands_in)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(3.0))
+                        .child(
+                            div()
+                                .text_size(px(16.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(title),
+                        )
+                        .child(div().text_size(px(11.0)).text_color(theme.muted).child(blurb)),
+                ),
+        )
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                // On every section, not only the ones whose answers land in
+                // it. It was section-scoped on the reasoning that a Board
+                // page's settings are inside the `.mbrd` and offering to open
+                // *that* in a text editor would be offering to open a zip —
+                // which is true and is not what this button does. It opens the
+                // application's settings file, which is one file for the whole
+                // app and is no less there for somebody currently looking at
+                // the grid step. A door that comes and goes as you move around
+                // the page is a door nobody remembers is there.
+                .child(
+                    div()
+                        .id("settings-edit-json")
+                        .px(px(9.0))
+                        .py(px(4.0))
+                        .rounded(px(crate::theme::RADIUS_SM))
+                        .text_size(px(11.0))
+                        .text_color(theme.muted)
+                        .border_1()
+                        .border_color(theme.chrome_edge)
+                        .bg(theme.chrome)
+                        .hover(|s| s.bg(theme.accent.opacity(0.10)).text_color(theme.text))
+                        .active(|s| s.bg(theme.accent.opacity(0.18)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.edit_settings_file(cx);
+                            }),
+                        )
+                        .child("Edit in settings.json"),
+                )
+                .child(
+                    div()
+                        .id("settings-close")
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(26.0))
+                        .rounded(px(crate::theme::RADIUS_SM))
+                        .hover(|s| s.bg(theme.accent.opacity(0.10)))
+                        .active(|s| s.bg(theme.accent.opacity(0.18)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.close_settings();
+                                cx.notify();
+                            }),
+                        )
+                        .child(icon(Icon::Close, crate::icons::ICON_MD, theme.muted)),
+                ),
+        )
+        .into_any_element()
 }
 
 // ---------------------------------------------------------------------------
 // The sidebar
 // ---------------------------------------------------------------------------
 
-fn sidebar(current: Section, view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
+fn sidebar(page: &Page, view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
     let theme = view.theme;
+    let searching = page.searching();
     div()
         .flex_none()
-        .w(px(190.0))
+        .w(px(206.0))
         .h_full()
         .flex()
         .flex_col()
         .justify_between()
-        .pt(px(26.0))
+        .pt(px(22.0))
         .pb(px(16.0))
         .pr(px(20.0))
         .border_r_1()
         .border_color(theme.chrome_edge)
         .child(
-            div()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .px(px(10.0))
-                        .pb(px(12.0))
-                        .text_size(px(15.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child("Settings"),
-                )
-                .children(Section::ALL.map(|section| {
-                    let active = section == current;
-                    div()
-                        .id(SharedString::from(section.label()))
-                        .px(px(10.0))
-                        .py(px(5.0))
-                        .mb(px(2.0))
-                        .rounded(px(crate::theme::RADIUS_SM))
-                        .text_size(px(13.0))
-                        .when(active, |d| {
-                            d.bg(theme.accent.opacity(0.12))
-                                .text_color(theme.text)
-                                .font_weight(FontWeight::MEDIUM)
-                        })
-                        .when(!active, |d| d.text_color(theme.muted).hover(|s| s.bg(theme.chrome)))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _event, _window, cx| {
-                                this.show_settings_section(section, cx);
-                            }),
-                        )
-                        .child(section.label())
-                        .into_any_element()
-                })),
+            div().flex().flex_col().min_h_0().child(search_field(page, view, cx)).child(
+                div()
+                    .id("settings-nav")
+                    .flex()
+                    .flex_col()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    // While a search is running the nav is still there
+                    // and still remembers where you were, but nothing on
+                    // it is lit: the list on the right is not a section
+                    // any more, and lighting one would be pointing at the
+                    // wrong thing.
+                    .children(
+                        Group::ALL.map(|group| group_block(group, page, searching, view, cx)),
+                    ),
+            ),
         )
         .child(
             div()
-                .px(px(10.0))
+                .px(px(8.0))
+                .pt(px(10.0))
                 .text_size(px(10.0))
                 .text_color(theme.muted)
                 .child(format!("mbrd {}", crate::update::version::Version::current())),
@@ -269,47 +739,272 @@ fn sidebar(current: Section, view: &BoardView, cx: &mut Context<BoardView>) -> A
         .into_any_element()
 }
 
+/// The search field over the nav, with the glass in it.
+///
+/// Drawn with `palette::query_line` rather than as a plain string, which is
+/// the difference between a field and a picture of one: `Ctrl A` used to
+/// select all of it and nothing on screen moved. The caret and the wash are
+/// gated on [`Page::focused`] rather than always on — see `query_line`.
+///
+/// Pressing it puts the caret at the end, which is the one placement a field
+/// that cannot measure its own text can honestly offer, and is what pressing
+/// past the end of a short query means anyway.
+fn search_field(page: &Page, view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
+    let theme = view.theme;
+    let empty = page.query.text().is_empty();
+    div()
+        .id("settings-search")
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .mb(px(12.0))
+        .px(px(8.0))
+        .py(px(5.0))
+        .rounded(px(crate::theme::RADIUS_SM))
+        .bg(theme.chrome)
+        .border_1()
+        // Lit while it holds something. The caret says where the keys go; this
+        // says, from across the page, that the list below is a filtered one.
+        .border_color(if empty { theme.chrome_edge } else { theme.accent })
+        .cursor_text()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _event, _window, cx| {
+                this.focus_settings_search(cx);
+                // Stops the page's own handler below from letting go of the
+                // field a moment after this took hold of it: presses bubble
+                // outwards, so the root would otherwise have the last word.
+                cx.stop_propagation();
+            }),
+        )
+        .child(icon(Icon::Search, crate::icons::ICON_SM, theme.tertiary))
+        .child(div().flex_1().min_w_0().text_size(px(12.0)).text_color(theme.text).child(
+            crate::palette::query_line(&page.query, "Search settings…", 12.0, page.focused, &theme),
+        ))
+        // A way out with the mouse, for somebody who typed with the keyboard
+        // and then reached for the pointer. Escape does the same thing.
+        .when(!empty, |d| {
+            d.child(
+                div()
+                    .id("settings-search-clear")
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(14.0))
+                    .rounded(px(crate::theme::RADIUS_XS))
+                    .hover(|s| s.bg(theme.accent.opacity(0.14)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.clear_settings_search(cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child(icon(Icon::Close, crate::icons::ICON_SM, theme.tertiary)),
+            )
+        })
+        .into_any_element()
+}
+
+/// One group, and its sections when it is open.
+fn group_block(
+    group: Group,
+    page: &Page,
+    searching: bool,
+    view: &BoardView,
+    cx: &mut Context<BoardView>,
+) -> AnyElement {
+    let theme = view.theme;
+    let open = page.open[group.slot()];
+    div()
+        .flex()
+        .flex_col()
+        .mb(px(4.0))
+        .child(
+            div()
+                .id(SharedString::from(group.label()))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(8.0))
+                .py(px(5.0))
+                .rounded(px(crate::theme::RADIUS_SM))
+                .text_size(px(13.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .hover(|s| s.bg(theme.chrome))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event, _window, cx| {
+                        this.fold_settings_group(group, cx);
+                    }),
+                )
+                .child(icon(
+                    if open { Icon::CaretDown } else { Icon::CaretRight },
+                    crate::icons::ICON_SM,
+                    theme.tertiary,
+                ))
+                .child(group.label()),
+        )
+        .when(open, |d| {
+            d.children(group.sections().iter().map(|&section| {
+                let active = !searching && section == page.section;
+                div()
+                    .id(SharedString::from(section.label()))
+                    // Indented to where the group's *word* starts rather than
+                    // to where its chevron does, so the children hang off the
+                    // name and the chevron column stays a column.
+                    .ml(px(18.0))
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .mb(px(1.0))
+                    .rounded(px(crate::theme::RADIUS_SM))
+                    .text_size(px(12.0))
+                    .when(active, |d| {
+                        d.bg(theme.accent.opacity(0.12))
+                            .text_color(theme.text)
+                            .font_weight(FontWeight::MEDIUM)
+                    })
+                    .when(!active, |d| d.text_color(theme.muted).hover(|s| s.bg(theme.chrome)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.show_settings_section(section, cx);
+                        }),
+                    )
+                    .child(section.label())
+                    .into_any_element()
+            }))
+        })
+        .into_any_element()
+}
+
 // ---------------------------------------------------------------------------
-// The two sections
+// The rows
 // ---------------------------------------------------------------------------
 
-fn board_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<AnyElement> {
-    let theme = view.theme;
-    let settings = &view.doc.board.settings.desktop;
-    let step = settings.grid_step;
-    let gap = settings.spacing;
-    let fit = view.doc.board.media_fit.clone();
+/// One setting, before it is an element.
+///
+/// A struct rather than a finished `AnyElement`, because the page has to be
+/// able to *match* on a row's words — see the module note on searching — and
+/// a row that had already become a `div` would have thrown them away.
+struct Spec {
+    section: Section,
+    title: SharedString,
+    about: SharedString,
+    control: AnyElement,
+}
+
+impl Spec {
+    /// One setting: a name, the sentence under it, and its control at the
+    /// edge.
+    ///
+    /// The ruled line belongs to the row rather than the list so every row is
+    /// the same shape; the last one's rule reads as the section's own edge.
+    fn into_row(self, say_where: bool, theme: Theme) -> AnyElement {
+        let Self { section, title, about, control } = self;
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(32.0))
+            .py(px(13.0))
+            .border_b_1()
+            .border_color(theme.chrome_edge.opacity(0.6))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .min_w_0()
+                    // Which section a result came from, and only in results:
+                    // a flattened list where every row looks alike is one
+                    // nobody can navigate back to by hand afterwards.
+                    .when(say_where, |d| {
+                        d.child(div().text_size(px(9.0)).text_color(theme.tertiary).child(format!(
+                            "{} · {}",
+                            section.group().label(),
+                            section.label()
+                        )))
+                    })
+                    .child(div().text_size(px(13.0)).font_weight(FontWeight::MEDIUM).child(title))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.muted)
+                            .line_height(gpui::relative(1.4))
+                            .child(about),
+                    ),
+            )
+            .child(div().flex_none().child(control))
+            .into_any_element()
+    }
+}
+
+/// How well one row answers a query, or `None` if it does not.
+///
+/// Title and description both, at the better of the two scores. The words
+/// people remember about a setting are as often in the sentence under it as in
+/// its name — "the space Rearrange leaves" is how somebody thinks of the card
+/// gap.
+///
+/// `query` is already lowercase and the two fields are folded here.
+/// `fuzzy::subsequence` documents that it does no folding of its own, because
+/// a caller matching several fields against one query would otherwise fold the
+/// query once per field — this is exactly such a caller, and handing it the
+/// words as written is why typing `grid` used to find nothing: there is no
+/// lowercase `g` anywhere in "Grid step".
+fn score(query: &str, spec: &Spec) -> Option<i32> {
+    let title = crate::fuzzy::subsequence(query, &spec.title.to_lowercase());
+    let about = crate::fuzzy::subsequence(query, &spec.about.to_lowercase());
+    title.max(about)
+}
+
+fn spec(
+    section: Section,
+    title: impl Into<SharedString>,
+    about: impl Into<SharedString>,
+    control: AnyElement,
+) -> Spec {
+    Spec { section, title: title.into(), about: about.into(), control }
+}
+
+/// Every row the page has, in the order the sections are listed.
+fn rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
+    let mut all = canvas_rows(view, cx);
+    all.extend(arranging_rows(view, cx));
+    all.extend(media_rows(view, cx));
+    all.extend(general_rows(view, cx));
+    all.extend(appearance_rows(view, cx));
+    all.extend(update_rows(view, cx));
+    all
+}
+
+fn canvas_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
+    let step = view.doc.board.settings.desktop.grid_step;
     vec![
-        toggle_row(
-            Command::ToggleGrid,
-            "Draw the dot lattice behind the board.",
-            None,
-            view,
-            cx,
-        ),
-        toggle_row(
+        toggle(Section::Canvas, Command::ToggleGrid, "Draw the dot lattice behind the board.", None, view, cx),
+        toggle(
+            Section::Canvas,
             Command::ToggleSnap,
             "Pull cards onto the grid as they are moved and resized. Turning it on snaps the whole board; turning it off puts everything back.",
             None,
             view,
             cx,
         ),
-        toggle_row(Command::ToggleAxes, "Show the world axes through the origin.", None, view, cx),
-        toggle_row(
-            Command::ToggleWeb,
-            "Draw the ropes between connected cards.",
-            None,
-            view,
-            cx,
-        ),
-        toggle_row(
+        toggle(Section::Canvas, Command::ToggleAxes, "Show the world axes through the origin.", None, view, cx),
+        toggle(Section::Canvas, Command::ToggleWeb, "Draw the ropes between connected cards.", None, view, cx),
+        toggle(
+            Section::Canvas,
             Command::ToggleGuides,
             "Flash a guide when a drag lines up with a neighbour's edge or centre.",
             None,
             view,
             cx,
         ),
-        row(
+        spec(
+            Section::Canvas,
             "Grid step",
             "World units between grid lines. Snapped cards land on multiples of this.",
             segmented(
@@ -320,47 +1015,61 @@ fn board_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<AnyElement> 
                 view,
                 cx,
             ),
-            theme,
-        ),
-        row(
-            "Card gap",
-            "The space Rearrange leaves between cards.",
-            segmented(
-                "card-gap",
-                &GAPS.map(|v| format!("{v}")),
-                GAPS.iter().position(|&v| (v - gap).abs() < 0.01),
-                pick_gap,
-                view,
-                cx,
-            ),
-            theme,
-        ),
-        row(
-            "Media fit",
-            "How photos and videos sit in their cards: the whole picture with margins, or the whole card with crops. A card's own menu can override it.",
-            fit_control(&fit, view, cx),
-            theme,
         ),
     ]
 }
 
-fn application_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<AnyElement> {
-    // A preference the environment has pinned should say so on the row,
-    // rather than appearing to take and then not surviving a restart — the
-    // same warning `toggle_pref` says after the fact, said before it instead.
-    let motion_note = crate::prefs::Prefs::forced(true)
-        .map(|var| format!("Set by {var}, which wins at startup."));
-    let update_note = crate::prefs::Prefs::forced(false)
-        .map(|var| format!("Set by {var}, which wins at startup."));
-    vec![
-        toggle_row(
-            Command::ToggleMotion,
-            "Let the interface move. Turn off to land every change instantly.",
-            motion_note,
+fn arranging_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
+    let gap = view.doc.board.settings.desktop.spacing;
+    vec![spec(
+        Section::Arranging,
+        "Card gap",
+        "The space Rearrange leaves between cards.",
+        segmented(
+            "card-gap",
+            &GAPS.map(|v| format!("{v}")),
+            GAPS.iter().position(|&v| (v - gap).abs() < 0.01),
+            pick_gap,
             view,
             cx,
         ),
-        toggle_row(
+    )]
+}
+
+fn media_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
+    let fit = view.doc.board.media_fit.clone();
+    let fits = ["contain".to_string(), "cover".to_string()];
+    let chosen = fits.iter().position(|f| *f == fit);
+    vec![spec(
+        Section::Media,
+        "Media fit",
+        "How photos and videos sit in their cards: the whole picture with margins, or the whole card with crops. A card's own menu can override it.",
+        segmented("media-fit", &fits, chosen, pick_fit, view, cx),
+    )]
+}
+
+fn general_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
+    // A preference the environment has pinned should say so on the row,
+    // rather than appearing to take and then not surviving a restart — the
+    // same warning `toggle_pref` says after the fact, said before it instead.
+    let motion_note = crate::prefs::Prefs::forced(crate::prefs::Setting::Motion)
+        .map(|var| format!("Set by {var}, which wins at startup."));
+    vec![toggle(
+        Section::General,
+        Command::ToggleMotion,
+        "Let the interface move. Turn off to land every change instantly.",
+        motion_note,
+        view,
+        cx,
+    )]
+}
+
+fn update_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
+    let update_note = crate::prefs::Prefs::forced(crate::prefs::Setting::Update)
+        .map(|var| format!("Set by {var}, which wins at startup."));
+    vec![
+        toggle(
+            Section::Updates,
             Command::ToggleUpdateChecks,
             "Check quietly at startup and say so in the top bar when one exists.",
             update_note,
@@ -372,57 +1081,296 @@ fn application_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<AnyEle
 }
 
 // ---------------------------------------------------------------------------
-// Row chrome
+// Appearance
 // ---------------------------------------------------------------------------
 
-/// One setting: a name, the sentence under it, and its control at the edge.
+fn appearance_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
+    let theme = view.theme;
+    let mode_pinned = crate::prefs::Prefs::forced(crate::prefs::Setting::Appearance);
+    let theme_pinned = crate::prefs::Prefs::forced(crate::prefs::Setting::Theme);
+    let worn = view.appearance();
+
+    let modes = [Mode::System, Mode::Light, Mode::Dark];
+    let mode_labels: Vec<String> = modes.iter().map(|m| m.label().to_string()).collect();
+
+    let mut all = vec![spec(
+        Section::Appearance,
+        "Appearance",
+        match mode_pinned {
+            Some(var) => format!("Set by {var}, which wins at startup."),
+            None => "Light, dark, or whatever your desktop is currently set to.".into(),
+        },
+        segmented(
+            "appearance-mode",
+            &mode_labels,
+            modes.iter().position(|&m| m == view.prefs.mode),
+            pick_mode,
+            view,
+            cx,
+        ),
+    )];
+
+    // Both rows, always, and the one not currently being worn is drawn
+    // quieter rather than hidden. A row that disappears is a row somebody
+    // cannot find again — and the whole point of keeping two names is that
+    // the pair is chosen once and then followed, which means the half you are
+    // not looking at has to be reachable while you are not looking at it.
+    for appearance in [Appearance::Dark, Appearance::Light] {
+        let name = view.prefs.theme_for(appearance).to_string();
+        let known = view.themes.knows(&name, appearance);
+        let live = worn == appearance;
+        let about: SharedString = match (theme_pinned, known) {
+            (Some(var), _) => format!("Set by {var}, which wins at startup.").into(),
+            // The one thing a settings page must not do is show a fallback as
+            // though it were a choice. The name is still what is written
+            // down — it comes back if the file does — and saying so is the
+            // difference between "your theme is missing" and "your theme is
+            // Ash now", which is what a row showing the fallback would imply.
+            (None, false) => format!(
+                "“{name}” is not among the themes this app can find. Wearing the built-in one until it turns up."
+            )
+            .into(),
+            (None, true) => {
+                format!("The palette worn when the app is {}.", appearance.label().to_lowercase())
+                    .into()
+            }
+        };
+        all.push(spec(
+            Section::Appearance,
+            format!("{} theme", appearance.label()),
+            about,
+            dropdown(appearance, &name, known, live, theme, cx),
+        ));
+    }
+
+    all.push(spec(
+        Section::Appearance,
+        "Themes folder",
+        match crate::dirs::themes() {
+            Some(path) => format!(
+                "Drop a .json in {} and press Reload. {}",
+                path.display(),
+                match view.themes.unreadable.len() {
+                    0 => "Everything there was read.".to_string(),
+                    1 => "One file there could not be read.".to_string(),
+                    n => format!("{n} files there could not be read."),
+                }
+            ),
+            None => "There is nowhere on this computer to keep themes.".into(),
+        },
+        button("settings-reload-themes", "Reload", true, theme, cx, |this, cx| {
+            this.reload_themes(cx);
+        }),
+    ));
+    all
+}
+
+/// The control that opens the theme list.
 ///
-/// The ruled line belongs to the row rather than the list so every row is
-/// the same shape; the last one's rule reads as the section's own edge.
-fn row(
-    title: impl Into<SharedString>,
-    about: impl Into<SharedString>,
-    control: AnyElement,
+/// Wears the two carets a dropdown wears, because from where somebody is
+/// sitting that is what it is — what it *opens* is a searchable panel rather
+/// than a popup, for the reasons [`Picker`] gives.
+fn dropdown(
+    appearance: Appearance,
+    name: &str,
+    known: bool,
+    live: bool,
     theme: Theme,
+    cx: &mut Context<BoardView>,
 ) -> AnyElement {
+    let id = match appearance {
+        Appearance::Dark => "settings-theme-dark",
+        Appearance::Light => "settings-theme-light",
+    };
     div()
+        .id(id)
         .flex()
         .items_center()
         .justify_between()
-        .gap(px(32.0))
-        .py(px(13.0))
-        .border_b_1()
-        .border_color(theme.chrome_edge.opacity(0.6))
+        .gap(px(8.0))
+        .px(px(9.0))
+        .py(px(4.0))
+        .min_w(px(154.0))
+        .rounded(px(crate::theme::RADIUS_SM))
+        .text_size(px(11.0))
+        .bg(theme.chrome)
+        .border_1()
+        .border_color(theme.chrome_edge)
+        // The row for the appearance that is not currently on screen is drawn
+        // quieter, so the page says which of the two is answering right now
+        // without taking the other away.
+        .when(!live, |d| d.opacity(0.65))
+        .hover(|s| s.bg(theme.accent.opacity(0.10)))
+        .active(|s| s.bg(theme.accent.opacity(0.18)))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _event, _window, cx| {
+                this.pick_theme(appearance, cx);
+            }),
+        )
         .child(
             div()
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .min_w_0()
-                .child(
-                    div().text_size(px(13.0)).font_weight(FontWeight::MEDIUM).child(title.into()),
-                )
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(theme.muted)
-                        .line_height(gpui::relative(1.4))
-                        .child(about.into()),
-                ),
+                // A name pointing at nothing is drawn in the colour of the
+                // sentence that says so, rather than as an ordinary value.
+                .when(!known, |d| d.text_color(theme.muted))
+                .child(name.to_string()),
         )
-        .child(div().flex_none().child(control))
+        .child(icon(Icon::CaretUpDown, crate::icons::ICON_SM, theme.tertiary))
         .into_any_element()
 }
 
+/// The list itself: a panel over the page, searchable, previewing live.
+fn picker_panel(picker: &Picker, view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
+    let theme = view.theme;
+    let offered = view.themes.of(picker.appearance);
+    let names: Vec<String> = offered.iter().map(|t| t.name.clone()).collect();
+    let matched = picker.matches(&names);
+    // Who each theme is by, for the right-hand side of its row. A map because
+    // the matched list is names and the details are on the registry entries,
+    // and doing the lookup per row inside the loop would be a linear scan of
+    // the registry for every row of it.
+    let by: HashMap<&str, SharedString> = offered
+        .iter()
+        .map(|t| {
+            let words: SharedString = match (t.family.as_str(), t.author.as_str()) {
+                ("", _) => "Built in".into(),
+                (family, "") => family.to_string().into(),
+                (family, author) => format!("{family} · {author}").into(),
+            };
+            (t.name.as_str(), words)
+        })
+        .collect();
+
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .flex()
+        .items_start()
+        .justify_center()
+        .bg(theme.ground.opacity(0.55))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _event, _window, cx| {
+                // Pressing outside abandons, like Escape. A picker whose
+                // answer is already on screen has to make the way out that
+                // does *not* commit the easy one.
+                this.cancel_theme_pick(cx);
+            }),
+        )
+        .child(
+            div()
+                .mt(px(96.0))
+                .w(px(430.0))
+                .flex()
+                .flex_col()
+                .rounded(px(crate::theme::RADIUS_LG))
+                .bg(theme.chrome)
+                .border_1()
+                .border_color(theme.chrome_edge)
+                .shadow(theme.shadow_large())
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .px(px(12.0))
+                        .py(px(9.0))
+                        .border_b_1()
+                        .border_color(theme.chrome_edge)
+                        .text_size(px(13.0))
+                        .text_color(theme.text)
+                        .child(crate::palette::query_line(
+                            &picker.query,
+                            &format!("Search {} themes…", picker.appearance.label().to_lowercase()),
+                            13.0,
+                            true,
+                            &theme,
+                        )),
+                )
+                .child(
+                    div()
+                        .id("theme-picker-list")
+                        .flex()
+                        .flex_col()
+                        .p(px(6.0))
+                        .max_h(px(320.0))
+                        .overflow_y_scroll()
+                        .children(matched.iter().enumerate().map(|(i, name)| {
+                            let lit = i == picker.cursor;
+                            let credit = by.get(name.as_str()).cloned().unwrap_or_default();
+                            let chosen = name.clone();
+                            div()
+                                .id(SharedString::from(format!("theme-{i}")))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(12.0))
+                                .px(px(8.0))
+                                .py(px(5.0))
+                                .rounded(px(crate::theme::RADIUS_SM))
+                                .text_size(px(12.0))
+                                .when(lit, |d| {
+                                    d.bg(theme.accent.opacity(0.14)).text_color(theme.text)
+                                })
+                                .when(!lit, |d| {
+                                    d.text_color(theme.muted)
+                                        .hover(|s| s.bg(theme.accent.opacity(0.07)))
+                                })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _event, _window, cx| {
+                                        cx.stop_propagation();
+                                        this.choose_theme(chosen.clone(), cx);
+                                    }),
+                                )
+                                .child(name.clone())
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .text_color(theme.tertiary)
+                                        .child(credit),
+                                )
+                                .into_any_element()
+                        }))
+                        .when(matched.is_empty(), |d| {
+                            d.child(
+                                div()
+                                    .px(px(8.0))
+                                    .py(px(8.0))
+                                    .text_size(px(12.0))
+                                    .text_color(theme.muted)
+                                    .child("No theme is called that."),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .px(px(12.0))
+                        .py(px(7.0))
+                        .border_t_1()
+                        .border_color(theme.chrome_edge)
+                        .text_size(px(10.0))
+                        .text_color(theme.tertiary)
+                        .child("Arrows to look · Enter to keep · Escape to put it back"),
+                ),
+        )
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Controls
+// ---------------------------------------------------------------------------
+
 /// One switch, run through the same `Command` the menus and the palette run.
-fn toggle_row(
+fn toggle(
+    section: Section,
     command: Command,
     about: &'static str,
     pinned: Option<String>,
     view: &BoardView,
     cx: &mut Context<BoardView>,
-) -> AnyElement {
-    let theme = view.theme;
+) -> Spec {
     let on = command.ticked(view) == Some(true);
     // The environment note replaces the description rather than joining it:
     // "what this does" matters less than "why flipping it will not hold".
@@ -430,7 +1378,7 @@ fn toggle_row(
         Some(words) => words.into(),
         None => about.into(),
     };
-    row(command.label(), about, switch(command, on, view, cx), theme)
+    spec(section, command.label(), about, switch(command, on, view, cx))
 }
 
 /// The switch's footprint, and how far its knob crosses it. Named because
@@ -506,6 +1454,14 @@ fn pick_gap(view: &mut BoardView, at: usize, cx: &mut Context<BoardView>) {
     view.set_spacing(GAPS[at], cx);
 }
 
+fn pick_fit(view: &mut BoardView, at: usize, cx: &mut Context<BoardView>) {
+    view.set_media_fit(if at == 0 { "contain" } else { "cover" }, cx);
+}
+
+fn pick_mode(view: &mut BoardView, at: usize, cx: &mut Context<BoardView>) {
+    view.set_mode([Mode::System, Mode::Light, Mode::Dark][at], cx);
+}
+
 /// A choice made from a short row of segments, drawn as one control rather
 /// than as loose chips: the container is what says the options are one
 /// setting.
@@ -549,7 +1505,7 @@ fn segmented(
                 .rounded(px(crate::theme::RADIUS_XS))
                 .text_size(px(11.0))
                 .bg(theme.accent.opacity(0.16 * lit))
-                .when(active, |d| d.text_color(theme.accent).font_weight(FontWeight::MEDIUM))
+                .when(active, |d| d.text_color(theme.accent_text).font_weight(FontWeight::MEDIUM))
                 .when(!active, |d| {
                     d.text_color(theme.muted)
                         .hover(|s| s.text_color(theme.text).bg(theme.accent.opacity(0.06)))
@@ -572,20 +1528,44 @@ fn segmented(
         .into_any_element()
 }
 
-fn fit_control(current: &str, view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
-    let fits = ["contain".to_string(), "cover".to_string()];
-    let chosen = fits.iter().position(|f| f == current);
-    segmented("media-fit", &fits, chosen, pick_fit, view, cx)
-}
-
-fn pick_fit(view: &mut BoardView, at: usize, cx: &mut Context<BoardView>) {
-    view.set_media_fit(if at == 0 { "contain" } else { "cover" }, cx);
+/// A control that is a verb rather than a state.
+fn button(
+    id: &'static str,
+    word: impl Into<SharedString>,
+    live: bool,
+    theme: Theme,
+    cx: &mut Context<BoardView>,
+    press: fn(&mut BoardView, &mut Context<BoardView>),
+) -> AnyElement {
+    div()
+        .id(id)
+        .px(px(10.0))
+        .py(px(4.0))
+        .rounded(px(crate::theme::RADIUS_SM))
+        .text_size(px(11.0))
+        .border_1()
+        .border_color(theme.chrome_edge)
+        .when(live, |d| {
+            d.bg(theme.chrome)
+                .hover(|s| s.bg(theme.accent.opacity(0.10)))
+                .active(|s| s.bg(theme.accent.opacity(0.18)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event, _window, cx| {
+                        press(this, cx);
+                        cx.notify();
+                    }),
+                )
+        })
+        .when(!live, |d| d.text_color(theme.muted))
+        .child(word.into())
+        .into_any_element()
 }
 
 /// The one row that is a verb rather than a state, so its control is a
 /// button — and the button's word follows how far the last press got, the
 /// same stepper the titlebar badge walks.
-fn update_row(view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
+fn update_row(view: &BoardView, cx: &mut Context<BoardView>) -> Spec {
     let theme = view.theme;
     let live = Command::CheckForUpdates.available(view);
     let word = match view.update_badge() {
@@ -599,28 +1579,233 @@ fn update_row(view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
     } else {
         "This build was not installed from a release, so it has nothing to update.".into()
     };
-    let button = div()
-        .id("settings-update")
-        .px(px(10.0))
-        .py(px(4.0))
-        .rounded(px(crate::theme::RADIUS_SM))
-        .text_size(px(11.0))
-        .border_1()
-        .border_color(theme.chrome_edge)
-        .when(live, |d| {
-            d.bg(theme.chrome)
-                .hover(|s| s.bg(theme.accent.opacity(0.10)))
-                .active(|s| s.bg(theme.accent.opacity(0.18)))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _event, _window, cx| {
-                        this.update_step(cx);
-                        cx.notify();
-                    }),
-                )
-        })
-        .when(!live, |d| d.text_color(theme.muted))
-        .child(word)
-        .into_any_element();
-    row("Check for updates", about, button, theme)
+    spec(
+        Section::Updates,
+        "Check for updates",
+        about,
+        button("settings-update", word, live, theme, cx, |this, cx| {
+            this.update_step(cx);
+        }),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_section_belongs_to_the_group_that_lists_it() {
+        // The two directions have to agree, and nothing else checks them: the
+        // sidebar walks groups down to sections, and the header walks a
+        // section back up to its group to decide which file it says the
+        // answers land in. A section listed under Board that thought it was
+        // an Application one would offer "Edit in settings.json" for a
+        // setting that goes into the `.mbrd`.
+        for group in Group::ALL {
+            for section in group.sections() {
+                assert_eq!(section.group(), group, "{:?}", section.label());
+            }
+        }
+    }
+
+    #[test]
+    fn every_section_is_reachable_from_the_sidebar() {
+        // A section with no way to it is a page of settings nobody can open.
+        // Counted rather than listed, because the listing is the thing under
+        // test.
+        let listed: usize = Group::ALL.iter().map(|g| g.sections().len()).sum();
+        let all = [
+            Section::Canvas,
+            Section::Arranging,
+            Section::Media,
+            Section::General,
+            Section::Appearance,
+            Section::Updates,
+        ];
+        assert_eq!(listed, all.len());
+        for section in all {
+            assert!(
+                section.group().sections().contains(&section),
+                "{:?} is not on its own group's list",
+                section.label()
+            );
+        }
+    }
+
+    fn row(title: &str, about: &str) -> Spec {
+        spec(Section::Canvas, title.to_string(), about.to_string(), div().into_any_element())
+    }
+
+    #[test]
+    fn a_page_nobody_has_typed_into_is_not_drawn_as_one_being_typed_into() {
+        // The field takes the keys from the moment the page opens, and that
+        // is deliberate — but a caret parked in an empty search box on every
+        // frame reads as a page its own search field has taken over. It
+        // appears when somebody uses the field and goes away when they leave
+        // it, which is the only thing `focused` decides.
+        let mut page = Page::open();
+        assert!(!page.focused);
+
+        page.key("g", Modifiers::default(), Some("g"), &[]);
+        assert!(page.focused, "typing is using the field, pointed at or not");
+        assert_eq!(page.query.text(), "g");
+
+        page.key("escape", Modifiers::default(), None, &[]);
+        assert!(!page.focused, "escape clears the search and lets go of it");
+        assert!(!page.searching());
+    }
+
+    #[test]
+    fn a_key_the_field_does_nothing_with_does_not_light_it_up() {
+        // The line is what the *editor* did, not what the key looks like: an
+        // arrow walks the caret and counts as using the field, an `F5` it has
+        // never heard of does not. Drawn from the editor's own answer rather
+        // than from a list of keys here, which is the list that would drift.
+        let mut page = Page::open();
+        page.key("f5", Modifiers::default(), None, &[]);
+        assert!(!page.focused);
+        assert_eq!(page.query.text(), "");
+
+        page.key("left", Modifiers::default(), None, &[]);
+        assert!(page.focused, "the caret moved, so there is a caret to show");
+    }
+
+    #[test]
+    fn searching_finds_a_setting_typed_the_way_anybody_types_it() {
+        // Lowercase, because that is how people type into a search field and
+        // every setting on the page is named with a capital letter. This is
+        // the whole of the bug that made the field appear not to work at all:
+        // `fuzzy::subsequence` takes two *already folded* strings, and there
+        // is no lowercase `g` anywhere in "Grid step".
+        let grid = row("Grid step", "World units between grid lines.");
+        assert!(score("grid", &grid).is_some());
+        assert!(score("gridstep", &grid).is_some(), "a subsequence, not a substring");
+        assert!(score("zzz", &grid).is_none());
+    }
+
+    #[test]
+    fn searching_reads_the_sentence_under_a_setting_as_well_as_its_name() {
+        // The words somebody remembers are as often in the description as in
+        // the title — "the space Rearrange leaves" is how people think of the
+        // card gap, and nothing in that phrase is in its name.
+        let gap = row("Card gap", "The space Rearrange leaves between cards.");
+        assert!(score("rearrange", &gap).is_some());
+        assert!(score("card", &gap).is_some(), "and the title still counts");
+    }
+
+    #[test]
+    fn a_theme_is_found_by_typing_its_name_in_lower_case() {
+        // The picker had the same folding bug as the page's own search, and
+        // for the same reason: every theme in the list is named with a capital
+        // letter.
+        let names: Vec<String> = ["Ash", "Ink", "Sepia"].map(String::from).to_vec();
+        let mut page = Page::open();
+        page.pick_theme(Appearance::Dark, "Ash", &names);
+        let picker = page.picking.as_mut().unwrap();
+        picker.query.insert("sep");
+        assert_eq!(picker.matches(&names), vec!["Sepia".to_string()]);
+    }
+
+    #[test]
+    fn escape_clears_a_search_before_it_closes_the_page() {
+        // Two meanings on one key, and they never collide: an empty field has
+        // nothing to clear. Somebody who typed something and wants the whole
+        // page back should not have to reopen it.
+        let mut page = Page::open();
+        assert_eq!(page.key("escape", Modifiers::default(), None, &[]), Reply::Close);
+        page.query.insert("grid");
+        assert!(page.searching());
+        assert_eq!(page.key("escape", Modifiers::default(), None, &[]), Reply::Held);
+        assert!(!page.searching(), "the first Escape emptied the field");
+        assert_eq!(page.key("escape", Modifiers::default(), None, &[]), Reply::Close);
+    }
+
+    #[test]
+    fn a_picker_opens_on_the_theme_that_is_already_chosen() {
+        // Not at the top. Because arrowing previews, a list that always
+        // opened at the first row would leave somebody who opened it merely
+        // to look one keystroke away from having changed something.
+        let names: Vec<String> = ["Ash", "Ink", "Iron"].map(String::from).to_vec();
+        let mut page = Page::open();
+        page.pick_theme(Appearance::Dark, "Iron", &names);
+        assert_eq!(page.picking.as_ref().map(|p| p.cursor), Some(2));
+        // And a name that is no longer in the list starts at the top rather
+        // than off the end of it.
+        page.pick_theme(Appearance::Dark, "Gone", &names);
+        assert_eq!(page.picking.as_ref().map(|p| p.cursor), Some(0));
+    }
+
+    #[test]
+    fn arrowing_through_the_picker_previews_without_choosing() {
+        let names: Vec<String> = ["Ash", "Ink", "Iron"].map(String::from).to_vec();
+        let mut page = Page::open();
+        page.pick_theme(Appearance::Dark, "Ash", &names);
+        assert_eq!(
+            page.key("down", Modifiers::default(), None, &names),
+            Reply::Preview(Appearance::Dark, "Ink".into())
+        );
+        // Nothing has been chosen yet — the picker is still open, which is
+        // the whole difference between a preview and a choice.
+        assert!(page.picking.is_some());
+        assert_eq!(
+            page.key("enter", Modifiers::default(), None, &names),
+            Reply::Choose(Appearance::Dark, "Ink".into())
+        );
+        assert!(page.picking.is_none());
+    }
+
+    #[test]
+    fn abandoning_the_picker_names_what_to_go_back_to() {
+        // The reason `Picker::was` exists. By the time Escape arrives the app
+        // is already wearing something nobody agreed to, and the only record
+        // of the real choice is the one taken before the first preview.
+        let names: Vec<String> = ["Ash", "Ink"].map(String::from).to_vec();
+        let mut page = Page::open();
+        page.pick_theme(Appearance::Dark, "Ash", &names);
+        page.key("down", Modifiers::default(), None, &names);
+        assert_eq!(
+            page.key("escape", Modifiers::default(), None, &names),
+            Reply::Cancel(Appearance::Dark, "Ash".into())
+        );
+        assert!(page.picking.is_none());
+    }
+
+    #[test]
+    fn typing_in_the_picker_previews_whatever_ends_up_under_the_highlight() {
+        // The highlight did not move; the list moved under it. Previewing on
+        // the keystroke rather than on the row would leave the app wearing
+        // the theme that *used* to be first.
+        let names: Vec<String> = ["Ash", "Ink", "Iron"].map(String::from).to_vec();
+        let mut page = Page::open();
+        page.pick_theme(Appearance::Dark, "Ash", &names);
+        assert_eq!(
+            page.key("r", Modifiers::default(), Some("r"), &names),
+            Reply::Preview(Appearance::Dark, "Iron".into())
+        );
+    }
+
+    #[test]
+    fn a_picker_with_nothing_in_it_cannot_be_accepted() {
+        // Enter on an empty list is not a choice. It puts back what was
+        // there, which is what Escape does — there is no third answer to
+        // "keep the theme you cannot see".
+        let names: Vec<String> = ["Ash"].map(String::from).to_vec();
+        let mut page = Page::open();
+        page.pick_theme(Appearance::Dark, "Ash", &names);
+        page.key("z", Modifiers::default(), Some("z"), &names);
+        assert_eq!(
+            page.key("enter", Modifiers::default(), None, &names),
+            Reply::Cancel(Appearance::Dark, "Ash".into())
+        );
+    }
+
+    #[test]
+    fn folding_a_group_leaves_the_other_one_alone() {
+        let mut page = Page::open();
+        assert_eq!(page.open, [true, true], "a page opens with its contents showing");
+        page.fold(Group::Board);
+        assert_eq!(page.open, [false, true]);
+        page.fold(Group::Board);
+        assert_eq!(page.open, [true, true]);
+    }
 }

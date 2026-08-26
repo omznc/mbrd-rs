@@ -1,0 +1,36 @@
+{
+  "name": "Sepia",
+  "author": "mbrd",
+  "themes": [
+    {
+      "name": "Sepia",
+      "appearance": "light",
+      "style": {
+        "ground": "#f7efdc",
+        "chrome": "#efe6d2",
+        "card": "#fdf7e9",
+        "selected_edge": "#9b4a17",
+
+        "text": "#2b2519",
+        "muted": "#615645",
+        "tertiary": "#867a66",
+        "accent": "#9b4a17",
+        "accent_text": "#9b4a17",
+
+        "note": "#f6e7bd",
+        "image": "#dfe9e2",
+        "video": "#efe0e2",
+        "audio": "#dfeada",
+        "link": "#e4e2ee",
+        "fence": "#9b4a1714",
+
+        "quote": "#5f5443",
+        "note_link": "#8f4a1c",
+
+        "rope_accent": "#9b4a17",
+
+        "notes": ["#f2e8c2", "#d9ecc9", "#d8e6ee", "#f1d8dd"]
+      }
+    }
+  ]
+}
