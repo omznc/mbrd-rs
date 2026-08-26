@@ -229,19 +229,41 @@ pub fn resized(
 
     if let Some(shape) = keep.filter(|s| s.is_finite() && *s > 0.0) {
         let (moves_w, moves_h) = grip.moves();
+
+        // Re-derive an aspect-corrected axis from its own flagged edge and put
+        // that edge back through `place`, so it lands on the grid exactly like
+        // the axis that was actually dragged — otherwise the correction quietly
+        // undoes whatever snap already happened on the edge it's replacing.
+        // `moving_hi` matches `span`'s meaning below: true when the *high* edge
+        // (x1/y1) is the one this axis moves, so the anchor is the low edge.
+        let snapped_from_edge = |anchor: f32, raw: f32, moving_hi: bool| -> f32 {
+            match to_grid {
+                None => clamp_size(raw),
+                Some(_) => {
+                    let edge = if moving_hi { anchor + raw } else { anchor - raw };
+                    clamp_size((place(edge) - anchor).abs())
+                }
+            }
+        };
+
         // A corner follows whichever axis was dragged further, so the card
         // keeps up with the pointer instead of lagging on one side. An edge has
         // only one axis, and the other simply follows it.
         if moves_w && moves_h {
             if w / shape > h {
-                h = clamp_size(w / shape);
+                let anchor = if t { out.y0 } else { out.y1 };
+                h = snapped_from_edge(anchor, w / shape, t);
             } else {
-                w = clamp_size(h * shape);
+                let anchor = if r { out.x0 } else { out.x1 };
+                w = snapped_from_edge(anchor, h * shape, r);
             }
         } else if moves_w {
-            h = clamp_size(w / shape);
+            // The other axis has no edge of its own — `span` grows it about
+            // the centre — so there is nothing to line up on the grid except
+            // the size itself.
+            h = clamp_size(place(w / shape));
         } else {
-            w = clamp_size(h * shape);
+            w = clamp_size(place(h * shape));
         }
     }
 
@@ -412,6 +434,43 @@ mod tests {
         let out = resized(Grip::Right, card(), point(287.0, 0.0), None, Some(64.0));
         assert_eq!(out.x1, 256.0);
         assert_eq!(out.x0, -100.0, "and the anchored edge is not snapped");
+    }
+
+    #[test]
+    fn keeping_aspect_while_snapping_a_dragged_corner_lands_the_corrected_edge_on_the_grid_too() {
+        // width (356, driven directly by the pointer) beats height, so the
+        // aspect lock overwrites height — and that overwritten edge must land
+        // on the grid too, not at whatever the raw ratio produced.
+        let out = resized(Grip::TopRight, card(), point(287.0, 30.0), Some(1.6), Some(64.0));
+        assert_eq!((out.x0, out.x1), (-100.0, 256.0), "the driven axis is untouched by this fix");
+        assert_eq!(out.y0, -50.0, "the anchored edge never moves");
+        assert_eq!(out.y1, 192.0, "the aspect-derived edge must also sit on the grid");
+    }
+
+    #[test]
+    fn keeping_aspect_while_snapping_a_dragged_corner_handles_the_other_overwritten_axis() {
+        // Same bug, opposite branch: height drives, so width gets overwritten.
+        let out = resized(Grip::TopLeft, card(), point(-120.0, 250.0), Some(1.6), Some(64.0));
+        assert_eq!(out.x1, 100.0, "the anchored edge never moves");
+        assert_eq!((out.y0, out.y1), (-50.0, 256.0), "the driven axis is untouched by this fix");
+        assert_eq!(out.x0, -384.0, "the aspect-derived edge must also sit on the grid");
+    }
+
+    #[test]
+    fn keeping_aspect_while_snapping_a_single_edge_snaps_the_derived_size_not_a_position() {
+        // Right has no edge on the vertical axis — span grows it about the
+        // centre — so there's nothing to line up on the grid except height.
+        let out = resized(Grip::Right, card(), point(300.0, 0.0), Some(2.0), Some(64.0));
+        assert_eq!((out.x0, out.x1), (-100.0, 320.0), "the driven edge is unaffected");
+        assert_eq!(
+            out.height(),
+            192.0,
+            "the derived size should be a whole multiple of the grid step"
+        );
+        assert!(
+            (out.centre().y - 0.0).abs() < 0.001,
+            "still centred, per the existing centring rule"
+        );
     }
 
     #[test]
