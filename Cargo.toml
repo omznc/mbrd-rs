@@ -12,19 +12,38 @@ anyhow = "1"
 # Pinned to the line gpui itself uses, so `image::Frame` here and
 # `image::Frame` inside `RenderImage` are the same type rather than two.
 image = "0.25"
-# The update path. `ureq` is blocking and runs on gpui's background executor,
-# which is the whole reason it is here rather than reqwest: the lockfile
-# already carries a full reqwest and tokio through `gpui_http_client`, but
-# gpui's default client is `NullHttpClient` and reaching the real one means
-# standing a tokio runtime up beside gpui's smol executor for two GET
-# requests. `minisign-verify` verifies and cannot sign, which is the only half
-# that belongs in a binary handed to other people.
+# The update path, and following a pasted link in `fetch.rs`. `ureq` is
+# blocking and runs on gpui's background executor, which is the whole reason it
+# is here rather than reqwest: the lockfile already carries a full reqwest and
+# tokio through `gpui_http_client`, but gpui's default client is
+# `NullHttpClient` and reaching the real one means standing a tokio runtime up
+# beside gpui's smol executor for a handful of requests. `minisign-verify`
+# verifies and cannot sign, which is the only half that belongs in a binary
+# handed to other people.
 flate2 = "1"
+# A PDF's page count and the text pulled out of it, with no rasteriser
+# anywhere behind it — that is a native dependency and, per `VIEWING.md`,
+# not the price of entry for reading what a PDF actually says.
+lopdf = "0.44"
 minisign-verify = "0.2"
+# The Markdown front end. `default-features = false` because the crate also
+# ships an HTML writer and a `getopts` CLI, and this build wants neither: what
+# is used here is the pull parser and the source ranges it hands back with
+# every event, which is what lets a block remember which bytes of the note it
+# came from.
+pulldown-cmark = { version = "0.13", default-features = false }
+# The one dependency VIEWING.md calls the highest value per unit of work in
+# tranche 4: an SVG shown as a picture rather than as its own XML. Re-exports
+# `usvg` and `tiny_skia`, so nothing else here needs to depend on either
+# directly.
+resvg = "0.48"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 tar = "0.4"
+# Reads a dropped font's own name table so its specimen sheet can be set in
+# its own face rather than in a label saying what the file is called.
+ttf-parser = "0.25"
 # The only irreversible action in the app is a board delete, and this is what
 # stops it from being one: `trash::delete` implements the freedesktop trash
 # spec on Linux and the native Recycle Bin / Trash on Windows and macOS,

@@ -15,11 +15,15 @@ anyhow.workspace = true
 flate2.workspace = true
 gpui = "0.2.2"
 image.workspace = true
+lopdf.workspace = true
 minisign-verify.workspace = true
+resvg.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tar.workspace = true
 trash.workspace = true
+ttf-parser.workspace = true
 ureq.workspace = true
 
 # Only to put an icon on the Windows executable — but declared unconditionally
