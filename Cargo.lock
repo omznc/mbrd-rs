@@ -3346,7 +3346,7 @@ dependencies = [
 
 [[package]]
 name = "mbrd"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "embed-resource",
@@ -3368,7 +3368,7 @@ dependencies = [
 
 [[package]]
 name = "mbrd-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "flate2",
