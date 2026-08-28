@@ -180,6 +180,22 @@ impl Box2 {
     }
 }
 
+/// How many bars a waveform is drawn as, along a scrubber this wide.
+///
+/// One bar per three pixels: a bar and a gap at a width a person can see, which
+/// at a card's usual size is somewhere between forty and a hundred and sixty.
+/// The ceiling is not about drawing cost — it is that past it the bars are
+/// thinner than the gaps and the whole thing reads as a texture rather than as
+/// a recording.
+///
+/// Here rather than in the painter because two places need the same answer: the
+/// painter, which draws that many, and `board_view::controls_for`, which
+/// resamples the stored peaks down to that many so the painter never carries
+/// numbers it will not draw.
+pub fn bars(track: Box2) -> usize {
+    ((track.width() / 3.0).floor() as usize).clamp(1, 160)
+}
+
 /// Where each control sits, once the card's width has had its say.
 ///
 /// The two that are never `None` are the two the strip exists for.

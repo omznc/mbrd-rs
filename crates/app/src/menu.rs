@@ -34,10 +34,12 @@
 //! went away. What the fit cannot see is where the *rows* are once the list is
 //! scrolled, so a submenu is given the scroll of the list that opened it.
 
-use gpui::{div, prelude::*, px, Context, MouseButton, Pixels, Point, ScrollHandle, Size};
+use gpui::{
+    div, prelude::*, px, AnyElement, Context, MouseButton, Pixels, Point, ScrollHandle, Size,
+};
 
 use crate::board_view::BoardView;
-use crate::command::Entry;
+use crate::command::{Command, Entry};
 use crate::icons::{icon, Icon};
 
 /// How wide the list is where the window has room for it. Fixed rather than
@@ -55,6 +57,29 @@ const RULE_HEIGHT: f32 = 9.0;
 /// up as one cut short in a window with room to spare.
 const RULE_MARGIN: f32 = 4.0;
 const PADDING: f32 = 6.0;
+/// One colour cell in the picker grid, and the air between two of them.
+///
+/// Small on purpose. A swatch is not a button you read, it is a colour you
+/// point at, and seventeen of them have to sit inside [`WIDTH`] without the
+/// list growing wider than every other menu in the app.
+const SWATCH: f32 = 18.0;
+const SWATCH_GAP: f32 = 3.0;
+/// The air above and below the grid, which is a little more than a row's own
+/// padding so the block of colour does not crowd the entries either side.
+const SWATCH_MARGIN: f32 = 5.0;
+/// How many cells fit across. Nine, which is the plain cell plus the pad's own
+/// first eight, leaving the second row the remaining eight and a ragged end.
+/// Counted rather than left to a wrap, because [`Menu::extent`] has to know
+/// the grid's height before anything is drawn — the same bargain
+/// [`RULE_MARGIN`] strikes.
+const SWATCH_COLS: usize = 9;
+/// How many rows of cells there are: the plain one, then every shade the theme
+/// can make. See [`crate::theme::SHADE_COUNT`].
+const SWATCH_ROWS: usize = (crate::theme::SHADE_COUNT as usize + 1).div_ceil(SWATCH_COLS);
+/// The grid's own indent, matching the one a row draws itself at so the block
+/// of colour lines up with the labels above and below it rather than with the
+/// edge of the list.
+const SWATCH_INSET: f32 = 4.0 + 8.0;
 /// The line around the list, which counts towards its size: gpui measures the
 /// border box, so a height worked out here without it would be two pixels shy
 /// of what gets drawn.
@@ -79,12 +104,14 @@ const OVERLAP: f32 = 4.0;
 /// the thing being read. [`crate::icons::ICON_SM`] — the same size every other
 /// inline, gutter-sized mark in the app draws at.
 const MARK: f32 = crate::icons::ICON_SM;
-/// The room the tick sits in, whether or not the row has one.
+/// The room the row's picture sits in, whether or not the row has one.
 ///
-/// Fixed, so the labels line up down a menu where only some entries are
-/// settings — a gutter that collapsed on the untickable rows would step every
-/// label in the list left and right depending on its neighbours.
-const GUTTER: f32 = 12.0;
+/// Fixed, so the labels line up down a menu where only some entries carry a
+/// mark — a gutter that collapsed on the ones without would step every label in
+/// the list left and right depending on its neighbours. A shade wider than
+/// [`MARK`], so the picture has air on its right rather than butting into the
+/// word it belongs to.
+const GUTTER: f32 = 14.0;
 
 /// A list, fitted to the window: where its corner goes, and how much of it
 /// there is room to draw.
@@ -211,6 +238,11 @@ impl Menu {
     fn extent(entry: &Entry) -> f32 {
         match entry {
             Entry::Rule => RULE_HEIGHT + RULE_MARGIN * 2.0,
+            Entry::Shades => {
+                SWATCH * SWATCH_ROWS as f32
+                    + SWATCH_GAP * (SWATCH_ROWS - 1) as f32
+                    + SWATCH_MARGIN * 2.0
+            }
             _ => ROW_HEIGHT,
         }
     }
@@ -331,11 +363,16 @@ impl Menu {
                 i = i.clamp(0, last);
                 break;
             }
-            if !matches!(entries[i as usize], Entry::Rule) {
+            if !matches!(entries[i as usize], Entry::Rule | Entry::Shades) {
                 break;
             }
         }
-        if matches!(entries[i as usize], Entry::Rule) {
+        // The grid is walked past for the same reason a rule is: neither is a
+        // row, and a highlight the width of the list drawn over a block of
+        // colour would say the whole block was about to be chosen. The pointer
+        // picks a colour; the keyboard has `T` — see
+        // [`crate::board_view::BoardView::cycle_tint`].
+        if matches!(entries[i as usize], Entry::Rule | Entry::Shades) {
             return;
         }
         match &mut self.open {
@@ -439,6 +476,7 @@ fn list(
                 .border_t_1()
                 .border_color(theme.chrome_edge)
                 .into_any_element(),
+            Entry::Shades => swatches(name, view, cx).into_any_element(),
             entry => row(name, i, *entry, lit == Some(i), sub, view, cx).into_any_element(),
         })
         .collect();
@@ -491,6 +529,77 @@ fn list(
         .children(rows)
 }
 
+/// The colour picker, as a block of cells rather than a list of rows.
+///
+/// A colour has no name worth reading, so naming sixteen of them down a list
+/// would be sixteen rows of a word nobody wants. The grid is the control: the
+/// first cell puts a card back to whatever its kind is normally, and the rest
+/// are the theme's shades in order — the pad's own four first, so the four the
+/// file format actually defines are the four nearest the corner, and the
+/// twelve the theme makes up afterwards. See [`crate::theme::Theme::shade`].
+///
+/// Whatever the selection already wears is ringed. Where a selection wears more
+/// than one colour nothing is ringed, which is the truth: there is no "current"
+/// colour to show, only a set of them.
+fn swatches(name: &'static str, view: &BoardView, cx: &mut Context<BoardView>) -> impl IntoElement {
+    let theme = view.theme;
+    let now = view.tint_now();
+
+    // Nought first — "no colour" is a colour to choose, and putting it at the
+    // front means the ragged end of the grid falls at the end of the list
+    // rather than in the middle of the pad. Everything after it comes from the
+    // theme in one go, so the grid cannot end up showing a different set of
+    // colours from the one the cards are painted with.
+    let cells: Vec<AnyElement> = std::iter::once(None)
+        .chain(theme.shades().into_iter().map(Some))
+        .enumerate()
+        .map(|(at, shade)| {
+            let n = at as u32;
+            let ringed = now == Some(n);
+            div()
+                .id(gpui::SharedString::from(format!("{name}-shade-{n}")))
+                .size(px(SWATCH))
+                .rounded(px(crate::theme::RADIUS_XS))
+                .border_1()
+                // The plain cell is drawn as the card's own colour so it looks
+                // like the thing it does, and given the same edge a card has so
+                // it does not read as a hole in the grid.
+                .bg(shade.unwrap_or(theme.card))
+                .border_color(match ringed {
+                    true => theme.accent,
+                    false => theme.chrome_edge,
+                })
+                // Ringed rather than ticked: a tick drawn on a swatch has to be
+                // one colour or the other and would vanish against half the pad.
+                .when(ringed, |d| d.border_2())
+                .hover(|s| s.border_color(theme.text))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event, _window, cx| {
+                        // Closed first, like every other entry that does
+                        // something: a picker left open over the cards it has
+                        // just recoloured hides the answer to "did that work".
+                        this.close_menu();
+                        this.tint_as(n, cx);
+                    }),
+                )
+                .into_any_element()
+        })
+        .collect();
+
+    div()
+        .my(px(SWATCH_MARGIN))
+        .mx(px(SWATCH_INSET))
+        .flex()
+        .flex_wrap()
+        .gap(px(SWATCH_GAP))
+        // The wrap needs a width to wrap inside, and it is the same arithmetic
+        // `SWATCH_COLS` promises `Menu::extent` — stated here so a change to
+        // one is a change the other cannot miss.
+        .w(px(SWATCH * SWATCH_COLS as f32 + SWATCH_GAP * (SWATCH_COLS - 1) as f32))
+        .children(cells)
+}
+
 fn row(
     name: &'static str,
     key: usize,
@@ -509,6 +618,24 @@ fn row(
     let available = entry.available(view);
     let ticked = matches!(entry, Entry::Does(command) if command.ticked(view) == Some(true));
     let more = matches!(entry, Entry::More(..));
+    // Red, and red on the words as well as on the mark. A row that takes
+    // something off the board is the one row in a menu worth spending a colour
+    // on — see `Command::destructive` for which two those are, and why the
+    // clipboard's `Cut` is not among them.
+    let grave = matches!(entry, Entry::Does(command) if command.destructive());
+    // A rope colour draws as *itself* rather than as a picture of a swatch.
+    // It is the one row in any of these menus whose whole content is a colour,
+    // and a mark that named the colour instead of being it would make the row
+    // a word you have to trust. See `Theme::rope_for`.
+    let dot = match entry {
+        Entry::Does(Command::ConnColour(colour)) => Some(theme.rope_for(colour)),
+        _ => None,
+    };
+    let ink = match (available, grave) {
+        (false, _) => theme.muted,
+        (_, true) => theme.rope_danger,
+        _ => theme.text,
+    };
 
     // Named after the step it would take back rather than labelled "Undo", so
     // the entry says what is about to happen instead of only whether anything
@@ -517,7 +644,7 @@ fn row(
     let label = match entry {
         Entry::Does(command) => command.label_in(view),
         Entry::More(name, _) => name.to_string(),
-        Entry::Rule => String::new(),
+        Entry::Rule | Entry::Shades => String::new(),
     };
 
     div()
@@ -529,7 +656,7 @@ fn row(
         .mx(px(4.0))
         .px(px(8.0))
         .rounded(px(crate::theme::RADIUS_XS))
-        .when(!available, |d| d.text_color(theme.muted))
+        .text_color(ink)
         // A row whose submenu is open stays lit while the pointer is off in
         // that submenu, which is what says where the second list came from —
         // and the same highlight the keyboard cursor draws, since the two are
@@ -569,7 +696,7 @@ fn row(
                             this.close_menu();
                             command.run(this, window, cx);
                         }
-                        Entry::Rule => {}
+                        Entry::Rule | Entry::Shades => {}
                     }),
                 )
         })
@@ -577,22 +704,32 @@ fn row(
             div()
                 .flex()
                 .items_center()
-                .gap(px(6.0))
+                .gap(px(8.0))
                 // Takes what the hint beside it does not, and gives the label
                 // room to be cut short rather than wrapped: a row that grew to
                 // two lines would make every height worked out above it wrong,
                 // and every flip decision that rests on one.
                 .flex_1()
                 .overflow_hidden()
-                // A fixed-width gutter, so the labels line up whether or not
-                // the entry above them happens to be ticked.
+                // A fixed-width gutter holding the row's own picture, so the
+                // labels line up down the list whether or not their neighbours
+                // have one. See [`Entry::mark`] for what goes in it and why so
+                // many rows share a mark.
                 .child(
-                    div()
-                        .flex_none()
-                        .w(px(GUTTER))
-                        .flex()
-                        .items_center()
-                        .when(ticked, |d| d.child(icon(Icon::Check, MARK, theme.accent))),
+                    div().flex_none().w(px(GUTTER)).flex().items_center().child(match dot {
+                        Some(colour) => {
+                            div().size(px(9.0)).rounded(px(2.0)).bg(colour).into_any_element()
+                        }
+                        None => div()
+                            .children(entry.mark().map(|mark| {
+                                let ink = match grave {
+                                    true => theme.rope_danger,
+                                    false => theme.muted,
+                                };
+                                icon(mark, MARK, ink)
+                            }))
+                            .into_any_element(),
+                    }),
                 )
                 .child(div().truncate().child(label)),
         )
@@ -606,6 +743,12 @@ fn row(
                 .text_size(px(10.0))
                 .text_color(theme.muted)
                 .child(entry.hint(view))
+                // The tick sits on the *right*, past the key that does it,
+                // because the left is the picture's now. It still means the
+                // same thing it always did — this row names a state the board
+                // is already in — and it is still the only mark in the app
+                // drawn in the accent.
+                .when(ticked, |d| d.child(icon(Icon::Check, MARK, theme.accent)))
                 .when(more, |d| d.child(icon(Icon::CaretRight, MARK, theme.muted))),
         )
 }
@@ -628,6 +771,68 @@ mod tests {
             && placed.at.y >= px(0.0)
             && placed.at.x + placed.size.width <= room.width
             && placed.at.y + placed.size.height <= room.height
+    }
+
+    /// The grid promises a height before anything is drawn, and the wrap it is
+    /// drawn with has to agree with that promise. Both are worked out from
+    /// `SWATCH_COLS`, so the test is really that seventeen cells at nine
+    /// across is two rows and not three — which is the arithmetic that would
+    /// quietly change the day somebody adds a shade.
+    #[test]
+    fn the_colour_grid_is_as_tall_as_the_rows_it_wraps_into() {
+        let cells = crate::theme::SHADE_COUNT as usize + 1;
+        assert_eq!(SWATCH_ROWS, cells.div_ceil(SWATCH_COLS), "the rows do not match the cells");
+        let wide = SWATCH * SWATCH_COLS as f32 + SWATCH_GAP * (SWATCH_COLS - 1) as f32;
+        let room = WIDTH - (BORDER + SWATCH_INSET) * 2.0;
+        assert!(
+            wide <= room,
+            "a row of {SWATCH_COLS} cells is {wide} wide, and the list has {room}"
+        );
+        assert_eq!(
+            Menu::extent(&Entry::Shades),
+            SWATCH * SWATCH_ROWS as f32
+                + SWATCH_GAP * (SWATCH_ROWS - 1) as f32
+                + SWATCH_MARGIN * 2.0,
+            "the height promised is not the height of the rows"
+        );
+    }
+
+    /// The keyboard walks past the grid the way it walks past a rule. Pressing
+    /// Down from the top of the card menu — where [`Entry::Shades`] is the
+    /// first entry — has to land on the first *row*, because a highlight the
+    /// width of the list drawn over a block of colour would say the whole
+    /// block was about to be chosen.
+    #[test]
+    fn the_keyboard_steps_over_the_colour_grid() {
+        let entries = vec![
+            Entry::Shades,
+            Entry::Does(Command::Undo),
+            Entry::Rule,
+            Entry::Does(Command::Redo),
+        ];
+        let mut menu = Menu::new(at(10.0, 10.0), entries, room(1000.0, 700.0));
+
+        menu.step(1);
+        assert_eq!(menu.cursor, Some(1), "the first press down landed on the grid");
+        menu.step(1);
+        assert_eq!(menu.cursor, Some(3), "the rule was not stepped over");
+        menu.step(-1);
+        menu.step(-1);
+        assert_eq!(menu.cursor, Some(1), "going back up landed on the grid");
+        // And it stays there rather than falling onto the grid at the end.
+        menu.step(-1);
+        assert_eq!(menu.cursor, Some(1), "stepping off the top landed on the grid");
+    }
+
+    /// A list that is nothing but a grid has nowhere for the cursor to go, and
+    /// the answer has to be "nowhere" rather than a cursor parked on it — the
+    /// same answer a list of nothing but rules gives.
+    #[test]
+    fn a_list_of_only_colours_takes_no_cursor() {
+        let mut menu = Menu::new(at(10.0, 10.0), vec![Entry::Shades], room(1000.0, 700.0));
+        menu.step(1);
+        assert_eq!(menu.cursor, None, "the cursor landed on a grid");
+        assert_eq!(menu.chosen(), None, "Enter would have chosen the grid");
     }
 
     /// The whole point of the file, asked of every list, in every window worth

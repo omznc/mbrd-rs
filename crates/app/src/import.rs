@@ -21,11 +21,15 @@
 //!    whether somebody meant to put a two-gigabyte video on a moodboard; the
 //!    layer that can say so is the one holding the pointer.
 //!
-//! What is deliberately *not* here: the original's catalogue of some thirteen
-//! hundred formats, which is generated rather than written. What is below is
-//! the families that matter for the four card types this build can draw,
-//! plus enough of a long tail that an unrecognised file still arrives as a
-//! named card rather than as nothing. See the roadmap's Phase 3.
+//! The two halves of "what is this", and they are deliberately different
+//! sizes. **What kind of card it becomes** is the short hand-written table in
+//! [`kind_of`] below — short because every entry is a promise that this build
+//! can draw the thing, and a card type given out generously is a frame on the
+//! board that stays empty forever. **What it is called** is
+//! [`mbrd_core::formats`], thirteen hundred extensions generated from the
+//! original's own catalogue, because a name costs nothing to be generous with:
+//! a `.sldprt` reading "SolidWorks part" is strictly better than "file" even
+//! though neither will ever open.
 
 use std::path::{Path, PathBuf};
 
@@ -399,6 +403,12 @@ fn sniff(bytes: &[u8]) -> Option<(ItemType, &'static str, &'static str)> {
         _ if matches!(brand, Some(b"M4A ") | Some(b"M4B ")) => {
             (ItemType::Audio, "AAC audio", "m4a")
         }
+        // A Canon RAW is an ISO container too, and without this arm it would
+        // fall through to the catch-all below and land as a *video* — the one
+        // way the bytes-first rule can be worse than the name, since the name
+        // says `.cr3` plainly. Named rather than drawn, for the reason
+        // `kind_of` gives: nothing here decodes it.
+        _ if brand == Some(b"crx ") => (ItemType::Generic, "Canon RAW (CR3)", "cr3"),
         // Every other ISO brand is some flavour of MP4. Checked last of the
         // `ftyp` arms for exactly that reason.
         _ if brand.is_some() => (ItemType::Video, "MPEG-4 video", "mp4"),
@@ -430,43 +440,74 @@ fn sniff(bytes: &[u8]) -> Option<(ItemType, &'static str, &'static str)> {
 }
 
 /// What the name claims, for bytes that gave nothing away.
+///
+/// Two questions with two different answers behind them — see the module note.
+/// The kind comes off the hand-written table; the words come off the generated
+/// catalogue, and fall back to the family it is filed under and then to the
+/// one word [`kind_of`] can always give. So an extension nobody has ever heard
+/// of still lands as a named card, which is what the last arm of the table is
+/// for.
 fn by_extension(ext: &str) -> (ItemType, &'static str) {
+    let kind = kind_of(ext);
+    let described = mbrd_core::formats::name(ext)
+        .or_else(|| mbrd_core::formats::family(ext).map(|f| f.label))
+        .unwrap_or_else(|| kind_of_word(&kind));
+    (kind, described)
+}
+
+/// The one word that is true of every card of a kind, for a file the catalogue
+/// has never heard of.
+fn kind_of_word(kind: &ItemType) -> &'static str {
+    match kind {
+        ItemType::Image => "image",
+        ItemType::Video => "video",
+        ItemType::Audio => "audio",
+        ItemType::Model => "3D / CAD",
+        ItemType::Note => "text",
+        // Not a failure. An unknown file arrives as a named card holding its
+        // own bytes, which is what lets a board be a place you put things
+        // before you know what to do with them.
+        _ => "file",
+    }
+}
+
+/// What kind of card this extension makes.
+///
+/// **Kept short on purpose**, and every arm is a claim that something in this
+/// tree can draw it. See the module note for why the catalogue is not allowed
+/// to answer this: it knows a `.cr3` is a photograph, and nothing here decodes
+/// Canon RAW.
+fn kind_of(ext: &str) -> ItemType {
     match ext {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "qoi" | "ico"
-        | "tga" | "exr" | "hdr" => (ItemType::Image, "image"),
         // Vector, so it never has magic bytes worth trusting — an SVG is XML
         // and may start with a comment, a declaration or the tag itself.
-        "svg" => (ItemType::Image, "SVG image"),
-        // Real pictures that nothing in this tree can decode: AVIF wants
-        // `dav1d`, and HEIC and JPEG XL the `image` crate does not do at all.
-        // Calling them images would put a card on the board that can never draw
-        // — a permanently empty frame, which is worse than the named file card
-        // every other unopenable format already gets. Reclassified rather than
-        // dropped: the bytes are kept, so a build that grows a decoder can call
-        // them images again. See `VIEWING.md`.
-        "avif" | "heic" | "heif" | "jxl" => (ItemType::Generic, "image"),
+        | "tga" | "exr" | "hdr" | "svg" => ItemType::Image,
 
         "mp4" | "m4v" | "mov" | "webm" | "mkv" | "avi" | "wmv" | "flv" | "mpg" | "mpeg" | "ogv"
-        | "3gp" | "mts" => (ItemType::Video, "video"),
+        | "3gp" | "mts" => ItemType::Video,
 
         "mp3" | "wav" | "flac" | "ogg" | "oga" | "opus" | "m4a" | "aac" | "aiff" | "aif"
-        | "wma" | "alac" | "ape" => (ItemType::Audio, "audio"),
+        | "wma" | "alac" | "ape" => ItemType::Audio,
 
         "glb" | "gltf" | "obj" | "stl" | "fbx" | "dae" | "3mf" | "ply" | "usdz" | "blend"
-        | "step" | "stp" | "iges" | "igs" | "sldprt" | "sldasm" => (ItemType::Model, "3D / CAD"),
+        | "step" | "stp" | "iges" | "igs" | "sldprt" | "sldasm" => ItemType::Model,
 
-        "md" | "markdown" | "txt" | "text" | "rst" | "org" => (ItemType::Note, "text"),
+        "md" | "markdown" | "txt" | "text" | "rst" | "org" => ItemType::Note,
 
-        "ttf" | "otf" | "ttc" | "woff" | "woff2" => (ItemType::Generic, "font"),
-        "pdf" => (ItemType::Generic, "PDF document"),
-        "zip" | "tar" | "gz" | "tgz" | "7z" | "rar" | "xz" | "zst" => {
-            (ItemType::Generic, "archive")
-        }
-
-        // Not a failure. An unknown file arrives as a named card holding its own
-        // bytes, which is what lets a board be a place you put things before you
-        // know what to do with them.
-        _ => (ItemType::Generic, "file"),
+        // Everything else is a named card holding its own bytes, which is what
+        // lets a board be a place you put things before you know what to do
+        // with them. Fonts, PDFs and archives all land here and all have a
+        // page of their own to open on — see `opened.rs`.
+        //
+        // So do the real pictures nothing in this tree can decode: AVIF wants
+        // `dav1d`, and HEIC and JPEG XL the `image` crate does not do at all.
+        // Calling them images would put a card on the board that can never
+        // draw — a permanently empty frame, which is worse than the named file
+        // card every other unopenable format already gets. Reclassified rather
+        // than dropped: the bytes are kept, so a build that grows a decoder can
+        // call them images again. See `VIEWING.md`.
+        _ => ItemType::Generic,
     }
 }
 
@@ -516,14 +557,34 @@ mod tests {
     fn the_name_is_believed_when_the_bytes_say_nothing() {
         let (kind, described, ext) = classify("model.sldprt", b"\0\0\0\0nothing in particular");
         assert_eq!(kind, ItemType::Model);
-        assert_eq!(described, "3D / CAD");
+        // Off the catalogue, which is the whole reason it is here: the hand
+        // table only knows this is a mesh-ish thing, and "3D / CAD" was all
+        // a card could say about it before.
+        assert_eq!(described, "SolidWorks part");
         assert_eq!(ext, "sldprt");
+    }
+
+    /// The catalogue names what the hand table has no opinion about, and the
+    /// hand table still decides what kind of card it is.
+    #[test]
+    fn the_catalogue_names_what_the_hand_table_cannot_draw() {
+        let (kind, described, _) = classify("layers.psd", b"8BPS\0\x01");
+        assert_eq!(kind, ItemType::Generic, "nothing here decodes a PSD");
+        assert_eq!(described, "Photoshop document");
+
+        // A photograph by every measure except the one that matters: no
+        // decoder, so no image card. See `kind_of`.
+        let (kind, described, _) = classify("dsc_0001.cr3", b"\0\0\0\x18ftypcrx ");
+        assert_eq!(kind, ItemType::Generic);
+        assert_eq!(described, "Canon RAW (CR3)");
     }
 
     #[test]
     fn a_file_nobody_wrote_a_rule_for_still_arrives() {
         let (kind, described, ext) = classify("notes.xyzzy", b"whatever this is");
         assert_eq!(kind, ItemType::Generic);
+        // Thirteen hundred extensions and this is not one of them, so the card
+        // falls all the way back to the word every card can wear.
         assert_eq!(described, "file");
         assert_eq!(ext, "xyzzy");
     }

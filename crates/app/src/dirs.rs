@@ -146,16 +146,32 @@ pub fn state() -> Option<PathBuf> {
 ///
 /// Nothing here creates the directory; see the module note. The caller about to
 /// write is the one that knows whether it is worth making.
+///
+/// **This is the answer for somebody who has not chosen one.** It is the only
+/// one of the five that a person can override — the other four are places the
+/// platform set aside and not anybody's business — so most callers want
+/// `Prefs::boards`, which falls through to here. See `prefs.rs`, whose
+/// `boards_dir` note is about why the unchosen case stays a `None` there
+/// rather than being written down as this path.
 pub fn boards() -> Option<PathBuf> {
     Some(home_dir()?.join(APP))
 }
 
 /// What can be thrown away without losing anything.
 ///
-/// Nothing uses this yet. It is here because the alternative is that the next
-/// thing wanting somewhere to put a download works it out for itself, which is
-/// the mistake this module exists to undo.
-#[allow(dead_code)]
+/// Where `pipeline.rs` lays a played file out for the media stack to open, and
+/// the first caller this had — it was written empty, on the argument that the
+/// next thing wanting somewhere to put a file would otherwise work it out for
+/// itself. Everything under here is rebuildable from a `.mbrd` that still
+/// exists, which is what the word cache is claiming.
+///
+/// Allowed dead on the platforms that swap in `pipeline_off.rs`, where there is
+/// no media backend to lay a file out for — see that file's note. The three
+/// real ones all reach here through [`crate::spill`].
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    allow(dead_code)
+)]
 pub fn cache() -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     let dir = from_env("XDG_CACHE_HOME").or_else(|| home(".cache"))?.join(APP);

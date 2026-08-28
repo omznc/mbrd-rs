@@ -41,11 +41,34 @@ mod mesh_cache;
 mod metrics;
 mod opened;
 mod palette;
+// Sound and video. Four files behind one name, and the swap is here rather
+// than as a `cfg` at every call site: GStreamer on Linux, AVFoundation on
+// macOS, the Media Foundation Media Engine on Windows, and a stand-in
+// elsewhere that answers "not in this build" to every question.
+//
+// Three backends rather than one because the one — GStreamer — is a link-time
+// dependency, and satisfying it on the other two would cost Windows its
+// single-file portable `.exe` and macOS a bundled framework. AVFoundation and
+// Media Foundation are already in those operating systems. Each file is the
+// same `Stack`, and `board_view.rs` cannot tell which it holds.
+#[cfg_attr(target_os = "macos", path = "pipeline_mac.rs")]
+#[cfg_attr(target_os = "windows", path = "pipeline_win.rs")]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    path = "pipeline_off.rs"
+)]
+mod pipeline;
 mod playback;
 mod prefs;
 mod recent;
 mod save;
 mod settings;
+mod shrink;
+// The half of the media stack that is the same everywhere. Not compiled where
+// `pipeline_off.rs` is, which is the one platform with nothing to lay out.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+mod spill;
+mod stock;
 mod switcher;
 mod taps;
 mod theme;
@@ -55,6 +78,7 @@ mod titlebar;
 mod tools;
 mod transport;
 mod update;
+mod welcome;
 mod wires;
 
 use std::cell::RefCell;
@@ -303,6 +327,22 @@ fn main() {
         if let Some(path) = dropped.borrow_mut().take() {
             view.update(cx, |view, cx| view.open_board(&path, cx));
         }
+
+        // The first run, if this is one.
+        //
+        // **After the board, deliberately.** A person who double-clicked a
+        // `.mbrd` has said what they wanted this launch to be, and putting
+        // four questions over the top of it would be answering a different
+        // one — this way the board is already open and loading behind the
+        // screen, so closing it lands on the thing they asked for rather than
+        // on the demonstration board. It also means the welcome screen is
+        // drawn over a real board on the one launch where the miniature
+        // preview is being used to choose a theme.
+        //
+        // Here rather than in `BoardView::new` because it needs the window to
+        // exist first: the screen is an `Overlay`, and an overlay opened
+        // before there is anything to overlay has nowhere to be.
+        view.update(cx, |view, cx| view.welcome_if_new(cx));
 
         // Collect anything the Finder hands over from now on. A poll, and
         // deliberately: the alternative is parking one of the background

@@ -165,6 +165,81 @@ pub fn scale_bar(scale: f32, zoom: f32, units: &str, target_px: f32) -> Option<(
     Some((base * per_base, label(base, imperial)))
 }
 
+/// What `scale` should become for a line of `world` units to measure what
+/// somebody says it measures.
+///
+/// The other direction through the same lens [`scale_bar`] looks along:
+/// `scale` is world units per millimetre, so a line that is 400 world units
+/// long and is *actually* 100mm gives a scale of 4. That is the whole of the
+/// calibration — the hard part is the sentence, not the arithmetic.
+///
+/// `said` is what was typed: a number, and a unit where there is one. The unit
+/// wins over `imperial` when it is written, because somebody who types "30 cm"
+/// on an imperial board has said which they meant more clearly than the board
+/// setting has. Where none is written, `imperial` decides — inches or
+/// millimetres — since the whole reason that setting exists is what a bare
+/// number means.
+///
+/// `None` for anything that could not be a measurement: a line of no length, a
+/// number that is not one, nought or a negative, and a unit nobody wrote. A
+/// board's scale is a number every other measurement is read through, so
+/// guessing at a stray one would be worse than refusing it.
+pub fn calibrate(world: f32, said: &str, imperial: bool) -> Option<f32> {
+    if !(world.is_finite() && world > 0.0) {
+        return None;
+    }
+    let mm = millimetres(said, imperial)?;
+    let scale = world / mm;
+    scale.is_finite().then_some(scale).filter(|s| *s > 0.0)
+}
+
+/// A typed measurement in millimetres — "30cm", "12 in", `1.5 m`, `6"`, or a
+/// bare number read in whichever unit `imperial` names.
+///
+/// The unit is matched against the same words [`label`] writes, plus the two
+/// marks a keyboard reaches faster than either word: `"` for inches and `'`
+/// for feet. Case and the space between are both forgiven, because a
+/// measurement is typed in a hurry.
+pub fn millimetres(said: &str, imperial: bool) -> Option<f32> {
+    let said = said.trim().to_ascii_lowercase();
+    // The number is however much of the front reads as one. Split by position
+    // rather than by whitespace, so "30cm" and "30 cm" are the same sentence.
+    let split = said
+        .char_indices()
+        .find(|(_, c)| !(c.is_ascii_digit() || *c == '.' || *c == ',' || *c == '-' || *c == '+'))
+        .map_or(said.len(), |(at, _)| at);
+    let (number, unit) = said.split_at(split);
+    // A comma is a decimal point in most of the world and a thousands
+    // separator in the rest, and a measurement typed into a one-line field is
+    // never big enough to need the second reading.
+    let value: f32 = number.replace(',', ".").parse().ok()?;
+    if !(value.is_finite() && value > 0.0) {
+        return None;
+    }
+    let per = match unit.trim() {
+        "mm" => 1.0,
+        "cm" => 10.0,
+        "m" => 1000.0,
+        "km" => 1_000_000.0,
+        "in" | "inch" | "inches" | "\"" => 25.4,
+        "ft" | "foot" | "feet" | "'" => 304.8,
+        "yd" | "yard" | "yards" => 914.4,
+        "mi" | "mile" | "miles" => 1_609_344.0,
+        // Nothing written, so the board's own units answer.
+        "" => {
+            if imperial {
+                25.4
+            } else {
+                1.0
+            }
+        }
+        // A word nobody here knows. Refused rather than read as the default —
+        // see [`calibrate`] on why a stray scale is worse than none.
+        _ => return None,
+    };
+    Some(value * per)
+}
+
 fn label(base: f32, imperial: bool) -> String {
     let trim = |v: f32| {
         if (v - v.round()).abs() < 0.001 {
@@ -303,5 +378,54 @@ mod tests {
         let (_, metric) = scale_bar(4.0, 1.0 / 4.0, "metric", 120.0).unwrap();
         let (_, other) = scale_bar(4.0, 1.0 / 4.0, "nonsense", 120.0).unwrap();
         assert_eq!(metric, other);
+    }
+
+    #[test]
+    fn a_line_of_four_hundred_units_that_is_a_hundred_millimetres_is_a_scale_of_four() {
+        assert_eq!(calibrate(400.0, "100mm", false), Some(4.0));
+        assert_eq!(calibrate(400.0, "10 cm", false), Some(4.0));
+        assert_eq!(calibrate(400.0, "0.1m", false), Some(4.0));
+    }
+
+    /// The whole reason the calibration and the scale bar are in one module:
+    /// what one writes the other has to be able to read back.
+    #[test]
+    fn calibrating_against_a_bar_gives_the_scale_that_drew_it() {
+        let scale = 4.0;
+        let (world, said) = scale_bar(scale, 1.0, "metric", 120.0).unwrap();
+        let back = calibrate(world, &said, false).unwrap();
+        assert!((back - scale).abs() < 0.001, "{back} should be {scale}");
+    }
+
+    #[test]
+    fn a_written_unit_beats_the_boards_own() {
+        // Somebody who types "30 cm" on an imperial board has said which they
+        // meant more plainly than the setting has.
+        assert_eq!(millimetres("30cm", true), Some(300.0));
+        // And a bare number is read in whichever the board is set to.
+        assert_eq!(millimetres("1", true), Some(25.4));
+        assert_eq!(millimetres("1", false), Some(1.0));
+    }
+
+    #[test]
+    fn the_marks_a_keyboard_reaches_first_are_units_too() {
+        assert_eq!(millimetres("6\"", false), Some(152.4));
+        assert_eq!(millimetres("2'", false), Some(609.6));
+    }
+
+    #[test]
+    fn a_decimal_comma_is_a_decimal_point() {
+        assert_eq!(millimetres("1,5cm", false), Some(15.0));
+    }
+
+    #[test]
+    fn nothing_that_is_not_a_measurement_becomes_one() {
+        assert_eq!(millimetres("", false), None);
+        assert_eq!(millimetres("wide", false), None);
+        assert_eq!(millimetres("0mm", false), None);
+        assert_eq!(millimetres("-3cm", false), None);
+        assert_eq!(millimetres("30 furlongs", false), None);
+        // And no line is no calibration, whatever was typed.
+        assert_eq!(calibrate(0.0, "10cm", false), None);
     }
 }

@@ -18,7 +18,7 @@ cargo run -p mbrd                       # a demonstration board
 cargo run -p mbrd -- some-board.mbrd    # a real one
 ```
 
-Building from source on Linux needs one extra package — see
+Building from source on Linux needs a handful of system packages — see
 [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Themes
@@ -51,6 +51,7 @@ what it draws.
 | `F2` or `Enter` | type into a card without leaving the board |
 | `N` / `K` / `E` | new note / new color / new fence |
 | `T` | next tint, on a note |
+| `#` | put a word on what is selected, off the list of words already on the board |
 | `Ctrl`+`G` / `Ctrl`+`Shift`+`G` | group what is selected into a fence / dissolve it |
 | double-click a card in a fence | steps inside, so presses reach what is in it; `Esc` steps back out |
 | hover a card, drag a mark | pull a rope to another card |
@@ -63,6 +64,7 @@ what it draws.
 | `[` / `]` | send to back / bring to front |
 | `G` / `X` / `S` | grid / axes / snapping |
 | drop a file or folder, or `Ctrl`+`V` | put it on the board |
+| the View menu, or `Shift` `Shift` | show only what wears a tag, walk the board's tour, set the scale by drawing a line along something you know the size of, and see what the board is made of and what it weighs |
 | `Ctrl`+`Z` / `Ctrl`+`Shift`+`Z` | undo / redo |
 | `Ctrl`+`S` | save now, and say so — the board is written a second after every change without it |
 | `Ctrl`+`N` | a new board, in `~/mbrd` |
@@ -91,8 +93,10 @@ myboard.mbrd
 ## What is not here yet
 
 The short version: no input method for composing keyboards, no rich text beyond
-Markdown, no sticker shapes, no file picker, video and audio do not play, and
-rotation round-trips but is not drawn. [`ROADMAP.md`](ROADMAP.md) has the plan,
+Markdown, no sticker shapes, no playlist for a board's audio, and rotation
+round-trips but is not drawn. Sound and video play on all three platforms,
+through the decoder the machine already has, so which formats work is the
+machine's answer rather than mbrd's. [`ROADMAP.md`](ROADMAP.md) has the plan,
 what has been cut, and why.
 
 ## Contributing

@@ -13,7 +13,7 @@
 //! the *test* happens in screen pixels and the *result* is in world units, and
 //! this module is the only place the two meet outside `viewport.rs`.
 
-use mbrd_core::geometry::{clamp_size, snap, Point, Rect};
+use mbrd_core::geometry::{cells, clamp_size, place, snap, Point, Rect};
 use mbrd_core::viewport::Viewport;
 
 /// How far from an edge or corner still counts as being on the handle.
@@ -185,8 +185,15 @@ fn near(a: Point, b: Point) -> bool {
 /// card that has been stretched away from them should come back to them rather
 /// than preserve the stretch. `None` resizes freely.
 ///
-/// `to_grid` snaps the moving edges, not the centre, because it is the edges
-/// somebody is lining up.
+/// `to_grid` snaps the edges, not the centre, because it is the edges somebody
+/// is lining up — and **all four of them**, not only the two being dragged.
+/// The anchored edge used to be left alone on the reasoning that a resize
+/// should not move the side nobody touched. But the size is the gap between
+/// the two, so an anchor sitting mid-square guarantees a size that is not a
+/// whole number of cells and a card that can never come square however
+/// carefully its other edge is placed. On a board that is already snapped the
+/// anchor is on a dot and rounding it does nothing; on one that is not, this
+/// is what makes the first resize tidy the card instead of preserving the mess.
 pub fn resized(
     grip: Grip,
     start: Rect,
@@ -197,22 +204,17 @@ pub fn resized(
     let (l, r, t, b) = grip.edges();
     let mut out = start;
 
-    let place = |v: f32| match to_grid {
+    let to_dot = |v: f32| match to_grid {
         Some(step) => snap(v, step),
         None => v,
     };
-    if l {
-        out.x0 = place(pointer.x);
-    }
-    if r {
-        out.x1 = place(pointer.x);
-    }
-    if t {
-        out.y1 = place(pointer.y);
-    }
-    if b {
-        out.y0 = place(pointer.y);
-    }
+    // The dragged edges follow the pointer; the other two are put on the
+    // nearest dot where they stand. Both go through the same rounding, so a
+    // card that was already square comes out of this untouched.
+    out.x0 = to_dot(if l { pointer.x } else { out.x0 });
+    out.x1 = to_dot(if r { pointer.x } else { out.x1 });
+    out.y1 = to_dot(if t { pointer.y } else { out.y1 });
+    out.y0 = to_dot(if b { pointer.y } else { out.y0 });
 
     // Dragging an edge past its opposite flips the card rather than inverting
     // it, which is what a rectangle given by edges would otherwise do — and an
@@ -224,46 +226,44 @@ pub fn resized(
         std::mem::swap(&mut out.y0, &mut out.y1);
     }
 
-    let mut w = clamp_size(out.width());
-    let mut h = clamp_size(out.height());
+    // Whole cells on a snapped board, the plain clamp otherwise. Since both
+    // edges of a dragged axis are now on dots, the gap between them is already
+    // a whole number of cells and this changes nothing there — it is the
+    // aspect-derived sizes below, and the `MIN_SIZE` floor, that need it. A
+    // card may not come out of a resize smaller than one square of the
+    // pattern: `clamp_size` would stop it at `MIN_SIZE`, which on the default
+    // lattice is smaller than a cell and a multiple of nothing.
+    let size = |v: f32| match to_grid {
+        Some(step) => cells(v, step),
+        None => clamp_size(v),
+    };
+    let mut w = size(out.width());
+    let mut h = size(out.height());
 
     if let Some(shape) = keep.filter(|s| s.is_finite() && *s > 0.0) {
         let (moves_w, moves_h) = grip.moves();
 
-        // Re-derive an aspect-corrected axis from its own flagged edge and put
-        // that edge back through `place`, so it lands on the grid exactly like
-        // the axis that was actually dragged — otherwise the correction quietly
-        // undoes whatever snap already happened on the edge it's replacing.
-        // `moving_hi` matches `span`'s meaning below: true when the *high* edge
-        // (x1/y1) is the one this axis moves, so the anchor is the low edge.
-        let snapped_from_edge = |anchor: f32, raw: f32, moving_hi: bool| -> f32 {
-            match to_grid {
-                None => clamp_size(raw),
-                Some(_) => {
-                    let edge = if moving_hi { anchor + raw } else { anchor - raw };
-                    clamp_size((place(edge) - anchor).abs())
-                }
-            }
-        };
-
         // A corner follows whichever axis was dragged further, so the card
         // keeps up with the pointer instead of lagging on one side. An edge has
         // only one axis, and the other simply follows it.
+        //
+        // The derived axis goes through `size` like the dragged one, which is
+        // all the grid needs from it now: a whole-cell size measured from an
+        // anchor that is on a dot puts the far edge on a dot too, so there is
+        // no separate edge-rounding pass to keep in step with this one. It
+        // costs the ratio a little — a shape can only be held as exactly as
+        // two whole numbers of cells can express it — and that is the trade a
+        // snapped board is asking for.
         if moves_w && moves_h {
             if w / shape > h {
-                let anchor = if t { out.y0 } else { out.y1 };
-                h = snapped_from_edge(anchor, w / shape, t);
+                h = size(w / shape);
             } else {
-                let anchor = if r { out.x0 } else { out.x1 };
-                w = snapped_from_edge(anchor, h * shape, r);
+                w = size(h * shape);
             }
         } else if moves_w {
-            // The other axis has no edge of its own — `span` grows it about
-            // the centre — so there is nothing to line up on the grid except
-            // the size itself.
-            h = clamp_size(place(w / shape));
+            h = size(w / shape);
         } else {
-            w = clamp_size(place(h * shape));
+            w = size(h * shape);
         }
     }
 
@@ -273,7 +273,23 @@ pub fn resized(
     // that does not pick a side arbitrarily.
     let (x0, x1) = span(out.x0, out.x1, w, l, r);
     let (y0, y1) = span(out.y0, out.y1, h, b, t);
-    Rect { x0, y0, x1, y1 }
+    let out = Rect { x0, y0, x1, y1 };
+
+    // That centre-grown axis is the one case where two dots and a whole-cell
+    // size still do not land on a dot: a card three cells tall has its middle
+    // half a cell off the pattern, and growing a two-cell size about that
+    // middle puts both new edges mid-square. So the axis nobody dragged is
+    // placed rather than centred — it keeps the middle it had to within half a
+    // cell, and it keeps the lattice exactly.
+    match to_grid {
+        None => out,
+        Some(step) => {
+            let centre = out.centre();
+            let x = if l || r { centre.x } else { place(centre.x, w, step) };
+            let y = if t || b { centre.y } else { place(centre.y, h, step) };
+            Rect::centred(x, y, w, h)
+        }
+    }
 }
 
 /// One axis of the above: keep the anchored edge, put the other `size` away.
@@ -428,49 +444,101 @@ mod tests {
         assert_eq!(out.width(), MAX_SIZE);
     }
 
+    /// Every edge of a rectangle, counted in grid cells from the origin.
+    ///
+    /// A whole number is on a dot and anything else is not, which is the only
+    /// question a snapped resize has to answer.
+    fn in_cells(r: Rect, step: f32) -> [f32; 4] {
+        [r.x0 / step, r.x1 / step, r.y0 / step, r.y1 / step]
+    }
+
+    fn all_whole(r: Rect, step: f32) -> bool {
+        in_cells(r, step).iter().all(|v| (v - v.round()).abs() < 0.001)
+    }
+
     #[test]
     fn snapping_lines_up_the_edge_being_dragged() {
         // 287 is a hair nearer 256 than 320, and snapping rounds.
         let out = resized(Grip::Right, card(), point(287.0, 0.0), None, Some(64.0));
         assert_eq!(out.x1, 256.0);
-        assert_eq!(out.x0, -100.0, "and the anchored edge is not snapped");
+        // And the anchored edge comes onto the lattice with it. The card in
+        // this test starts at -100, which is mid-square: leaving it there — as
+        // this used to — would hand back a card 356 wide, five and a half
+        // cells, which is exactly the size a snapped board is not allowed to
+        // produce.
+        assert_eq!(out.x0, -128.0, "the anchored edge is squared up too");
+        assert_eq!(out.width(), 384.0, "six whole cells");
+        assert!(all_whole(out, 64.0), "{out:?}");
     }
 
     #[test]
     fn keeping_aspect_while_snapping_a_dragged_corner_lands_the_corrected_edge_on_the_grid_too() {
-        // width (356, driven directly by the pointer) beats height, so the
-        // aspect lock overwrites height — and that overwritten edge must land
-        // on the grid too, not at whatever the raw ratio produced.
+        // width (driven directly by the pointer) beats height, so the aspect
+        // lock overwrites height — and that overwritten edge must land on the
+        // grid too, not at whatever the raw ratio produced.
         let out = resized(Grip::TopRight, card(), point(287.0, 30.0), Some(1.6), Some(64.0));
-        assert_eq!((out.x0, out.x1), (-100.0, 256.0), "the driven axis is untouched by this fix");
-        assert_eq!(out.y0, -50.0, "the anchored edge never moves");
+        assert_eq!((out.x0, out.x1), (-128.0, 256.0), "the driven axis, both edges squared");
+        assert_eq!(out.y0, -64.0, "the anchored edge, squared where it stood");
         assert_eq!(out.y1, 192.0, "the aspect-derived edge must also sit on the grid");
+        assert!(all_whole(out, 64.0), "{out:?}");
     }
 
     #[test]
     fn keeping_aspect_while_snapping_a_dragged_corner_handles_the_other_overwritten_axis() {
-        // Same bug, opposite branch: height drives, so width gets overwritten.
+        // Same case, opposite branch: height drives, so width gets overwritten.
         let out = resized(Grip::TopLeft, card(), point(-120.0, 250.0), Some(1.6), Some(64.0));
-        assert_eq!(out.x1, 100.0, "the anchored edge never moves");
-        assert_eq!((out.y0, out.y1), (-50.0, 256.0), "the driven axis is untouched by this fix");
+        assert_eq!(out.x1, 128.0, "the anchored edge, squared where it stood");
+        assert_eq!((out.y0, out.y1), (-64.0, 256.0), "the driven axis, both edges squared");
         assert_eq!(out.x0, -384.0, "the aspect-derived edge must also sit on the grid");
+        assert!(all_whole(out, 64.0), "{out:?}");
     }
 
     #[test]
     fn keeping_aspect_while_snapping_a_single_edge_snaps_the_derived_size_not_a_position() {
         // Right has no edge on the vertical axis — span grows it about the
-        // centre — so there's nothing to line up on the grid except height.
+        // centre — so there is nothing to line up on the grid except height.
         let out = resized(Grip::Right, card(), point(300.0, 0.0), Some(2.0), Some(64.0));
-        assert_eq!((out.x0, out.x1), (-100.0, 320.0), "the driven edge is unaffected");
-        assert_eq!(
-            out.height(),
-            192.0,
-            "the derived size should be a whole multiple of the grid step"
-        );
+        assert_eq!((out.x0, out.x1), (-128.0, 320.0), "the driven axis, both edges squared");
+        assert_eq!(out.height(), 256.0, "the derived size is a whole number of cells");
         assert!(
             (out.centre().y - 0.0).abs() < 0.001,
             "still centred, per the existing centring rule"
         );
+        assert!(all_whole(out, 64.0), "{out:?}");
+    }
+
+    #[test]
+    fn a_snapped_resize_lands_every_edge_on_the_grid_from_every_handle() {
+        // The centre-grown axis is the one this is really about: a card an odd
+        // number of cells tall has its middle half a cell off the pattern, so
+        // growing the other axis about that middle used to put both of its
+        // edges mid-square — a resize that snapped and still came out halfway.
+        let step = 64.0;
+        // Deliberately mid-square to begin with, and an odd number of cells
+        // once it has been squared up, so neither axis starts out convenient.
+        let start = Rect::centred(30.0, -18.0, 170.0, 210.0);
+        for grip in ALL {
+            for at in [point(287.0, 30.0), point(-311.0, -122.0), point(41.0, 260.0)] {
+                for keep in [None, Some(1.6), Some(0.5)] {
+                    let out = resized(grip, start, at, keep, Some(step));
+                    assert!(all_whole(out, step), "{grip:?} at {at:?} keeping {keep:?}: {out:?}");
+                    assert!(out.width() >= step, "{grip:?}: {} is under a cell", out.width());
+                    assert!(out.height() >= step, "{grip:?}: {} is under a cell", out.height());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_snapped_card_cannot_be_dragged_smaller_than_one_square_of_the_pattern() {
+        // Free, the floor is `MIN_SIZE` — which is 48, smaller than a 64 cell
+        // and a multiple of nothing. Snapped, the floor has to be the cell, or
+        // the smallest card on the board is one that sits across the grid.
+        let out = resized(Grip::Right, card(), point(-99.0, 0.0), None, Some(64.0));
+        assert_eq!(out.width(), 64.0);
+        assert!(all_whole(out, 64.0), "{out:?}");
+        // The pinned edge is still the pinned edge, so it shrank towards it.
+        assert_eq!(out.x1, -64.0, "grown from the anchor, which was squared to -128");
     }
 
     #[test]

@@ -43,7 +43,7 @@ use crate::command::{Command, Entry};
 use crate::editor::{self, Editor};
 use crate::fetch;
 use crate::grips::Grip;
-use crate::icons::{icon, Icon};
+use crate::icons::{icon, Icon, ICON_MD, ICON_SM};
 use crate::images::{Images, Load, THUMB_SIDE};
 use crate::import;
 use crate::live::Live;
@@ -355,12 +355,55 @@ const LABEL_ZOOM: f32 = 0.25;
 /// delta to the rounded result quantises the delta itself, so any drag slower
 /// than half a step per frame rounds straight back to where it started and the
 /// card never leaves the first cell it snapped to.
-fn dropped_at(home: WorldPoint, dx: f32, dy: f32, to_grid: Option<f32>) -> WorldPoint {
+///
+/// The card's `size` is wanted because the lattice takes **edges**, not
+/// centres: a card an odd number of cells wide has its middle half a cell off
+/// the pattern, so rounding the middle is what put cards halfway onto the grid
+/// in the first place. See [`geometry::place`], which is where that is argued
+/// and where every other snapped placement goes through.
+fn dropped_at(
+    home: WorldPoint,
+    dx: f32,
+    dy: f32,
+    size: (f32, f32),
+    to_grid: Option<f32>,
+) -> WorldPoint {
     let free = point(home.x + dx, home.y + dy);
     match to_grid {
-        Some(step) => point(geometry::snap(free.x, step), geometry::snap(free.y, step)),
+        Some(step) => {
+            point(geometry::place(free.x, size.0, step), geometry::place(free.y, size.1, step))
+        }
         None => free,
     }
+}
+
+/// The lattice this board is snapped to, or `None` if it is not snapped.
+///
+/// One question asked in one place. Every caller that has to decide whether to
+/// round something wants the same two fields and the same guard on the step —
+/// a board from somewhere else can carry a step of zero or a NaN, and a
+/// lattice of nothing is not a lattice.
+fn lattice(board: &mbrd_core::Board) -> Option<f32> {
+    let settings = &board.settings.desktop;
+    (settings.snap && settings.grid_step.is_finite() && settings.grid_step > 0.0)
+        .then_some(settings.grid_step)
+}
+
+/// Put a card onto the lattice, if the board is on one.
+///
+/// For everything that *arrives* on a board rather than being dragged onto it:
+/// a fresh note, a pasted card, a dropped photograph, a duplicate. Snapping is
+/// a property of the board, so a card put down on a snapped board is on the
+/// grid from the moment it lands — the alternative is a setting that tidies
+/// what was already there and then lets every new card sit halfway across it,
+/// which is not a grid anybody can build on.
+fn settle(item: &mut Item, to_grid: Option<f32>) {
+    let Some(step) = to_grid else { return };
+    let (x, y, w, h) = geometry::conform(item.x, item.y, item.w, item.h, step);
+    item.x = x;
+    item.y = y;
+    item.w = w;
+    item.h = h;
 }
 
 /// Move a presence value a frame nearer 0 or 1, and say whether it moved.
@@ -576,6 +619,14 @@ enum Gesture {
     /// same call the press made with `extend` set, and the release has nothing
     /// to close: a text selection is not board state and costs no undo step.
     SelectingText,
+    /// Drawing the line whose real-world length is about to be named.
+    ///
+    /// Carries nothing, like [`Gesture::SelectingText`] and for the same
+    /// reason: both ends live on [`BoardView::measuring`], which has to outlive
+    /// the drag. A gesture ends at the release, and the line has to stay on
+    /// screen while the answer is being typed — otherwise the question "how
+    /// long is that?" would be asked about something nobody can see any more.
+    Measuring,
     /// Sweeping out a selection rectangle over empty space.
     Marquee {
         from: WorldPoint,
@@ -900,11 +951,35 @@ impl Tone {
         }
     }
 
-    /// What colour it is drawn in. Only a failure earns the accent.
+    /// What colour the *words* are drawn in.
+    ///
+    /// A failure is the one tone whose words are near white. That is the whole
+    /// of the weight difference between it and [`Tone::Told`]: both are one
+    /// short line beside a small mark in the corner of the window, and the one
+    /// that says something did not happen has to win the glance. Colour alone
+    /// on the mark would not do it — the mark is twelve pixels.
     fn colour(self, theme: &Theme) -> gpui::Hsla {
         match self {
-            Tone::Wrong => theme.accent,
+            Tone::Wrong => theme.text,
+            Tone::Mode => theme.accent_text,
             _ => theme.muted,
+        }
+    }
+
+    /// What colour the *mark* is drawn in.
+    ///
+    /// Apart from the words, because the mark is doing a different job: it is
+    /// what makes the four tones tellable apart before a word of any of them
+    /// has been read, and it is the only part of the line that is allowed to
+    /// be a colour rather than a weight.
+    fn mark(self, theme: &Theme) -> gpui::Hsla {
+        match self {
+            Tone::Wrong => theme.rope_danger,
+            Tone::Mode => theme.accent_text,
+            // Blue rather than muted, and it is the app's only blue mark: an
+            // outline `i` that is the same colour as the sentence beside it is
+            // punctuation, not a signal.
+            Tone::Done | Tone::Told => theme.link,
         }
     }
 }
@@ -941,12 +1016,26 @@ enum Updating {
 ///
 /// A projection of [`Updating`] rather than the thing itself, so the bar can
 /// read the state without the state machine leaking out of this module: the
-/// bar needs three sentences and a fraction, not artifacts and paths. `None`
-/// covers both `Idle` and `Looking` — a check that is merely running is not
-/// worth a badge, because most checks end in nothing and a flicker of chrome
-/// on every launch would teach everybody to ignore the spot.
+/// bar needs four sentences and a fraction, not artifacts and paths.
+///
+/// **The four are one control at four stages, not four things.** They keep the
+/// same place, near enough the same width, and the same press; what changes is
+/// how loudly they are drawn, and the loudness is earned — nothing waiting is
+/// a version in muted with no border, and only the last one, which has a
+/// finished download behind it and a verb to offer, is allowed to fill.
+///
+/// `None` means this build has no updater at all — see [`update::possible`] —
+/// which is the one case where there is nothing to say and nothing to press.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpdateBadge {
+    /// Nothing waiting. `version` is the one running; clicking checks now.
+    ///
+    /// Drawn at all — where the old badge drew nothing — because a spot that
+    /// is empty until the day it is not is a spot nobody has learnt to read.
+    /// The version is quietly useful on its own, and it is what turns the
+    /// louder states into the same chip having changed rather than a new
+    /// thing having appeared.
+    Resting { version: String },
     /// A newer version exists; clicking downloads it.
     Available { version: String },
     /// It is on its way down. `fraction` is `0.0..=1.0` of the bytes.
@@ -969,6 +1058,31 @@ pub enum UpdateBadge {
 /// gesture — see [`mbrd_core::state::BoardState::start`]. Two drops overlapping
 /// share the step and close it when the last of them lands.
 struct Importing {
+    /// What to call the drop while it is arriving.
+    ///
+    /// The folder's own name, because that is the word somebody used when they
+    /// dragged it — "reading Tiles & stone" is answerable ("yes, that one") in
+    /// a way "reading 300 files" is not.
+    named: String,
+    /// When the first of the drops in flight started reading.
+    ///
+    /// Only ever used to divide: the estimate is elapsed time over cards
+    /// landed, times cards left. Crude, and honestly so — it is prefixed with
+    /// a tilde and it is there to answer "seconds or minutes", not to be
+    /// right.
+    began: std::time::Instant,
+    /// Where the cards not yet read are going to land, one row per drop.
+    ///
+    /// A place held open is the difference between a folder that is arriving
+    /// and a board that has stopped: the block's shape is on the screen from
+    /// the moment the walk finishes counting, and each card fills a square
+    /// that was already there rather than appearing somewhere new. Kept per
+    /// drop because two folders dropped a second apart are two blocks in two
+    /// places — see [`Self::drops`].
+    ///
+    /// Empty rows are left in place rather than removed, so a drop's index
+    /// into this stays its own for as long as it is reading.
+    ghosts: Vec<Vec<WorldPoint>>,
     /// The step every drop in flight closes into, held open across the read.
     ///
     /// One step for the whole drop, for the reason [`BoardView::place`] gives:
@@ -1082,6 +1196,15 @@ const LOADER_TRACK: f32 = LOADER_WIDTH - 28.0;
 /// thousand repaints, and nobody can see a card land in under a frame anyway.
 const ARRIVE_EVERY: Duration = Duration::from_millis(33);
 
+/// How many held-open places a drop draws before it stops drawing them.
+///
+/// The block's shape is made by its first screenful; a folder of ten thousand
+/// files would spend the rest of the ceiling on quads nobody can tell apart.
+const GHOSTS_SHOWN: usize = 240;
+
+/// How wide the pill over an arriving drop is.
+const IMPORT_PILL: f32 = 452.0;
+
 /// How long something that just happened stays on screen.
 const SAY_FOR: Duration = Duration::from_secs(4);
 
@@ -1135,6 +1258,44 @@ enum Overlay {
     /// the same reason the settings page carries only its section. See
     /// `opened.rs`.
     Opened(crate::opened::Opened),
+    /// The inventory sheet — what the board is made of and what it weighs.
+    /// The payload is only where the list is scrolled to: the report itself is
+    /// taken off the board every frame, so it cannot go stale behind an undo.
+    /// See `stock.rs`.
+    Stock(crate::stock::Sheet),
+    /// The first-run screen. Carries which of its four pages is showing and
+    /// what has been typed into the one field on them — every *answer* is
+    /// written straight through to the prefs, for the reason `welcome.rs`
+    /// gives: a screen that collected answers and applied them at the end
+    /// would lose them to the Escape it promises is safe.
+    Welcome(crate::welcome::Welcome),
+}
+
+/// A measurement being taken against the paper — `Command::Calibrate`'s whole
+/// state, and the app's half of [`mbrd_core::paper::calibrate`].
+///
+/// A board's `scale` is world units per millimetre, and until somebody says
+/// what one thing on the board really measures it is a number with no way in.
+/// Typing it is not one: nobody knows how many world units their photograph of
+/// a doorway is. Drawing a line along something whose size you *do* know is,
+/// and that is the only reason this mode exists.
+///
+/// ## Three states, two fields
+///
+/// Armed and waiting, being drawn, and being named. The first two are told
+/// apart by the gesture — `Gesture::Measuring` is live only while the hand is
+/// down — and the third by `answer`, which is `Some` exactly while the bar is
+/// asking. A third field spelling out what two already say is a third field to
+/// forget to set.
+#[derive(Debug, Clone)]
+struct Measuring {
+    /// Both ends of the line, in world units. Equal until the hand moves,
+    /// which is why nothing draws a line of no length — see `measure_line`.
+    from: WorldPoint,
+    to: WorldPoint,
+    /// What has been typed as the length, once there is a line to type it
+    /// about. `None` while the mode is armed or the hand is still down.
+    answer: Option<Editor>,
 }
 
 pub struct BoardView {
@@ -1150,6 +1311,42 @@ pub struct BoardView {
     pub theme: Theme,
     /// Selected item ids, in the order they were selected.
     pub selection: Vec<String>,
+    /// The tags the board is currently being narrowed to, and empty for the
+    /// overwhelmingly common case of no filter at all.
+    ///
+    /// **Not in the file, on purpose.** Which tags somebody is looking through
+    /// right now is the same kind of state as a playhead — see `playback.rs`,
+    /// which makes the argument in full: it is a fact about a session rather
+    /// than about the board, nobody has ever wanted to undo it, and a `.mbrd`
+    /// sent to somebody else with two thirds of it faded out would be a file
+    /// that arrives looking broken.
+    ///
+    /// A `BTreeSet` rather than a `Vec`, so the status bar reads it out in the
+    /// same order every time and a tag cannot be in it twice.
+    pub tag_filter: std::collections::BTreeSet<String>,
+    /// Which stop of the tour is being looked at, and `None` when no tour is
+    /// running.
+    ///
+    /// An index into the *resolved* stops — see `mbrd_core::tour::stops` — and
+    /// held here rather than on the board for the reason that module's own note
+    /// gives: the route is something somebody made and belongs in the file;
+    /// where they had got to reading it is a position in a reading, and writing
+    /// it down would make opening a board a change to it.
+    touring: Option<usize>,
+    /// The scale being set by hand, and `None` on every frame that is not.
+    ///
+    /// Not board state and not undoable *while it is happening* — a line
+    /// somebody is dragging is a question, not an answer. What comes of it is
+    /// board state and goes through `board.edit` like everything else; see
+    /// [`Measuring`] and `take_measurement`.
+    measuring: Option<Measuring>,
+    /// How far a run of the shrink has got, and `None` when none is running.
+    ///
+    /// Two numbers rather than a struct: what the page draws is "3 of 12", and
+    /// there is nothing else to know about a job that is only ever one thing at
+    /// a time. It is also the lock — a second run while one is going would have
+    /// two loops swapping the same hashes past each other. See `squeeze_board`.
+    squeezing: Option<(usize, usize)>,
     /// Selections let go of without the board changing.
     ///
     /// What Ctrl Z takes back before it starts on the ledger. See [`LetGo`].
@@ -1386,6 +1583,17 @@ pub struct BoardView {
     /// and a key meant for the board underneath does not vanish into a panel
     /// that is on its way out anyway.
     overlay_leaving: bool,
+    /// A card to open again once whatever is standing over it has gone.
+    ///
+    /// There is only ever one overlay — see [`Overlay`] — so the tag list an
+    /// opened card's rail puts up has to close the card to appear. Without
+    /// this that is a one-way door: you tag a photograph from its own page and
+    /// land back on the board, several presses from where you were looking.
+    ///
+    /// Set by [`Self::open_tag_list_for`], cleared by anything else that opens
+    /// an overlay, and spent by `advance_overlay` at the one moment there is
+    /// nothing over the board to fight with.
+    resume_card: Option<String>,
     /// The little controls on the settings page — a switch's knob, a
     /// segmented row's lit choice — each a spring from the state it showed
     /// to the state it now has, keyed by the control's own id.
@@ -1475,6 +1683,14 @@ pub struct BoardView {
     /// wanted to undo a playhead, and a `.mbrd` sent to somebody else should not
     /// arrive halfway through a video.
     media: Media,
+    /// The decoders behind those playheads. See `pipeline.rs`.
+    ///
+    /// Split from `media` rather than folded into it because the two answer to
+    /// different things: a playhead is a number this app owns and can test
+    /// without a window, and a pipeline is a live object belonging to the
+    /// desktop's media stack. Keeping them apart is what lets a machine with no
+    /// GStreamer still draw every transport strip on the board.
+    stack: crate::pipeline::Stack,
     /// The measured clock of every animation recently on screen. See
     /// [`Timings`].
     timings: Timings,
@@ -1549,13 +1765,16 @@ struct Drawn {
     looping: bool,
     /// Whether this card's sound should stop the others when it starts.
     sound: bool,
-    /// Whether there is anything behind the playhead yet.
+    /// Whether there is anything for a playhead to advance over.
     ///
-    /// An animation moves the moment it is decoded. A video does not move at
-    /// all until there is a decoder to move it, and starting a playhead over a
-    /// still poster would be a scrubber that advances across a picture that
-    /// does not — and, worse, a board that repaints sixty times a second
-    /// forever with nothing to show for it.
+    /// True for a recording because it is a recording, and for a picture only
+    /// if its own bytes turned out to hold more than one frame — a `.gif` with
+    /// a single drawing in it is a photograph, and starting a playhead over one
+    /// would be a scrubber crossing a picture that does not move, on a board
+    /// repainting sixty times a second with nothing to show for it.
+    ///
+    /// Whether this machine can *play* the recording is a different question,
+    /// asked later and by `pipeline::Stack` — see `BoardView::start_reel`.
     moves: bool,
 }
 
@@ -1584,6 +1803,7 @@ impl BoardView {
             settings_motion: HashMap::new(),
             animating: false,
             overlay_leaving: false,
+            resume_card: None,
             switches: 0,
             taps: Taps::default(),
             editing: None,
@@ -1595,6 +1815,7 @@ impl BoardView {
             wires: Wires::default(),
             drawn: Vec::new(),
             media: Media::default(),
+            stack: crate::pipeline::Stack::new(),
             timings: Timings::default(),
             decoding: 0,
             live: Live::default(),
@@ -1609,6 +1830,10 @@ impl BoardView {
             viewport: Viewport::default(),
             theme: Theme::default(),
             selection: Vec::new(),
+            tag_filter: std::collections::BTreeSet::new(),
+            touring: None,
+            measuring: None,
+            squeezing: None,
             let_go: LetGo::default(),
             said: None,
             opening: None,
@@ -1800,8 +2025,20 @@ impl BoardView {
     /// did.
     /// What the title bar should show about the update. See [`UpdateBadge`].
     pub fn update_badge(&self) -> Option<UpdateBadge> {
+        // A build that was not installed from a release has no updater behind
+        // any of this, so the chip would be a button that cannot do its one
+        // job. See [`update::possible`].
+        if !update::possible() {
+            return None;
+        }
         match &self.updating {
-            Updating::Idle | Updating::Looking => None,
+            // A check that is merely running gets no badge of its own: most of
+            // them end in nothing, and a flicker of chrome on every launch is
+            // how a spot gets trained out of being read. Pressing while one is
+            // in flight still says so, in the status line.
+            Updating::Idle | Updating::Looking => Some(UpdateBadge::Resting {
+                version: update::version::Version::current().to_string(),
+            }),
             Updating::Offered { version, .. } => {
                 Some(UpdateBadge::Available { version: version.to_string() })
             }
@@ -2592,7 +2829,9 @@ impl BoardView {
         }
         self.capture_view();
 
-        let Some(path) = self.path.clone().or_else(|| fresh_board_path(&self.doc.board)) else {
+        let Some(path) =
+            self.path.clone().or_else(|| fresh_board_path(&self.doc.board, &self.prefs))
+        else {
             self.warn("nowhere to save: no home directory".into());
             return;
         };
@@ -2753,7 +2992,9 @@ impl BoardView {
             return true;
         }
         self.capture_view();
-        let Some(path) = self.path.clone().or_else(|| fresh_board_path(&self.doc.board)) else {
+        let Some(path) =
+            self.path.clone().or_else(|| fresh_board_path(&self.doc.board, &self.prefs))
+        else {
             return true;
         };
         match crate::save::write(&path, &self.doc) {
@@ -2801,7 +3042,10 @@ impl BoardView {
         note.y = at.y;
         note.z = self.top_z() + 1.0;
         note.meta.insert("text".into(), serde_json::Value::String("# note".into()));
-        self.doc.board.edit("Add note", |board| board.items.push(note));
+        self.doc.board.edit("Add note", |board| {
+            settle(&mut note, lattice(board));
+            board.items.push(note);
+        });
         self.select_only(&id);
         // Open for typing straight away. A note is a thing you put down in
         // order to write on it, and the alternative was a note that looked
@@ -3142,16 +3386,53 @@ impl BoardView {
         swatch.x = self.viewport.pan.x;
         swatch.y = self.viewport.pan.y;
         swatch.z = self.top_z() + 1.0;
-        self.doc.board.edit("Add swatch", |board| board.items.push(swatch));
+        self.doc.board.edit("Add swatch", |board| {
+            settle(&mut swatch, lattice(board));
+            board.items.push(swatch);
+        });
         self.select_only(&id);
         self.start_editing(&id, cx);
     }
 
+    /// Whether anything selected is a thing that can be given a colour.
+    ///
+    /// The one place the question is answered, so the key, the menu row and
+    /// the picker grid can never disagree about which cards take a tint.
+    pub fn can_tint(&self) -> bool {
+        self.selection.iter().filter_map(|id| self.doc.board.item(id)).any(|it| tintable(&it.kind))
+    }
+
+    /// The one colour the whole selection wears, where there is one.
+    ///
+    /// `Some(0)` where everything selected is plain, `Some(n)` where everything
+    /// wears shade `n`, and `None` where they disagree — which is the honest
+    /// answer for a mixed selection, and the one the picker draws as "no cell
+    /// is ringed" rather than picking a winner. Cards that cannot take a colour
+    /// at all are left out of the vote: a photograph sitting in a selection of
+    /// notes should not be able to say the notes have no colour.
+    pub fn tint_now(&self) -> Option<u32> {
+        let mut seen: Option<u32> = None;
+        for item in self.selection.iter().filter_map(|id| self.doc.board.item(id)) {
+            if !tintable(&item.kind) {
+                continue;
+            }
+            let n = item.meta.get("tint").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32;
+            match seen {
+                Some(before) if before != n => return None,
+                _ => seen = Some(n),
+            }
+        }
+        seen
+    }
+
     /// Tear the selected notes off a different part of the pad.
     ///
-    /// Cycles rather than choosing, because four colours is a short enough list
-    /// that pressing the key again is faster than picking from a menu — and it
-    /// is what the original does when a note is made.
+    /// Cycles rather than choosing, and only through the *format's* four —
+    /// see [`crate::theme::NOTE_TINT_COUNT`]. Four is a short enough list that
+    /// pressing the key again is faster than picking from a menu, it is what
+    /// the original does when a note is made, and it is the range every build
+    /// that reads these files agrees about. The other twelve are a thing you
+    /// point at: see [`Self::tint_as`].
     pub fn cycle_tint(&mut self, cx: &mut Context<Self>) {
         let ids = self.selection.clone();
         if ids.is_empty() {
@@ -3161,11 +3442,15 @@ impl BoardView {
             let mut changed = 0;
             for id in &ids {
                 let Some(item) = board.item_mut(id) else { continue };
-                if !matches!(item.kind, ItemType::Note | ItemType::Text | ItemType::Sticker) {
+                if !tintable(&item.kind) {
                     continue;
                 }
                 let now = item.meta.get("tint").and_then(serde_json::Value::as_u64).unwrap_or(0);
-                let next = (now as u32 % crate::theme::NOTE_TINT_COUNT) + 1;
+                // Past the pad's own four — set by the picker — the key starts
+                // again at the first rather than walking the twelve one press
+                // at a time. `T` is for the four; the grid is for the rest.
+                let now = (now as u32).min(crate::theme::NOTE_TINT_COUNT);
+                let next = (now % crate::theme::NOTE_TINT_COUNT) + 1;
                 item.meta.insert("tint".into(), serde_json::json!(next));
                 changed += 1;
             }
@@ -3174,6 +3459,43 @@ impl BoardView {
         self.say(match changed {
             0 => "nothing here takes a tint".into(),
             n => format!("tinted {n}"),
+        });
+        cx.notify();
+    }
+
+    /// Give everything selected the colour that was pointed at.
+    ///
+    /// `n` is a shade number — see [`crate::theme::Theme::shade`] — and nought
+    /// takes the tint off, which is the one thing the cycling key cannot do
+    /// and the reason the grid has a seventeenth cell.
+    pub fn tint_as(&mut self, n: u32, cx: &mut Context<Self>) {
+        let ids = self.selection.clone();
+        if ids.is_empty() {
+            return;
+        }
+        let changed = self.doc.board.edit("Recolour", |board| {
+            let mut changed = 0;
+            for id in &ids {
+                let Some(item) = board.item_mut(id) else { continue };
+                if !tintable(&item.kind) {
+                    continue;
+                }
+                match n {
+                    0 => {
+                        item.meta.remove("tint");
+                    }
+                    n => {
+                        item.meta.insert("tint".into(), serde_json::json!(n));
+                    }
+                }
+                changed += 1;
+            }
+            changed
+        });
+        self.say(match (changed, n) {
+            (0, _) => "nothing here takes a colour".into(),
+            (n, 0) => format!("{n} back to plain"),
+            (n, _) => format!("recoloured {n}"),
         });
         cx.notify();
     }
@@ -3307,7 +3629,17 @@ impl BoardView {
         let ids = pick_of(&fresh);
         let n = fresh.len();
         let label = if n == 1 { label.to_string() } else { format!("{label} {n}") };
-        self.doc.board.edit(&label, |board| board.items.extend(fresh));
+        self.doc.board.edit(&label, |board| {
+            let step = lattice(board);
+            board.items.extend(fresh.into_iter().map(|mut card| {
+                // Belt and braces: the offset above is a whole grid step, so a
+                // copy of a card that was on the lattice is already on it. This
+                // is for the card that was not — one that arrived from a board
+                // saved before snapping was turned on, say.
+                settle(&mut card, step);
+                card
+            }));
+        });
         self.selection = ids;
         cx.notify();
     }
@@ -3504,14 +3836,11 @@ impl BoardView {
             return;
         }
         self.inside.push(fence.to_string());
-        let name = self
-            .doc
-            .board
-            .item(fence)
-            .map(|it| it.name.clone())
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| "group".into());
-        self.say(format!("inside {name}"));
+        // Nothing said. Being inside a group is a *state*, not an event, and
+        // the bar reads it off `inside` every frame — see `inside_line`. A
+        // sentence said once here would be gone in four seconds and the state
+        // would not, which is exactly the trap a mode with nothing on screen
+        // to show it is.
         cx.notify();
     }
 
@@ -3530,7 +3859,8 @@ impl BoardView {
         if self.doc.board.item(&left).is_some() {
             self.select_only(&left);
         }
-        self.say("left the group".into());
+        // Nor here. The mode line goes on its own, because the state it was
+        // reading is over — see `enter_group`.
         cx.notify();
         true
     }
@@ -3829,8 +4159,8 @@ impl BoardView {
             .map(|&i| {
                 let mut c = free[i].clone();
                 if snapped && c.kind != ItemType::Fence {
-                    c.w = geometry::clamp_size(geometry::snap(c.w, step));
-                    c.h = geometry::clamp_size(geometry::snap(c.h, step));
+                    c.w = geometry::cells(c.w, step);
+                    c.h = geometry::cells(c.h, step);
                 }
                 c
             })
@@ -3880,11 +4210,13 @@ impl BoardView {
         for (slot, &item_index) in order.iter().enumerate() {
             let mut p = spots[slot];
             if snapped {
-                // The spots came back clear even for centres each up to half
-                // a step from the lattice — that is what the whole-cell
-                // reservation above bought.
-                p.x = geometry::snap(p.x, step);
-                p.y = geometry::snap(p.y, step);
+                // Edges onto the lattice rather than centres, measured against
+                // the size the card is being laid out at — see
+                // `geometry::place`. The spots came back clear with room to
+                // spare: whole-cell footprints cannot be rounded into an
+                // overlap, which is what `arrange::to_cells` reserves them for.
+                p.x = geometry::place(p.x, laid[slot].w, step);
+                p.y = geometry::place(p.y, laid[slot].h, step);
             }
             let it = free[item_index];
             plan.insert(it.id.clone(), (p.x, p.y));
@@ -3909,7 +4241,20 @@ impl BoardView {
                     next.push(it);
                     continue;
                 };
-                plan.insert(it.id.clone(), (it.x + fx1 - fx0, it.y + fy1 - fy0));
+                // Carried by its fence's own translation, which is not a
+                // whole number of cells — the fence moved from wherever it
+                // was to a slot. So a carried card is put on the lattice in
+                // its own right, size included: it is as much a part of the
+                // rearrangement as the cards the engine dealt slots to, and
+                // leaving it a step off is the same untidiness one row in.
+                let (mut at_x, mut at_y) = (it.x + fx1 - fx0, it.y + fy1 - fy0);
+                if snapped && it.kind != ItemType::Fence {
+                    let (w, h) = (geometry::cells(it.w, step), geometry::cells(it.h, step));
+                    at_x = geometry::place(at_x, w, step);
+                    at_y = geometry::place(at_y, h, step);
+                    resized.push((it.id.clone(), w, h));
+                }
+                plan.insert(it.id.clone(), (at_x, at_y));
                 grew = true;
             }
             if !grew {
@@ -3996,7 +4341,10 @@ impl BoardView {
         // rather than a thing on the board.
         pen.z =
             self.doc.board.items.iter().map(|i| i.z).fold(f32::INFINITY, f32::min).min(0.0) - 1.0;
-        self.doc.board.edit("Add fence", |board| board.items.push(pen));
+        self.doc.board.edit("Add fence", |board| {
+            settle(&mut pen, lattice(board));
+            board.items.push(pen);
+        });
         let held =
             Fences::measure(&self.doc.board.items).contents(&id, &self.doc.board.items).len();
         self.select_only(&id);
@@ -4124,6 +4472,7 @@ impl BoardView {
         let Some(fitted) = self.text_fitted() else { return };
         let Some(id) = self.selection.first().cloned() else { return };
         let measure = self.measure.clone();
+        let to_grid = lattice(&self.doc.board);
         self.doc.board.edit("Dynamic size", |board| {
             if let Some(item) = board.item_mut(&id) {
                 match fitted {
@@ -4138,7 +4487,7 @@ impl BoardView {
                     }
                     false => {
                         item.meta.insert(FIT_TEXT.into(), serde_json::Value::Bool(true));
-                        refit(item, &measure);
+                        refit(item, &measure, to_grid);
                     }
                 }
             }
@@ -4405,6 +4754,34 @@ impl BoardView {
         transport::reaching(local, mute, slider).then_some(id)
     }
 
+    /// Get whatever plays this card ready, and answer whether anything can.
+    ///
+    /// An animation needs nothing built: its frames are already decoded and
+    /// `Images` and `Timings` drive it between them. A recording needs a
+    /// pipeline, which is opened here and then left to `pump_media` — this is
+    /// the only place one is ever created, so "there is a reel" and "somebody
+    /// pressed play" cannot come apart.
+    ///
+    /// A `false` has already said why: [`crate::pipeline::Stack::open`] leaves
+    /// the reason on the reel and the next `pump_media` reports it once. That
+    /// is deliberately not done here, because the same failure would otherwise
+    /// be announced twice on the frame it happens.
+    fn start_reel(&mut self, id: &str) -> bool {
+        // Split, so the assets can be read while the stack is written to.
+        let Self { doc, stack, .. } = self;
+        let Some(item) = doc.board.item(id) else { return false };
+        let video = match item.kind {
+            ItemType::Video => true,
+            ItemType::Audio => false,
+            // Everything else that plays is a picture that moves, and moves
+            // out of its own frames.
+            _ => return true,
+        };
+        let Some(hash) = item.asset.as_ref().and_then(ItemAsset::hash) else { return false };
+        let Some(asset) = doc.assets.get(hash) else { return false };
+        stack.open(id, hash, &asset.ext, &asset.bytes, video)
+    }
+
     /// Act on a press that landed on the strip.
     fn press_control(&mut self, id: &str, hit: transport::Hit, cx: &mut Context<Self>) {
         let Some(drawn) = self.drawn_control(id) else { return };
@@ -4434,16 +4811,23 @@ impl BoardView {
                         // running over a still poster would be a scrubber that
                         // moves across a picture that does not, and a board
                         // that never goes idle again.
-                        if moves {
+                        // The decoder is opened *before* the playhead starts,
+                        // so that a file this machine cannot play leaves the
+                        // card exactly as it was rather than running a
+                        // scrubber across silence.
+                        if moves && self.start_reel(id) {
                             self.media.play(id, length, looping);
-                        } else {
-                            self.tell("that needs a video decoder, which is not here yet".into());
                         }
                     }
                 }
             }
             transport::Hit::Scrub(fraction) => {
                 self.media.seek(id, fraction, length);
+                // The decoder follows the playhead here rather than in
+                // `pump_media`, because this is the one thing the playhead
+                // decides and the pipeline does not: everywhere else the
+                // position travels the other way. See `Media::sync`.
+                self.stack.seek(id, self.media.at(id));
                 self.gesture = Gesture::Scrubbing { id: id.to_string() };
             }
             transport::Hit::Mute => {
@@ -4628,34 +5012,80 @@ impl BoardView {
     /// Sharp where the opened page has this card up, thumb otherwise — the
     /// same two tiers `resting` holds, so swapping from one to the other at
     /// the end of the drag is not a jump in size.
+    ///
+    /// One rasterise in flight per card, and one orbit waiting behind it. A
+    /// mouse move arriving while one is drawing does not start a second: it
+    /// replaces what is waiting, and [`mesh_cache::Meshes::settle_live`]
+    /// hands that back when the current one lands. Every move spawning its
+    /// own task is what made a turning mesh lag the pointer by a whole
+    /// backlog rather than by one frame — see `mesh_cache.rs`'s note on
+    /// `turning` for the full argument.
     fn live_orbit_frame(
         &mut self,
         id: &str,
         orbit: mbrd_core::media::Orbit,
         cx: &mut Context<Self>,
     ) {
-        let Some(item) = self.doc.board.item(id) else { return };
-        let Some(hash) = item.asset.as_ref().and_then(ItemAsset::hash) else { return };
+        if self.meshes.begin_live(id) {
+            self.spawn_live_orbit_frame(id, orbit, cx);
+        } else {
+            self.meshes.want_live(id, orbit);
+        }
+    }
+
+    /// [`Self::live_orbit_frame`]'s own work, with the live claim already
+    /// held — so the completion below may start the next frame directly
+    /// rather than going back through a claim it never let go of.
+    fn spawn_live_orbit_frame(
+        &mut self,
+        id: &str,
+        orbit: mbrd_core::media::Orbit,
+        cx: &mut Context<Self>,
+    ) {
+        // Every one of these gives up the claim rather than draining what is
+        // waiting: the orbit behind it would only arrive at the same dead
+        // end, and a claim left on is a card that never turns again.
+        let Some(item) = self.doc.board.item(id) else {
+            self.meshes.abandon_live(id);
+            return;
+        };
+        let Some(hash) = item.asset.as_ref().and_then(ItemAsset::hash) else {
+            self.meshes.abandon_live(id);
+            return;
+        };
         let Some(mesh) = self.meshes.parsed(hash) else {
             // Not parsed yet — the first decode this card ever asked for is
             // still in flight, or has not been asked for. Nothing to turn
             // yet; the resting picture, once it lands, is where this orbit
             // will show up.
+            self.meshes.abandon_live(id);
             return;
         };
-        let sharp = matches!(&self.overlay, Overlay::Opened(opened) if opened.id.as_str() == id);
+        // The one tier that is about to be on screen, and no other. The
+        // other one is a picture nothing will ask for before the next mouse
+        // move throws this frame away.
+        let target = if matches!(&self.overlay, Overlay::Opened(opened) if opened.id.as_str() == id)
+        {
+            crate::images::LONGEST_SIDE
+        } else {
+            crate::images::THUMB_SIDE
+        };
         let id = id.to_string();
         let task = cx
             .background_executor()
-            .spawn(async move { crate::mesh_cache::rasterize_tiers(&mesh, orbit) });
+            .spawn(async move { crate::mesh_cache::rasterize_live(&mesh, orbit, target) });
         cx.spawn(async move |view, cx| {
-            let decoded = task.await;
+            let frame = task.await;
             view.update(cx, |view, cx| {
-                if let Some(decoded) = decoded {
-                    let frame =
-                        if sharp { decoded.sharp.unwrap_or(decoded.thumb) } else { decoded.thumb };
+                if let Some(frame) = frame {
                     view.live.put(&id, frame);
                     cx.notify();
+                }
+                // Wherever the pointer got to while this was drawing is the
+                // frame to draw next. Nothing waiting lets the claim go, and
+                // the next move starts fresh.
+                if let Some(next) = view.meshes.settle_live(&id) {
+                    view.spawn_live_orbit_frame(&id, next, cx);
                 }
             })
             .ok();
@@ -4684,6 +5114,11 @@ impl BoardView {
         if self.tool == tool {
             return;
         }
+        // Picking a tool is picking what a press means, and a measurement in
+        // hand is a claim on the same thing. Dropped rather than fought with:
+        // the hint line below is about to say what a press does now, and two
+        // modes both answering that question is one of them lying.
+        self.measuring = None;
         self.tool = tool;
         // A standing note rather than something that just happened: while you
         // are in a tool, what the tool does is true, and a line that timed out
@@ -4903,8 +5338,17 @@ impl BoardView {
     /// have worked.
     pub fn new_board(&mut self, cx: &mut Context<Self>) {
         self.flush(cx);
-        let doc = Document::default();
-        let Some(path) = fresh_board_path(&doc.board) else {
+        // What this computer's habits say a board starts as. Stamped onto the
+        // `Board` *before* it becomes a `BoardState` — which is the only way
+        // to say it without recording a step, and saying it without a step is
+        // the point: this is what the board was born as, not something
+        // somebody did to it, so undo has nothing to take back. See
+        // `prefs::NewBoard`, whose note is about why a preference is allowed
+        // to decide this and not allowed to reach into the board on screen.
+        let mut born = mbrd_core::Board::default();
+        self.prefs.new_board.apply(&mut born.settings.desktop);
+        let doc = Document { board: mbrd_core::BoardState::new(born), ..Document::default() };
+        let Some(path) = fresh_board_path(&doc.board, &self.prefs) else {
             self.warn("nowhere to put a new board: no home directory".into());
             return;
         };
@@ -4968,6 +5412,11 @@ impl BoardView {
         self.inside.clear();
         self.let_go.forget();
         self.gesture = Gesture::None;
+        // For the same reason, and with more at stake: a playhead left behind
+        // would land on whatever card holds that id here, and the decoder
+        // under it would go on making noise about a board that is closed.
+        self.media = Media::default();
+        self.stack.forget_all();
         self.restore_saved_view();
         crate::recent::remember(path);
     }
@@ -4981,6 +5430,10 @@ impl BoardView {
     /// instead of dropping to black and fading up again. See
     /// `advance_overlay`.
     fn open_overlay(&mut self, new: Overlay) {
+        // Taken rather than left, so a card waiting to come back is forgotten
+        // the moment something else is asked for. Only the resume itself puts
+        // it back, and it does so *after* calling this.
+        self.resume_card = None;
         self.overlay = new;
         self.overlay_leaving = false;
     }
@@ -5007,11 +5460,16 @@ impl BoardView {
         // remembered, and this fills in the rest once it is ready, the same
         // shape `open_board` reads a board in.
         let here = self.path.clone();
+        // Read on this thread and carried in, because the scan runs on the
+        // background executor and the prefs live on the view.
+        let boards = self.prefs.boards();
         cx.spawn(async move |view, cx| {
-            let found = cx
-                .background_executor()
-                .spawn(async move { crate::switcher::beside_boards(here.as_deref()) })
-                .await;
+            let found =
+                cx.background_executor()
+                    .spawn(async move {
+                        crate::switcher::beside_boards(here.as_deref(), boards.as_deref())
+                    })
+                    .await;
             view.update(cx, |view, cx| {
                 // Overtaken: the switcher has been closed and opened again,
                 // or closed for good, since this scan was asked for — and
@@ -5128,6 +5586,23 @@ impl BoardView {
         cx.notify();
     }
 
+    /// Put the tag list up over an opened card, and come back to it after.
+    ///
+    /// The card is selected first, because the list works on the selection —
+    /// see [`Self::tag_selection`] — and the card somebody has open is not
+    /// necessarily the one that was selected when they opened it. Tagging four
+    /// cards at once is what the selection is for; tagging *this* card is what
+    /// the button on its own rail means.
+    pub fn open_tag_list_for(&mut self, id: &str, cx: &mut Context<Self>) {
+        let id = id.to_string();
+        self.select_only(&id);
+        self.open_palette(crate::palette::Mode::Tag, cx);
+        // After, because `open_overlay` clears it: the field means "come back
+        // to this once the thing now going up has gone", so it can only be set
+        // once that thing is up.
+        self.resume_card = Some(id);
+    }
+
     pub fn close_palette(&mut self) {
         if matches!(self.overlay, Overlay::Palette(_)) {
             self.close_overlay();
@@ -5198,12 +5673,254 @@ impl BoardView {
     /// card does not — there is no board under the pointer any more, only a
     /// picture of one.
     fn covered(&self) -> bool {
-        matches!(self.overlay, Overlay::Settings(_) | Overlay::Opened(_))
+        matches!(
+            self.overlay,
+            Overlay::Settings(_) | Overlay::Opened(_) | Overlay::Stock(_) | Overlay::Welcome(_)
+        )
     }
 
     pub fn close_settings(&mut self) {
         if matches!(self.overlay, Overlay::Settings(_)) {
             self.close_overlay();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The first run
+    // -----------------------------------------------------------------------
+
+    /// Put the welcome screen up, if this is the first run.
+    ///
+    /// Called once, from `main.rs`, after the window exists. **The flag is
+    /// written the moment the screen opens rather than when it is finished**,
+    /// and that is deliberate: the alternative is an app that asks the same
+    /// four questions again after a crash, and there is no version of "you
+    /// have seen this" that is more true than "it was on the screen".
+    ///
+    /// A build with any of the environment variables set skips it entirely.
+    /// Somebody who has pinned the theme and the appearance from a launcher
+    /// has already answered the first question in the one place that wins, and
+    /// a screen that asked it anyway would be collecting an answer it is about
+    /// to ignore.
+    pub fn welcome_if_new(&mut self, cx: &mut Context<Self>) {
+        if self.prefs.welcomed {
+            return;
+        }
+        self.prefs.welcomed = true;
+        crate::prefs::save(&self.prefs);
+        if crate::prefs::Prefs::forced(crate::prefs::Setting::Appearance).is_some()
+            || crate::prefs::Prefs::forced(crate::prefs::Setting::Theme).is_some()
+        {
+            return;
+        }
+        let boards = self.prefs.boards();
+        self.open_overlay(Overlay::Welcome(crate::welcome::Welcome::open(boards.as_deref())));
+        cx.notify();
+    }
+
+    /// Open it on purpose, which is what `Command::Welcome` does.
+    pub fn open_welcome(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.overlay, Overlay::Welcome(_)) && !self.overlay_leaving {
+            self.close_welcome(cx);
+            return;
+        }
+        let boards = self.prefs.boards();
+        self.taps.forget();
+        self.open_overlay(Overlay::Welcome(crate::welcome::Welcome::open(boards.as_deref())));
+        cx.notify();
+    }
+
+    pub fn close_welcome(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.overlay, Overlay::Welcome(_)) {
+            // Whatever is in the folder field goes in on the way out. Every
+            // other control on that screen has already written itself through
+            // on press; a text field has no press to hang that on, so this is
+            // the one that needs a moment.
+            self.commit_welcome_folder();
+            self.close_overlay();
+            cx.notify();
+        }
+    }
+
+    pub fn show_welcome_step(&mut self, step: crate::welcome::Step, cx: &mut Context<Self>) {
+        if let Overlay::Welcome(screen) = &mut self.overlay {
+            screen.show(step);
+            cx.notify();
+        }
+        self.commit_welcome_folder();
+    }
+
+    pub fn walk_welcome(&mut self, by: isize, cx: &mut Context<Self>) {
+        if let Overlay::Welcome(screen) = &mut self.overlay {
+            screen.go(by);
+            cx.notify();
+        }
+        self.commit_welcome_folder();
+    }
+
+    pub fn focus_welcome_folder(&mut self, cx: &mut Context<Self>) {
+        if let Overlay::Welcome(screen) = &mut self.overlay {
+            screen.focused = true;
+            cx.notify();
+        }
+    }
+
+    /// Write the folder field through to the prefs.
+    ///
+    /// Idempotent and cheap, so it can be called on every keystroke as well as
+    /// on the way out: `set_boards` normalises the platform's own answer back
+    /// to `None`, and a save that writes the same bytes is not worth guarding
+    /// against.
+    pub fn commit_welcome_folder(&mut self) {
+        let Overlay::Welcome(screen) = &self.overlay else { return };
+        let chosen = screen.folder_text();
+        let before = self.prefs.boards_dir.clone();
+        self.prefs.set_boards(chosen.as_deref());
+        if self.prefs.boards_dir != before {
+            crate::prefs::save(&self.prefs);
+        }
+    }
+
+    /// Start choosing a theme from the welcome screen.
+    ///
+    /// The same `Picker` the settings page opens, over the screen that asked —
+    /// see `welcome.rs` on why this page borrows every control rather than
+    /// growing its own.
+    pub fn pick_welcome_theme(
+        &mut self,
+        appearance: crate::themes::Appearance,
+        cx: &mut Context<Self>,
+    ) {
+        let was = self.prefs.theme_for(appearance).to_string();
+        let names: Vec<String> =
+            self.themes.of(appearance).iter().map(|t| t.name.clone()).collect();
+        if let Overlay::Welcome(screen) = &mut self.overlay {
+            screen.picking = Some(crate::settings::Picker::open(appearance, was, &names));
+            cx.notify();
+        }
+    }
+
+    /// Ask for a folder, and keep what comes back.
+    ///
+    /// The picker is the platform's, through the same door `Command::AddFiles`
+    /// uses. Cancelling changes nothing, which is why the `None` arm does
+    /// nothing rather than clearing the choice.
+    ///
+    /// Reached from both the welcome screen and the settings page, and it
+    /// writes to the *prefs* rather than to either — the field on the welcome
+    /// screen is then brought into line if it happens to be up. That order is
+    /// what lets the same button live on two surfaces without one of them
+    /// owning the answer.
+    pub fn browse_for_boards(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose".into()),
+        });
+        cx.spawn(async move |view, cx| {
+            let Ok(Ok(Some(chosen))) = paths.await else { return };
+            let Some(dir) = chosen.into_iter().next() else { return };
+            view.update(cx, |view, cx| {
+                view.set_boards_dir(Some(&dir), cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Where boards go, and save it.
+    ///
+    /// `None` puts it back to following the platform. The welcome screen's
+    /// field is retyped to match if it is on screen, so the two can never show
+    /// different answers to the same question.
+    pub fn set_boards_dir(&mut self, dir: Option<&Path>, cx: &mut Context<Self>) {
+        self.prefs.set_boards(dir);
+        crate::prefs::save(&self.prefs);
+        if let Overlay::Welcome(screen) = &mut self.overlay {
+            let shown =
+                self.prefs.boards().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+            screen.folder = crate::editor::Editor::new(shown, 512, false);
+            screen.focused = false;
+        }
+        cx.notify();
+    }
+
+    /// What a new board's snapping starts as. See `prefs::NewBoard`.
+    ///
+    /// Answers where it ended up, because that is what the switch aims its
+    /// knob at.
+    pub fn set_new_board_snap(&mut self, on: bool, cx: &mut Context<Self>) -> bool {
+        self.prefs.new_board.snap = on;
+        crate::prefs::save(&self.prefs);
+        cx.notify();
+        on
+    }
+
+    /// What a new board's grid step starts as. See `prefs::NewBoard`.
+    pub fn set_new_board_step(&mut self, step: f32, cx: &mut Context<Self>) {
+        self.prefs.new_board.grid_step = step;
+        crate::prefs::save(&self.prefs);
+        cx.notify();
+    }
+
+    /// Open the inventory sheet, or put it away from the same command.
+    ///
+    /// The same door twice, like `open_settings` above it: a command that can
+    /// only open is one that stops working the moment it has worked.
+    pub fn open_stock(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.overlay, Overlay::Stock(_)) && !self.overlay_leaving {
+            self.close_stock();
+            cx.notify();
+            return;
+        }
+        self.open_overlay(Overlay::Stock(crate::stock::Sheet::open()));
+        cx.notify();
+    }
+
+    pub fn close_stock(&mut self) {
+        if matches!(self.overlay, Overlay::Stock(_)) {
+            self.close_overlay();
+        }
+    }
+
+    /// Put the caret in the inventory sheet's filter.
+    ///
+    /// The field takes every keystroke whether or not it has been pressed —
+    /// it is the only thing on the page that can be typed into — so this only
+    /// decides whether the caret is *drawn*. See `settings::Page::focused`.
+    pub fn focus_stock_filter(&mut self, cx: &mut Context<Self>) {
+        if let Overlay::Stock(sheet) = &mut self.overlay {
+            sheet.focused = true;
+            cx.notify();
+        }
+    }
+
+    /// Empty the inventory sheet's filter. Escape does the same thing.
+    pub fn clear_stock_filter(&mut self, cx: &mut Context<Self>) {
+        if let Overlay::Stock(sheet) = &mut self.overlay {
+            *sheet = crate::stock::Sheet {
+                filter: crate::editor::Editor::new("", 64, false),
+                focused: false,
+                ..sheet.clone()
+            };
+            cx.notify();
+        }
+    }
+
+    /// Order the inventory sheet's rows another way.
+    ///
+    /// The scroll goes back to the top with it: the row somebody was looking
+    /// at is somewhere else now, so holding the offset would land them in the
+    /// middle of a list they have not read the start of.
+    pub fn set_stock_sort(&mut self, sort: crate::stock::Sort, cx: &mut Context<Self>) {
+        if let Overlay::Stock(sheet) = &mut self.overlay {
+            if sheet.sort != sort {
+                sheet.sort = sort;
+                sheet.scroll = gpui::ScrollHandle::new();
+            }
+            cx.notify();
         }
     }
 
@@ -5901,10 +6618,11 @@ impl BoardView {
 
         let head: String = text.chars().take(mbrd_core::model::NOTE_MAX).collect();
         let id = id.to_string();
+        let to_grid = lattice(&self.doc.board);
         self.doc.board.during(token, |board| {
             if let Some(item) = board.item_mut(&id) {
                 item.asset = Some(ItemAsset::Embedded { hash: hash.clone(), family: None });
-                write_field(item, Field::Note, &head, &self.measure);
+                write_field(item, Field::Note, &head, &self.measure, to_grid);
             }
         });
     }
@@ -5914,6 +6632,31 @@ impl BoardView {
     /// Both doors — Enter and a press on the row — come through here, so the
     /// two cannot drift into meaning different things.
     pub fn run_palette_row(&mut self, what: What, window: &mut Window, cx: &mut Context<Self>) {
+        // The two tag lists **stay open**, which every other row does not.
+        // Tagging four cards with three words is one errand, and a palette that
+        // put itself away after each one would make it three — the fold in the
+        // original stays up for the same reason. So the list is refilled
+        // instead: the ticks it is drawing are about the board as it was one
+        // press ago, and after this press they would be wrong.
+        if let What::Marks { tag, .. } | What::Filters { tag, .. } = &what {
+            let tag = tag.clone();
+            let mode = match what {
+                What::Marks { .. } => crate::palette::Mode::Tag,
+                _ => crate::palette::Mode::Filter,
+            };
+            match mode {
+                crate::palette::Mode::Tag => self.tag_selection(&tag, cx),
+                _ => self.narrow_to(&tag, cx),
+            }
+            // Built while nothing else is borrowed, because the palette lives
+            // inside `self.overlay` and cannot be handed the view it is in.
+            let rows = crate::palette::rows_for(mode, self);
+            if let Overlay::Palette(palette) = &mut self.overlay {
+                palette.refill(rows);
+            }
+            cx.notify();
+            return;
+        }
         self.close_palette();
         match what {
             // Checked again rather than trusted: the row was drawn against the
@@ -5926,8 +6669,105 @@ impl BoardView {
                 }
             }
             What::Goes { id, .. } => self.reveal(&id, cx),
+            // Dealt with above, and returned from before reaching here.
+            What::Marks { .. } | What::Filters { .. } => {}
         }
         cx.notify();
+    }
+
+    /// Put a tag on everything taggable that is selected, or take it off all
+    /// of it.
+    ///
+    /// Off only when **every** one of them already carries it, which is the
+    /// same three-state reading the tick uses: a partly-tagged selection is
+    /// finished rather than undone, because "tag these nine kitchen" is the
+    /// sentence somebody is saying and a mixed selection is halfway through it.
+    ///
+    /// One step, however many cards it touches — a tag put on forty photographs
+    /// comes off in one `Ctrl Z`, which is what somebody who has just realised
+    /// it was the wrong word wants. And nothing is recorded at all when nothing
+    /// changed, the bargain `align` makes: `tags::mark` answers whether it did.
+    pub fn tag_selection(&mut self, tag: &str, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .doc
+            .board
+            .items
+            .iter()
+            .filter(|item| self.selection.contains(&item.id) && mbrd_core::tags::taggable(item))
+            .map(|item| item.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let on = !ids.iter().all(|id| {
+            self.doc
+                .board
+                .item(id)
+                .is_some_and(|it| mbrd_core::tags::of(it).iter().any(|t| t == tag))
+        });
+        let label = if on { "Tag" } else { "Untag" };
+        let mut touched = 0;
+        self.doc.board.edit(label, |board| {
+            for id in &ids {
+                if let Some(item) = board.item_mut(id) {
+                    if mbrd_core::tags::mark(item, tag, on) {
+                        touched += 1;
+                    }
+                }
+            }
+        });
+        // The ceiling is the only way a press can land on nothing: a card
+        // already carrying twelve tags takes no thirteenth. Said rather than
+        // shrugged off, because a row that ticks for some of the selection and
+        // not the rest would otherwise be a mystery.
+        match touched {
+            0 if on => self.warn(format!(
+                "no room for “{tag}” — {} tags is the most a card takes",
+                mbrd_core::tags::TAGS_PER_ITEM
+            )),
+            0 => {}
+            1 => self.say(format!("{} 1 card", if on { "tagged" } else { "untagged" })),
+            n => self.say(format!("{} {n} cards", if on { "tagged" } else { "untagged" })),
+        }
+        cx.notify();
+    }
+
+    /// Add a tag to the filter, or take it out.
+    ///
+    /// Several tags read as **or**, not as and: adding a second one widens the
+    /// question, because narrowing it is what the first one already did. See
+    /// `mbrd_core::tags::hidden`.
+    pub fn narrow_to(&mut self, tag: &str, cx: &mut Context<Self>) {
+        if !self.tag_filter.remove(tag) {
+            self.tag_filter.insert(tag.to_string());
+        }
+        self.say_filter();
+        cx.notify();
+    }
+
+    /// Drop the filter, whatever it was.
+    pub fn clear_filter(&mut self, cx: &mut Context<Self>) {
+        if self.tag_filter.is_empty() {
+            return;
+        }
+        self.tag_filter.clear();
+        self.say("showing everything".into());
+        cx.notify();
+    }
+
+    /// Say what the filter now stands at, in the bar.
+    ///
+    /// The filter is not a mode line — it does not stand until dismissed the
+    /// way renaming does — because the fade on the board is already the
+    /// standing report of it, and a bar that could never say anything else
+    /// while a filter was on would be a bar that had stopped being useful.
+    fn say_filter(&mut self) {
+        let text = match self.tag_filter.len() {
+            0 => "showing everything".to_string(),
+            1 => format!("showing “{}”", self.tag_filter.iter().next().unwrap_or(&String::new())),
+            n => format!("showing {n} tags"),
+        };
+        self.say(text);
     }
 
     /// Select one card and go to it.
@@ -5954,6 +6794,414 @@ impl BoardView {
         want.fit(Some(bounds), 160.0, BASE_ZOOM);
         self.camera.travel_to(&want);
         cx.notify();
+    }
+
+    // -----------------------------------------------------------------------
+    // The tour
+    // -----------------------------------------------------------------------
+
+    /// Whether a tour is running right now.
+    pub fn touring(&self) -> bool {
+        self.touring.is_some()
+    }
+
+    /// Start at the first stop, or end a tour that is already running.
+    ///
+    /// One command for both, the same shape `open_stock` has: a row that can
+    /// only start is a row that stops working the moment it has worked.
+    pub fn take_tour(&mut self, cx: &mut Context<Self>) {
+        if self.touring.is_some() {
+            self.end_tour(false, cx);
+            return;
+        }
+        if mbrd_core::tour::stops(&self.doc.board).is_empty() {
+            // Not an error and worth saying, because the route is invisible
+            // until it has something on it: somebody reaching for this has
+            // usually not found the row that fills it.
+            self.warn("nothing is on the tour yet — add cards from their menu".into());
+            cx.notify();
+            return;
+        }
+        self.touring = Some(0);
+        self.arrive_at_stop(cx);
+    }
+
+    /// End it, and **leave the camera where the last stop put it**.
+    ///
+    /// Deliberately not a return to where the tour started. A tour is a way of
+    /// reading the board, and reading it usually ends where you wanted to be —
+    /// putting the camera back would throw away the one thing the last step
+    /// just did.
+    pub fn end_tour(&mut self, quiet: bool, cx: &mut Context<Self>) {
+        if self.touring.take().is_none() {
+            return;
+        }
+        if !quiet {
+            self.say("tour ended".into());
+        }
+        cx.notify();
+    }
+
+    /// Move by a stop, clamped at both ends.
+    ///
+    /// Clamped rather than wrapped: a tour has a first stop and a last one, and
+    /// arriving back at the beginning without asking reads as a bug rather than
+    /// as a loop. The bar greys its ends instead.
+    ///
+    /// Answers whether a tour was running — not whether it moved. That is what
+    /// the arrow keys need: while the bar is up the arrows belong to the tour
+    /// even at the last stop, and `false` there would drop through to nudging
+    /// the selection.
+    pub fn step_tour(&mut self, by: i32, cx: &mut Context<Self>) -> bool {
+        let Some(at) = self.touring else { return false };
+        let count = mbrd_core::tour::stops(&self.doc.board).len();
+        if count == 0 {
+            // Every stop was deleted underneath a running tour. Ended quietly
+            // rather than left showing "1 of 0".
+            self.end_tour(true, cx);
+            return true;
+        }
+        let next = (at as i32 + by).clamp(0, count as i32 - 1) as usize;
+        if next != at {
+            self.touring = Some(next);
+            self.arrive_at_stop(cx);
+        } else {
+            cx.notify();
+        }
+        true
+    }
+
+    /// Fly to the stop the tour is on, and select what is there.
+    ///
+    /// **Framed rather than filled.** `TOUR_ZOOM` is half again over the
+    /// resting zoom rather than the camera's own ceiling: a stop on a sticker
+    /// would otherwise fly the whole way in and the board would vanish behind
+    /// one object, which is the difference between a tour and a slideshow.
+    ///
+    /// The list is resolved here rather than held, which is what makes a stop
+    /// deleted mid-tour cost a clamp instead of a stale id — see
+    /// `mbrd_core::tour`.
+    fn arrive_at_stop(&mut self, cx: &mut Context<Self>) {
+        let Some(at) = self.touring else { return };
+        let stops = mbrd_core::tour::stops(&self.doc.board);
+        let Some(item) = stops.get(at.min(stops.len().saturating_sub(1))) else {
+            self.end_tour(true, cx);
+            return;
+        };
+        let (id, bounds) = (item.id.clone(), Rect::of_item(item));
+        self.selection = vec![id];
+        self.rope = None;
+        let mut want = self.viewport;
+        want.fit(Some(bounds), TOUR_PAD, TOUR_ZOOM);
+        self.camera.travel_to(&want);
+        cx.notify();
+    }
+
+    /// Put what is selected on the route, or take it off.
+    ///
+    /// All of it or none of it, ticked the same three-state way a tag is: off
+    /// only when **every** selected card is already a stop, so a half-selected
+    /// route is finished rather than undone.
+    ///
+    /// Goes through the mutation door like everything else, so a route built by
+    /// accident comes apart with `Ctrl Z` — which matters more here than it
+    /// looks, because the route is otherwise invisible until you walk it.
+    pub fn toggle_tour_stop(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .doc
+            .board
+            .items
+            .iter()
+            .filter(|item| self.selection.contains(&item.id) && item.kind.is_content())
+            .map(|item| item.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let on = !ids.iter().all(|id| mbrd_core::tour::on_tour(&self.doc.board, id));
+        let mut touched = 0;
+        self.doc.board.edit(if on { "Add to tour" } else { "Remove from tour" }, |board| {
+            for id in &ids {
+                if mbrd_core::tour::mark(board, id, on) {
+                    touched += 1;
+                }
+            }
+        });
+        match (touched, on) {
+            (0, true) => self.warn(format!("a tour holds {} stops at most", mbrd_core::tour::MAX)),
+            (0, false) => {}
+            (_, true) => {
+                let total = mbrd_core::tour::stops(&self.doc.board).len();
+                self.say(format!("on the tour — {total} stops"));
+            }
+            (_, false) => self.say("off the tour".into()),
+        }
+        cx.notify();
+    }
+
+    /// Whether everything selected is already a stop, for the menu's tick.
+    /// `None` when there is nothing a stop could be made of.
+    pub fn tour_state(&self) -> Option<bool> {
+        let mut any = false;
+        let mut all = true;
+        for item in self.doc.board.items.iter().filter(|i| self.selection.contains(&i.id)) {
+            if !item.kind.is_content() {
+                continue;
+            }
+            any = true;
+            all &= mbrd_core::tour::on_tour(&self.doc.board, &item.id);
+        }
+        any.then_some(all)
+    }
+
+    // -----------------------------------------------------------------------
+    // The scale, set by hand
+    // -----------------------------------------------------------------------
+
+    /// Arm the measuring mode — `Command::Calibrate`'s door.
+    ///
+    /// A second run of the command puts it away again, the same one-row-for-
+    /// both shape `Command::Tour` has: a row that can only start is a row that
+    /// stops working the moment it has worked.
+    pub fn start_calibrating(&mut self, cx: &mut Context<Self>) {
+        if self.measuring.take().is_some() {
+            self.hush();
+            cx.notify();
+            return;
+        }
+        // A note being typed into is committed first. This mode owns the
+        // keyboard once there is a line to name, and two text fields taking
+        // the same keys is one of them quietly losing what was typed.
+        if self.editing.is_some() {
+            self.stop_editing(true, cx);
+        }
+        // A tour running underneath would own Escape and the arrows, and its
+        // bar sits exactly where this one does. Ended rather than fought with:
+        // a tour is a way of reading the board and this is a way of measuring
+        // it, and nobody is doing both in the same second.
+        self.end_tour(true, cx);
+        self.measuring =
+            Some(Measuring { from: point(0.0, 0.0), to: point(0.0, 0.0), answer: None });
+        self.hint(Some("drag a line along something you know the size of".into()));
+        cx.notify();
+    }
+
+    /// Put the mode away. `quiet` for the paths that are about to say
+    /// something better than "cancelled" — the same argument `end_tour` takes.
+    pub fn stop_calibrating(&mut self, quiet: bool, cx: &mut Context<Self>) {
+        if self.measuring.take().is_none() {
+            return;
+        }
+        // The hint is a standing line rather than a passing one, so it does
+        // not time out on its own: leaving the mode is what clears it.
+        self.hush();
+        if !quiet {
+            self.say("scale left alone".into());
+        }
+        cx.notify();
+    }
+
+    /// The line as it stands, where there is one long enough to name.
+    ///
+    /// The length is in world units and the ends are for the painter. `None`
+    /// while the mode is merely armed, and for a line shorter than a couple of
+    /// pixels — a press that never travelled is a click, and a click cannot be
+    /// a measurement of anything.
+    fn measure_line(&self) -> Option<(WorldPoint, WorldPoint, f32)> {
+        let held = self.measuring.as_ref()?;
+        let world = (held.to.x - held.from.x).hypot(held.to.y - held.from.y);
+        (world * self.viewport.zoom >= ENOUGH).then_some((held.from, held.to, world))
+    }
+
+    /// The hand has come off the line: ask what it measures.
+    ///
+    /// A line too short to be a measurement leaves the mode armed rather than
+    /// cancelling it — a slipped click should cost the click, not the mode.
+    fn ask_measurement(&mut self, cx: &mut Context<Self>) {
+        if self.measure_line().is_none() {
+            if self.measuring.is_some() {
+                self.warn("too short to measure — drag further".into());
+            }
+            cx.notify();
+            return;
+        }
+        // Seeded empty rather than with a guess. The board's current scale is
+        // very often the default one, and pre-filling the answer with what
+        // *that* makes of the line would be the app answering its own
+        // question — and then keeping the answer if somebody pressed Enter.
+        //
+        // Two dozen characters, which is more than "1200 millimetres" and far
+        // less than anything that could be a sentence.
+        if let Some(held) = &mut self.measuring {
+            held.answer = Some(Editor::new("", 24, false));
+        }
+        self.hush();
+        cx.notify();
+    }
+
+    /// Take what was typed and make it the board's scale.
+    ///
+    /// The arithmetic is `paper::calibrate`'s; everything here is about the
+    /// sentence. A refusal keeps the bar up with what was typed still in it,
+    /// because the fix is nearly always one character — a missing unit — and
+    /// throwing the line away would mean drawing it again to add one.
+    fn take_measurement(&mut self, cx: &mut Context<Self>) {
+        let Some((_, _, world)) = self.measure_line() else { return };
+        let said = self
+            .measuring
+            .as_ref()
+            .and_then(|held| held.answer.as_ref())
+            .map(|editor| editor.text().trim().to_string())
+            .unwrap_or_default();
+        let imperial = self.doc.board.settings.desktop.units == "imperial";
+        let Some(scale) = mbrd_core::paper::calibrate(world, &said, imperial) else {
+            self.warn(match said.is_empty() {
+                true => "say how long that line is".into(),
+                false => format!("{said} is not a length — try 30cm, 12in, 1.5m"),
+            });
+            cx.notify();
+            return;
+        };
+        self.measuring = None;
+        // The bar comes on with it, in the same step. The scale bar is the
+        // only thing on screen that shows what a scale *is*, so a calibration
+        // that left it off would be a number somebody has to take on trust —
+        // and `Command::ToggleHud` is right there to turn it back off.
+        self.doc.board.edit("Scale", |board| {
+            board.settings.desktop.scale = scale;
+            board.settings.desktop.hud = true;
+        });
+        self.say(format!("scale set — that line is {said}"));
+        cx.notify();
+    }
+
+    // -----------------------------------------------------------------------
+    // Making the board smaller
+    // -----------------------------------------------------------------------
+
+    /// How far a shrink has got, for the page that started it.
+    pub fn squeezing(&self) -> Option<(usize, usize)> {
+        self.squeezing
+    }
+
+    /// Re-encode every picture on the board that would come out meaningfully
+    /// smaller, and repoint the cards at the new files in one undoable step.
+    ///
+    /// What is tried and what is left alone is `mbrd_core::shrink`'s; the
+    /// encoding is `crate::shrink`'s. What is here is the only part that needs
+    /// a window: keeping a job that can take a minute off the thread that
+    /// draws, and landing all of it as **one** entry in the ledger.
+    ///
+    /// ## One picture in flight at a time
+    ///
+    /// Deliberately, and it is the whole shape of the loop. The obvious version
+    /// clones every picture's bytes out of the store and hands the batch to a
+    /// background task — which on the boards this feature exists for means a
+    /// second copy of most of a gigabyte, to save a fraction of it. Instead
+    /// each turn of the loop copies one file, decodes it away from the window,
+    /// comes back to store the result, and lets go. The board stays live
+    /// throughout, the memory cost is one photograph, and a card deleted half
+    /// way through simply finds nothing to swap.
+    ///
+    /// ## The swap happens at the end, all together
+    ///
+    /// A shrink is one thing somebody asked for, so it is one `Ctrl Z`. The new
+    /// bytes go into the asset store as they are made — an asset store is not
+    /// board state and has no place in a step — and the *cards* are repointed
+    /// in a single `edit` once every picture is done.
+    pub fn squeeze_board(&mut self, cx: &mut Context<Self>) {
+        if self.squeezing.is_some() {
+            return;
+        }
+        let plan = mbrd_core::shrink::plan(&self.doc);
+        if plan.is_empty() {
+            self.say("nothing on this board would get smaller".into());
+            cx.notify();
+            return;
+        }
+        let jobs = plan.jobs;
+        self.squeezing = Some((0, jobs.len()));
+        cx.notify();
+
+        cx.spawn(async move |view, cx| {
+            let mut swaps: Vec<(String, String)> = Vec::new();
+            let mut report = mbrd_core::shrink::Report::default();
+
+            for (done, job) in jobs.iter().enumerate() {
+                // One file's bytes, and the progress reading, in the same hop
+                // back to the view — see the note above. `None` means the card
+                // that wanted it has gone since the plan was made, which is not
+                // a failure and not worth saying anything about.
+                let held = view
+                    .update(cx, |view, cx| {
+                        view.squeezing = Some((done, jobs.len()));
+                        cx.notify();
+                        view.doc.assets.get(&job.hash).map(|asset| asset.bytes.clone())
+                    })
+                    .ok()
+                    .flatten();
+                let Some(bytes) = held else { continue };
+                let edge = job.edge;
+
+                let made = cx
+                    .background_executor()
+                    .spawn(async move { crate::shrink::squeeze(&bytes, edge) })
+                    .await;
+                // Left alone: an animation, a format nothing here can read, or
+                // a re-encode that came out no smaller. All three are answers.
+                let Some(made) = made else { continue };
+                let after = made.bytes.len();
+                if !mbrd_core::shrink::worth_it(job.bytes, after) {
+                    continue;
+                }
+
+                let label = job.label.clone();
+                let landed = view
+                    .update(cx, |view, _cx| {
+                        // The format's own identity rule: a file is named by
+                        // the hash of its contents, so the same picture shrunk
+                        // twice is one asset. `or_insert` rather than `insert`
+                        // for the same reason.
+                        let hash = mbrd_core::mbrd::hash_bytes(&made.bytes);
+                        view.doc.assets.entry(hash.clone()).or_insert(mbrd_core::mbrd::Asset {
+                            bytes: made.bytes,
+                            ext: made.ext.to_string(),
+                            label,
+                        });
+                        hash
+                    })
+                    .ok();
+                let Some(hash) = landed else { break };
+                swaps.push((job.hash.clone(), hash));
+                report.changed += 1;
+                report.before += job.bytes;
+                report.after += after;
+            }
+
+            view.update(cx, |view, cx| {
+                view.squeezing = None;
+                if swaps.is_empty() {
+                    // A real answer rather than a shrug: every picture was
+                    // tried and every one of them is already as small as it is
+                    // worth making it.
+                    view.say("every picture is already as small as it is worth".into());
+                } else {
+                    view.doc.board.edit("Make smaller", |board| {
+                        for (from, to) in &swaps {
+                            mbrd_core::shrink::swap(board, from, to);
+                        }
+                    });
+                    view.say(format!(
+                        "{} smaller — {} saved",
+                        plural(report.changed, "picture"),
+                        mbrd_core::inventory::size(report.saved()),
+                    ));
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub fn close_menu(&mut self) {
@@ -6042,6 +7290,55 @@ impl BoardView {
     // Getting things onto the board
     // -----------------------------------------------------------------------
 
+    /// Ask the system for files to put on the board.
+    ///
+    /// The other door into [`Self::take_files`], and the one that exists for
+    /// everybody who does not have a second window open to drag *from*. A drop
+    /// is the fast way when the file is already in front of you; this is the
+    /// only way when it is not, and a canvas app whose only route in was a drag
+    /// was one you could not fill from the keyboard at all.
+    ///
+    /// **The dialog is the platform's, not ours.** `prompt_for_paths` reaches
+    /// the XDG desktop portal on Linux and the native panel on macOS and
+    /// Windows, which is what gets a Flatpak or a snap read access to a file
+    /// outside its sandbox — a picker drawn in this window could show the same
+    /// list and then not be allowed to open what was chosen. It also means the
+    /// places, the search and the sidebar are the ones somebody already knows.
+    ///
+    /// Folders are selectable as well as files, and land the same way a dropped
+    /// folder does: what is directly in it, no deeper. See [`import::walk`].
+    ///
+    /// Cancelling is not an error and says nothing. Failing to *open* the
+    /// dialog is, and says so — on Linux that is a desktop with no portal
+    /// running, which is a real state and one nothing else in the app would
+    /// otherwise mention.
+    pub fn pick_files(&mut self, cx: &mut Context<Self>) {
+        // Where the cards land is decided *now*, before the dialog opens, for
+        // the same reason a drop uses the middle of the view: the board may be
+        // panned while the picker is up, and files chosen for the view somebody
+        // was looking at should not follow the view they left it in.
+        let at = self.viewport.pan;
+        let asked = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: true,
+            multiple: true,
+            prompt: Some("Add".into()),
+        });
+        cx.spawn(async move |view, cx| {
+            let answer = asked.await;
+            view.update(cx, |view, cx| match answer {
+                // Chosen. The empty case is a picker that answered with nothing
+                // selected, which is a cancel wearing another shape.
+                Ok(Ok(Some(paths))) if !paths.is_empty() => view.take_files(&paths, at, cx),
+                // Cancelled, or the channel was dropped with the window.
+                Ok(Ok(_)) | Err(_) => {}
+                Ok(Err(e)) => view.warn(format!("no file picker: {e}")),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Take files somebody dropped on the window.
     ///
     /// A folder brings what is *directly* in it and nothing deeper — see
@@ -6067,10 +7364,21 @@ impl BoardView {
 
         // Join the step already open where a drop is still arriving, rather than
         // opening a second one. See [`Importing`] for why there can only be one.
-        match &mut self.importing {
-            Some(importing) => importing.drops += 1,
+        let named = Self::drop_name(&paths);
+        let slot = match &mut self.importing {
+            Some(importing) => {
+                importing.drops += 1;
+                // The second folder does not rename the first: the pill is
+                // reporting one job with two halves, and a name that changed
+                // under you would make it look like the first one restarted.
+                importing.ghosts.push(Vec::new());
+                importing.ghosts.len() - 1
+            }
             None => {
                 self.importing = Some(Importing {
+                    named,
+                    began: std::time::Instant::now(),
+                    ghosts: vec![Vec::new()],
                     open: self.doc.board.start(),
                     token,
                     drops: 1,
@@ -6082,9 +7390,10 @@ impl BoardView {
                     described: None,
                     placed: Vec::new(),
                     ours: true,
-                })
+                });
+                0
             }
-        }
+        };
         self.hint(Some("reading…".into()));
 
         let (arrived, incoming) = std::sync::mpsc::channel::<Arriving>();
@@ -6141,6 +7450,10 @@ impl BoardView {
             // knows which block its files belong to.
             let mut across = 1.0_f32;
             let mut taken = 0usize;
+            // How many places this drop's block has, nought until the walk
+            // finishes counting. The difference between this and `taken` is
+            // exactly the ghosts.
+            let mut places = 0usize;
 
             loop {
                 // Everything waiting, not one message: a folder of small files
@@ -6165,6 +7478,7 @@ impl BoardView {
                         // the time the first card needs a place to go.
                         Arriving::Found(n) => {
                             across = import::across(n);
+                            places = n;
                             found = Some(n);
                         }
                         Arriving::Ready(file) => {
@@ -6176,8 +7490,20 @@ impl BoardView {
                     }
                 }
 
+                // Recomputed rather than trimmed, because `spot` is arithmetic
+                // on an index and holding the tail of a list would cost more to
+                // keep honest than to rebuild. Capped for the reason the dot
+                // grid is drawn in a layer: ten thousand held places are ten
+                // thousand quads for a shape whose point is made by the first
+                // screenful.
+                let ghosts: Vec<WorldPoint> = (taken..places)
+                    .take(GHOSTS_SHOWN)
+                    .map(|nth| import::spot(at, across, nth))
+                    .collect();
                 let wanted = view
-                    .update(cx, |view, cx| view.arrive(token, found, batch, unreadable, heavy, cx))
+                    .update(cx, |view, cx| {
+                        view.arrive(token, slot, ghosts, found, batch, unreadable, heavy, cx)
+                    })
                     .unwrap_or(false);
                 // The view has gone, or this drop has been called off. Dropping
                 // the receiver is what tells the reader to stop.
@@ -6203,9 +7529,12 @@ impl BoardView {
     /// Through [`mbrd_core::state::BoardState::during`] rather than `edit`, so
     /// that forty batches are one step rather than forty. The step is closed by
     /// [`Self::settle_import`] when the last drop lands.
+    #[expect(clippy::too_many_arguments, reason = "one drain tick's worth of news")]
     fn arrive(
         &mut self,
         token: u64,
+        slot: usize,
+        ghosts: Vec<WorldPoint>,
         found: Option<usize>,
         batch: Vec<(WorldPoint, import::Ready)>,
         unreadable: Vec<String>,
@@ -6219,6 +7548,12 @@ impl BoardView {
         importing.found += found.unwrap_or(0);
         importing.unreadable.extend(unreadable);
         importing.heavy.extend(heavy);
+        // Only this drop's row. The slot was claimed in `take_files` and is
+        // this task's for as long as it reads, so the write cannot land on a
+        // sibling drop's block.
+        if let Some(row) = importing.ghosts.get_mut(slot) {
+            *row = ghosts;
+        }
         if batch.is_empty() {
             // A tick with nothing on it must not repaint. The line only changes
             // when a card lands or when the walk finally says how many there
@@ -6264,7 +7599,13 @@ impl BoardView {
         let placed = ours.then(|| importing.placed.clone());
         let open = importing.open.clone();
 
-        self.doc.board.during(&open, |board| board.items.extend(cards));
+        self.doc.board.during(&open, |board| {
+            let step = lattice(board);
+            board.items.extend(cards.into_iter().map(|mut card| {
+                settle(&mut card, step);
+                card
+            }));
+        });
         if let Some(placed) = placed {
             self.selection = placed;
         }
@@ -6332,6 +7673,53 @@ impl BoardView {
             self.say(message);
         }
         cx.notify();
+    }
+
+    /// What to call a drop while it is arriving.
+    ///
+    /// The name of the thing that was dragged, which is the word somebody used
+    /// and therefore the word they can check the pill against. Several at once
+    /// have no shared name, so they are counted instead — the pill's job there
+    /// is only to say that the count it is showing covers all of them.
+    fn drop_name(paths: &[PathBuf]) -> String {
+        match paths {
+            [] => "nothing".into(),
+            [one] => one
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| one.display().to_string()),
+            many => format!("{} items", many.len()),
+        }
+    }
+
+    /// Roughly how long the rest of the drop will take, in whole seconds.
+    ///
+    /// `None` until a card has landed and the walk has said how many there
+    /// are, because before both of those the honest answer is that nobody
+    /// knows — and a countdown made up out of nothing is worse than no
+    /// countdown, since it will be wrong in a way that looks authoritative.
+    fn import_left(importing: &Importing) -> Option<u64> {
+        let left = importing.found.checked_sub(importing.done)?;
+        if left == 0 || importing.done == 0 {
+            return None;
+        }
+        let each = importing.began.elapsed().as_secs_f64() / importing.done as f64;
+        Some((each * left as f64).ceil().max(1.0) as u64)
+    }
+
+    /// Say, by name, which files were large enough to be worth a word.
+    ///
+    /// The pill only has room for the count. This is the count's footnote, and
+    /// it goes to the status line in the tone that stands until it is read —
+    /// the same one [`Self::settle_import`] would have used for it at the end,
+    /// said early because somebody asked.
+    fn show_heavy(&mut self) {
+        let Some(importing) = &self.importing else { return };
+        if importing.heavy.is_empty() {
+            return;
+        }
+        let list = importing.heavy.join("; ");
+        self.warn(list);
     }
 
     /// One sentence for the files a drop could not read at all.
@@ -6512,7 +7900,10 @@ impl BoardView {
             swatch.x = at.x;
             swatch.y = at.y;
             swatch.z = z;
-            self.doc.board.edit("Paste", |board| board.items.push(swatch));
+            self.doc.board.edit("Paste", |board| {
+                settle(&mut swatch, lattice(board));
+                board.items.push(swatch);
+            });
             self.select_only(&id);
             self.say("pasted a color".into());
             cx.notify();
@@ -6542,7 +7933,10 @@ impl BoardView {
         card.x = at.x;
         card.y = at.y;
         card.z = z;
-        self.doc.board.edit("Paste", |board| board.items.push(card));
+        self.doc.board.edit("Paste", |board| {
+            settle(&mut card, lattice(board));
+            board.items.push(card);
+        });
         self.select_only(&id);
         self.say("pasted".into());
         cx.notify();
@@ -6563,7 +7957,10 @@ impl BoardView {
         card.x = at.x;
         card.y = at.y;
         card.z = z;
-        self.doc.board.edit("Paste", |board| board.items.push(card));
+        self.doc.board.edit("Paste", |board| {
+            settle(&mut card, lattice(board));
+            board.items.push(card);
+        });
         self.select_only(id);
     }
 
@@ -6645,7 +8042,13 @@ impl BoardView {
         }
 
         let ids: Vec<String> = cards.iter().map(|c| c.id.clone()).collect();
-        self.doc.board.edit(&Self::add_label(count), |board| board.items.extend(cards));
+        self.doc.board.edit(&Self::add_label(count), |board| {
+            let step = lattice(board);
+            board.items.extend(cards.into_iter().map(|mut card| {
+                settle(&mut card, step);
+                card
+            }));
+        });
         self.selection = ids;
         count
     }
@@ -7034,6 +8437,12 @@ impl BoardView {
                 let what = if *cropping { "crop" } else { "size" };
                 Some(format!("{what}  {} × {}", show(item.w), show(item.h)))
             }
+            // How long the line is so far, in the board's own units — which is
+            // the number somebody is about to say what it *really* is.
+            Gesture::Measuring => {
+                let (_, _, world) = self.measure_line()?;
+                Some(format!("measure  {}", show(world)))
+            }
             Gesture::Marquee { from, to, .. } => {
                 let (w, h) = ((to.x - from.x).abs(), (to.y - from.y).abs());
                 // Nothing until the sweep is a rectangle rather than a point,
@@ -7105,6 +8514,10 @@ impl BoardView {
                 return if *copied { CursorStyle::DragCopy } else { CursorStyle::ClosedHand };
             }
             Gesture::Marquee { .. } => return CursorStyle::Crosshair,
+            // Drawing a line across something, which is the crosshair's whole
+            // job: it is the one pointer that says "this is aimed at a point"
+            // rather than "this is holding a thing".
+            Gesture::Measuring => return CursorStyle::Crosshair,
             // Holding a label, which travels along its line rather than in any
             // one direction — so the closed hand rather than either arrow.
             Gesture::Sliding { .. } => return CursorStyle::ClosedHand,
@@ -7115,6 +8528,12 @@ impl BoardView {
             // dragging a card.
             Gesture::Orbiting { .. } => return CursorStyle::ClosedHand,
             Gesture::None => {}
+        }
+
+        // The measuring mode outranks the tool in hand, because it outranks it
+        // at the press too — see `on_mouse_down`, whose order this mirrors.
+        if self.measuring.is_some() {
+            return CursorStyle::Crosshair;
         }
 
         match self.tool {
@@ -7217,6 +8636,27 @@ impl BoardView {
         // the click that deselects everything behind it.
         if matches!(self.overlay, Overlay::Menu(_)) {
             self.close_menu();
+            cx.notify();
+            return;
+        }
+
+        // A measurement in hand owns the press, whichever button it is: while
+        // this mode is armed the board is not something to pick up, it is
+        // something to draw a line across. The right button is a way out of
+        // it, the same as Escape — a card menu opened mid-measurement would be
+        // a menu about a board nobody is pointing at any more.
+        if self.measuring.is_some() {
+            match event.button {
+                MouseButton::Left => {
+                    // A press while the bar is already asking starts the line
+                    // again rather than being ignored, which is what somebody
+                    // who mis-drew it reaches for before they reach for Escape.
+                    self.measuring = Some(Measuring { from: world, to: world, answer: None });
+                    self.gesture = Gesture::Measuring;
+                    self.hush();
+                }
+                _ => self.stop_calibrating(false, cx),
+            }
             cx.notify();
             return;
         }
@@ -7712,6 +9152,7 @@ impl BoardView {
                 if let Some(drawn) = self.drawn_control(&id) {
                     let (fraction, length) = (drawn.strip.scrub.fraction(local.x), drawn.length);
                     self.media.seek(&id, fraction, length);
+                    self.stack.seek(&id, self.media.at(&id));
                 }
                 cx.notify();
                 return;
@@ -7790,6 +9231,17 @@ impl BoardView {
             return;
         }
 
+        // Drawing the line to be measured. Early, like the two above, because
+        // the far end lives on `self.measuring` rather than on the gesture —
+        // see `Gesture::Measuring` for why it has to.
+        if matches!(self.gesture, Gesture::Measuring) {
+            if let Some(held) = &mut self.measuring {
+                held.to = world;
+            }
+            cx.notify();
+            return;
+        }
+
         // Split into fields rather than borrowed whole. The gesture holds the
         // picture the drag is measured against, and the board is the thing that
         // moves; they are different fields, and saying so is what lets the
@@ -7837,7 +9289,7 @@ impl BoardView {
                 pan_trail.push(viewport.pan, Instant::now());
             }
             // Handled above, where `self` is still whole.
-            Gesture::Marquee { .. } => {}
+            Gesture::Marquee { .. } | Gesture::Measuring => {}
             // Handled after the destructuring below, where the media and the
             // board are both reachable — a scrub writes to neither of the four
             // fields borrowed here.
@@ -7888,7 +9340,7 @@ impl BoardView {
                         // words decide the rest. Letting the handle win instead
                         // would leave a height the next keystroke overwrites,
                         // which is a control that does nothing a moment later.
-                        refit(item, measure);
+                        refit(item, measure, to_grid);
                         if crop {
                             // Cropping is a framing, and the format already has
                             // the word for it: a covered picture fills the card
@@ -8075,7 +9527,13 @@ impl BoardView {
                     // snapping off can put the card back rather than
                     // leaving it on the lattice.
                     let free = point(home.x + dx, home.y + dy);
-                    let to = dropped_at(*home, dx, dy, (snap && !escape_grid).then_some(step));
+                    let to = dropped_at(
+                        *home,
+                        dx,
+                        dy,
+                        (item.w, item.h),
+                        (snap && !escape_grid).then_some(step),
+                    );
                     if snap {
                         item.meta.insert(
                             "presnap".into(),
@@ -8309,6 +9767,14 @@ impl BoardView {
             return;
         }
 
+        // The line is drawn. Nothing to close here either — the board has not
+        // been touched yet and will not be until somebody says what the line
+        // measures. See `take_measurement`.
+        if let Gesture::Measuring = ended {
+            self.ask_measurement(cx);
+            return;
+        }
+
         if let Gesture::Louder { id, open } = ended {
             // One step for the whole drag. `finish` answers `false` where the
             // slider ended where it started, which is a press that changed
@@ -8364,6 +9830,27 @@ impl BoardView {
             // closing an empty gesture, and the ledger would refuse the step
             // anyway — but saying "moved" about it would still be a lie.
             if moved {
+                // The grid has the last word. A drag can leave the lattice
+                // mid-gesture — that is what the modifier in `drag_cards` is
+                // for, and it is worth having: a card judged into place by eye
+                // needs a way out of the warp. But it is an escape for the
+                // *drag*, not a way to leave a card halfway onto a grid the
+                // board says it is snapped to, so the release puts it back.
+                // Held down the whole way, this is the only frame that moves.
+                //
+                // Position only. A move does not change a size, and rounding
+                // one here would resize cards on a gesture that was not about
+                // their size.
+                let ids: Vec<String> = start.iter().map(|h| h.id.clone()).collect();
+                self.doc.board.during(&open, |board| {
+                    let Some(step) = lattice(board) else { return };
+                    for id in &ids {
+                        if let Some(item) = board.item_mut(id) {
+                            item.x = geometry::place(item.x, item.w, step);
+                            item.y = geometry::place(item.y, item.h, step);
+                        }
+                    }
+                });
                 let n = start.len();
                 // An Alt-drag is a duplicate that happens to have been made
                 // with the pointer, and the ledger should say so: "Move 4" for
@@ -8388,8 +9875,22 @@ impl BoardView {
             return;
         }
 
-        if let Gesture::Sizing { moved, cropping, open, .. } = ended {
+        if let Gesture::Sizing { id, moved, cropping, open, .. } = ended {
             let what = if cropping { "Crop" } else { "Resize" };
+            // The same last word the release of a move gets, and for the same
+            // reason: `free` lets a resize out of the lattice while it is held,
+            // and letting go is where the board's own rule comes back. Size as
+            // well as position here, because a resize is exactly the gesture
+            // that was changing it — a card must not be left a size the grid
+            // cannot express, or smaller than one square of it.
+            if moved {
+                self.doc.board.during(&open, |board| {
+                    let step = lattice(board);
+                    if let Some(item) = board.item_mut(&id) {
+                        settle(item, step);
+                    }
+                });
+            }
             if moved && self.doc.board.finish(what, open) {
                 self.say(if cropping { "cropped" } else { "resized" }.into());
             }
@@ -8627,6 +10128,12 @@ impl BoardView {
             match reply {
                 crate::settings::Reply::Held => {}
                 crate::settings::Reply::Close => self.close_settings(),
+                // The settings page has no folder field — that reply belongs
+                // to the welcome screen, which shares this vocabulary because
+                // it shares the controls. Nothing to do rather than
+                // `unreachable!`: a page that grew one later should not panic
+                // on the first keystroke into it.
+                crate::settings::Reply::Folder => {}
                 // The clipboard is the view's, not the page's — the same
                 // division the palette and the switcher draw.
                 crate::settings::Reply::Paste => {
@@ -8663,6 +10170,54 @@ impl BoardView {
             return;
         }
 
+        // The welcome screen. It takes every press for the same reasons the
+        // settings page does, and answers the same `Reply` — it borrows that
+        // page's controls wholesale, so borrowing its vocabulary too is what
+        // keeps the theme picker behaving identically on both.
+        if matches!(self.overlay, Overlay::Welcome(_)) && !self.overlay_leaving {
+            let names: Vec<String> = match &self.overlay {
+                Overlay::Welcome(screen) => screen
+                    .picking
+                    .as_ref()
+                    .map(|picker| {
+                        self.themes.of(picker.appearance).iter().map(|t| t.name.clone()).collect()
+                    })
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            let Overlay::Welcome(screen) = &mut self.overlay else { unreachable!() };
+            let reply = screen.key(key, mods, event.keystroke.key_char.as_deref(), &names);
+            match reply {
+                crate::settings::Reply::Held => {}
+                crate::settings::Reply::Close => self.close_welcome(cx),
+                // Every keystroke in the folder field, so that leaving by any
+                // route keeps what was typed. See `commit_welcome_folder`.
+                crate::settings::Reply::Folder => self.commit_welcome_folder(),
+                crate::settings::Reply::Paste => {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        if let Overlay::Welcome(screen) = &mut self.overlay {
+                            screen.insert(&text);
+                        }
+                        self.commit_welcome_folder();
+                    }
+                }
+                crate::settings::Reply::Preview(appearance, name) => {
+                    let theme = self.themes.resolve(&name, appearance);
+                    self.preview_theme(theme, cx);
+                }
+                crate::settings::Reply::Choose(appearance, name) => {
+                    self.set_theme(appearance, name, cx);
+                }
+                crate::settings::Reply::Cancel(appearance, was) => {
+                    self.prefs.set_theme(appearance, was);
+                    self.cancel_preview(cx);
+                    self.retheme(cx);
+                }
+            }
+            cx.notify();
+            return;
+        }
+
         // A card opened onto the whole window. While it is only being *read*
         // it takes every press for the same reason the settings page does —
         // the board is not on screen, and a shortcut that edited it would be
@@ -8678,6 +10233,30 @@ impl BoardView {
             if key == "escape" {
                 self.close_opened(cx);
             }
+            return;
+        }
+
+        // The inventory sheet. It takes every press for the same reason the
+        // settings page does, and for the same second reason too: it has a
+        // filter field over its rows, and a text field whose letters were
+        // shortcuts would be one nobody can type in.
+        if matches!(self.overlay, Overlay::Stock(_)) && !self.overlay_leaving {
+            let Overlay::Stock(sheet) = &mut self.overlay else { unreachable!() };
+            match sheet.key(key, mods, event.keystroke.key_char.as_deref()) {
+                crate::stock::Reply::Held => {}
+                crate::stock::Reply::Close => self.close_stock(),
+                // The clipboard is the view's, not the page's — the same
+                // division the palette, the switcher and the settings page
+                // all draw.
+                crate::stock::Reply::Paste => {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        if let Overlay::Stock(sheet) = &mut self.overlay {
+                            sheet.insert(&text);
+                        }
+                    }
+                }
+            }
+            cx.notify();
             return;
         }
 
@@ -8733,6 +10312,51 @@ impl BoardView {
             }
             // Anything still unclaimed falls through to the board's own
             // shortcuts below, which is how `Ctrl S` saves from inside a note.
+        }
+
+        // A measurement being named. The third text field in the app, and it
+        // takes every press for the reason the other two do: a field whose
+        // letters were shortcuts is a field you cannot type "30cm" into, and
+        // `c` and `m` are both bound to something out here.
+        //
+        // Before the tools and before the commands, and after the note editor
+        // — nothing can be open in both at once, because arming this mode
+        // commits an open note first. See `start_calibrating`.
+        if self.measuring.as_ref().is_some_and(|held| held.answer.is_some()) {
+            let mods = editor::Mods::from(mods);
+            let typed = event.keystroke.key_char.clone();
+            let reply = self
+                .measuring
+                .as_mut()
+                .and_then(|held| held.answer.as_mut())
+                .map(|answer| answer.key(key, mods, typed.as_deref()));
+            match reply {
+                Some(editor::Reply::Commit) => self.take_measurement(cx),
+                Some(editor::Reply::Revert) => self.stop_calibrating(false, cx),
+                // The clipboard is the view's, not the field's — the same
+                // division the palette and the switcher draw.
+                Some(editor::Reply::Ignored) if mods.secondary && key == "v" => {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        if let Some(answer) =
+                            self.measuring.as_mut().and_then(|held| held.answer.as_mut())
+                        {
+                            answer.insert(&text);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            cx.notify();
+            return;
+        }
+
+        // The mode armed but no line drawn yet. Only Escape, and everything
+        // else falls through: until there is a line this is a mode like a
+        // tool, not a field, and a board you cannot save or zoom while it is
+        // armed would be a mode that took the app hostage over a scale.
+        if key == "escape" && self.measuring.is_some() {
+            self.stop_calibrating(false, cx);
+            return;
         }
 
         // A tool before a command, and only ever an unmodified digit or letter
@@ -8841,7 +10465,9 @@ impl BoardView {
                                 command.run(self, window, cx);
                             }
                         }
-                        Some(Entry::Rule) | None => {}
+                        // Neither is a row the keyboard can land on — see
+                        // [`crate::menu::Menu::step`], which walks past both.
+                        Some(Entry::Rule | Entry::Shades) | None => {}
                     }
                     return;
                 }
@@ -8856,6 +10482,29 @@ impl BoardView {
         if key == "menu" || (key == "f10" && mods.shift) {
             self.open_context_menu_at(cx);
             return;
+        }
+
+        // A tour is running, so the four keys that mean "where am I in this"
+        // are the tour's before they are anything else's. The arrows would
+        // otherwise nudge the card the tour has just selected, and Escape would
+        // clear that selection while leaving the bar up saying which stop it is
+        // on — a bar reporting a tour nothing else believes in.
+        if self.touring() {
+            match key {
+                "escape" => {
+                    self.end_tour(false, cx);
+                    return;
+                }
+                "left" | "up" | "pageup" => {
+                    self.step_tour(-1, cx);
+                    return;
+                }
+                "right" | "down" | "pagedown" | "space" => {
+                    self.step_tour(1, cx);
+                    return;
+                }
+                _ => {}
+            }
         }
 
         // Every shortcut in the app, from the one table the menu draws from.
@@ -8899,7 +10548,17 @@ impl BoardView {
 
             // A whole grid step with shift held, which is the difference
             // between adjusting a layout and building one.
-            let step = if mods.shift { self.doc.board.settings.desktop.grid_step } else { 1.0 };
+            //
+            // On a snapped board every nudge is a whole cell, held or not. A
+            // pixel is not a distance the lattice can express, so a fine nudge
+            // there is not a fine adjustment — it is a card walked off the grid
+            // one press at a time, by somebody who cannot see it happening
+            // until the card is a pixel proud of its neighbours.
+            let step = match (lattice(&self.doc.board), mods.shift) {
+                (Some(cell), _) => cell,
+                (None, true) => self.doc.board.settings.desktop.grid_step,
+                (None, false) => 1.0,
+            };
             // World y points up, so "up" is positive.
             let (dx, dy) = match key {
                 "left" => (-step, 0.0),
@@ -8966,6 +10625,75 @@ impl BoardView {
     // The frame clock
     // -----------------------------------------------------------------------
 
+    /// One frame of the media stack, and whether it drew anything new.
+    ///
+    /// **The pipeline follows the playhead, every frame, in one direction.**
+    /// That is the whole design: `playback::Media` decides what is playing —
+    /// it is the thing that knows about [`crate::playback::AT_ONCE`], about one sound
+    /// at a time, about a clip that has run out — and this brings the decoders
+    /// level with whatever it decided. Nothing pushes the other way except
+    /// `Media::sync`, which carries only the position.
+    ///
+    /// Written this way rather than as a `stack.play` beside every
+    /// `media.play` because there are six places a playhead stops, and five of
+    /// them are inside `playback.rs` where there is no pipeline to stop with
+    /// it. A card evicted by `AT_ONCE` is the case that proves it: nothing at
+    /// the call site knows it happened, and a video that went on making noise
+    /// after being pushed out would be very hard to account for.
+    ///
+    /// Volume, mute and loop go the same way and for the same reason — three
+    /// property writes a frame against three more places for a slider and a
+    /// pipeline to drift apart.
+    fn pump_media(&mut self) -> bool {
+        // Every playing card gets a decoder, including one nobody pressed:
+        // a board saved mid-video opens with `autoplay` set and reaches here
+        // before it reaches a button. Idempotent, and a no-op for an
+        // animation.
+        for id in self.media.playing() {
+            self.start_reel(&id);
+        }
+
+        let mut moved = false;
+        for id in self.stack.open_reels() {
+            // The card was deleted while its reel was standing. Dropped here
+            // rather than at the delete, so that undo and redo and every other
+            // way a card can leave the board are one case.
+            let Some(item) = self.doc.board.item(&id) else {
+                self.stack.forget(&id);
+                continue;
+            };
+            let flags = mbrd_core::media::playback(item);
+            let Some(beat) = self.stack.poll(&id, flags.looping) else { continue };
+            if let Some(trouble) = beat.trouble {
+                // Said once — `poll` will not say it again — and the playhead
+                // is stopped, so the card does not run a scrubber across
+                // something that is never going to arrive.
+                self.warn(trouble);
+                self.media.pause(&id);
+                continue;
+            }
+            match self.media.is_playing(&id) {
+                true => self.stack.play(&id),
+                false => self.stack.pause(&id),
+            }
+            self.stack.set_loudness(&id, flags.volume, flags.muted);
+            self.media.sync(&id, beat.at, beat.length);
+            if beat.ended {
+                self.media.pause(&id);
+            }
+            // A new picture is a reason to redraw. The playhead moving is not:
+            // `Media::tick` already answers for that, and answering twice
+            // would keep the board awake for a card the cull has dropped.
+            moved |= beat.fresh;
+        }
+
+        // Twice what can play at once, so that flicking between a handful of
+        // clips never rebuilds one, and thirty clips over an afternoon do not
+        // leave thirty decoders standing. See `pipeline::Stack::trim`.
+        self.stack.trim(crate::playback::AT_ONCE * 2);
+        moved
+    }
+
     /// Advance everything that moves by one frame, and say whether to ask for
     /// another.
     ///
@@ -9004,6 +10732,10 @@ impl BoardView {
         // the board was still.
         let camera = self.camera.step(&mut self.viewport, dt);
         let anchors = self.fade_anchors(dt);
+        // The decoders first, so that a playhead a pipeline owns is already
+        // where the pipeline says before the clock below would have moved it —
+        // see `playback::Player::driven`.
+        let decoding = self.pump_media();
         // Playback is bound with the rest rather than short-circuited into the
         // chain below for the same reason the two above are: a video must go on
         // advancing while the camera happens to be moving.
@@ -9022,6 +10754,7 @@ impl BoardView {
         self.animating = camera
             || anchors
             || playing
+            || decoding
             || self.images.arriving()
             || self.wires.fading()
             || overlay
@@ -9047,6 +10780,16 @@ impl BoardView {
         if self.overlay_leaving && !moving {
             self.overlay = Overlay::None;
             self.overlay_leaving = false;
+            // Back to the card the tag list was opened from. Here rather than
+            // wherever the list was dismissed because there are several such
+            // places — Escape, the close button, a press outside — and this is
+            // the one moment all of them arrive at. See `resume_card`.
+            if let Some(id) = self.resume_card.take() {
+                if self.doc.board.item(&id).is_some() {
+                    let bare = self.opened_preview(&id) == mbrd_core::preview::Preview::Nothing;
+                    self.open_overlay(Overlay::Opened(crate::opened::Opened::open(&id, bare)));
+                }
+            }
         }
         moving
     }
@@ -9364,6 +11107,9 @@ impl BoardView {
         // selection and makes the loop below flat in it.
         let picked: HashSet<&str> = self.selection.iter().map(String::as_str).collect();
         let stepped_into: HashSet<&str> = self.inside.iter().map(String::as_str).collect();
+        // The innermost group being stood in, if any. Everything that is not
+        // in it is drawn back — see the `fade` below.
+        let outside: Option<&str> = self.inside.last().map(String::as_str);
         // What an in-progress sweep would add to the selection, borrowed
         // rather than walked per card for the same reason `picked` is. Empty
         // whenever the gesture is not a marquee, so a plain lookup below
@@ -9414,6 +11160,29 @@ impl BoardView {
             // selected — an already-selected card caught again by an
             // additive sweep has nothing left to preview.
             let previewed = !selected && marqueed.contains(item.id.as_str());
+            // Narrowed out by the tag filter, if one is standing. Faded rather
+            // than hidden: a filter that *removed* cards would be a board that
+            // rearranged itself, and the point of the fade is to show where
+            // what you asked for sits among everything else.
+            let fade = match mbrd_core::tags::hidden(item, &self.tag_filter) {
+                true => FADED,
+                false => 1.0,
+            };
+            // And everything outside the group being stood in, at the same
+            // weight and for the same reason: what is faded is still there,
+            // still where it was, and still says where what you are working on
+            // sits among it. Stepping inside changes what a press does — see
+            // `enter_group` — and this is the half of saying so that is on the
+            // board rather than in the corner. The fence itself is not faded,
+            // and neither is anything it holds however deeply.
+            let fade = match &outside {
+                Some(fence)
+                    if item.id != **fence && !self.fences.chain(&item.id).contains(fence) =>
+                {
+                    fade * FADED
+                }
+                _ => fade,
+            };
 
             // Dust. Not worth a border, a corner, a picture or a word — and at
             // this size a selected card still has to be visible, so the accent
@@ -9422,8 +11191,9 @@ impl BoardView {
                 out.push(Draw {
                     body,
                     radius: px(0.0),
-                    fill: if selected { theme.selected_edge } else { theme.colour_of(item) },
-                    edge: theme.card_edge,
+                    fill: if selected { theme.selected_edge } else { theme.colour_of(item) }
+                        .opacity(fade),
+                    edge: theme.card_edge.opacity(fade),
                     border: px(0.0),
                     selected: false,
                     picture: None,
@@ -9435,11 +11205,14 @@ impl BoardView {
                     caret: None,
                     highlight: Vec::new(),
                     marked: Vec::new(),
+                    fade,
                     dust: true,
                     grips: false,
                     frame: false,
                     entered: false,
                     broken: false,
+                    // Nor a tag chip, for the same reason.
+                    tags: Vec::new(),
                     // No padlock at this size. A card below `LOD_DUST` is a
                     // few pixels across, and a mark on it would be the whole
                     // card — see the note above on what dust is worth.
@@ -9499,6 +11272,21 @@ impl BoardView {
                         None
                     }
                 }
+            } else if let Some(frame) = self.stack.picture(item.id.as_str()) {
+                // A playing clip draws what its decoder just handed back, in
+                // front of whatever poster the card carries. Checked before the
+                // cover rather than after it because `picture_hash` answers for
+                // both and would otherwise win on every frame; the cover is
+                // still what a stopped card shows, since a reel that has been
+                // torn down has no picture to offer.
+                let fit =
+                    item.meta.get("fit").and_then(serde_json::Value::as_str).unwrap_or(&board_fit);
+                let size = frame.size(0);
+                let aspect = size.width.0.max(1) as f32 / size.height.0.max(1) as f32;
+                // Never faded in: the first frame of a video arrives where the
+                // poster already was, and fading between two pictures of the
+                // same thing is a flicker rather than an arrival.
+                Some((frame, fit_into(body, aspect, fit == "cover"), 1.0))
             } else {
                 match picture_hash(item) {
                     Some(hash) => match self.images.look(hash, w.max(h) * scale) {
@@ -9552,6 +11340,11 @@ impl BoardView {
                 found.as_ref().map(|(image, ..)| image),
                 self.hovering.as_deref() == Some(item.id.as_str()),
                 sound,
+                item.asset
+                    .as_ref()
+                    .and_then(ItemAsset::hash)
+                    .and_then(|hash| self.doc.waveforms.get(hash))
+                    .map(|waveform| waveform.peaks.as_slice()),
                 for_this(&hover_control),
                 for_this(&press_control),
             );
@@ -9668,13 +11461,14 @@ impl BoardView {
                 theme.colour_of(item).opacity(0.22)
             } else {
                 theme.colour_of(item)
-            };
+            }
+            .opacity(fade);
 
             out.push(Draw {
                 body,
                 radius,
                 fill,
-                edge: if selected {
+                edge: (if selected {
                     theme.selected_edge
                 } else if previewed {
                     // "Will be caught" reads differently from "is selected"
@@ -9690,7 +11484,8 @@ impl BoardView {
                     theme.fence
                 } else {
                     theme.card_edge
-                },
+                })
+                .opacity(fade),
                 border,
                 selected: selected && !plain,
                 picture,
@@ -9698,15 +11493,20 @@ impl BoardView {
                 lines,
                 font_size: px(font_size),
                 pad: px(pad),
-                text: theme.text,
+                text: theme.text.opacity(fade),
                 caret,
                 highlight,
                 marked,
+                fade,
                 dust: false,
                 grips,
                 frame: item.kind == ItemType::Fence,
                 entered,
                 broken,
+                // A fence carries its own, and they are drawn in the one
+                // corner of it that belongs to the fence rather than to
+                // whatever is sitting inside — see [`paint_tags`].
+                tags: mbrd_core::tags::of(item),
                 // Black or white rather than the theme's ink, because this
                 // one sits *on* the card — see `Theme::ink_on`. A fence is
                 // the exception: its fill is a wash the board shows through,
@@ -9920,6 +11720,11 @@ impl BoardView {
             Gesture::Marquee { from, to, .. } => Some((*from, *to)),
             _ => None,
         };
+        // The line being measured, if there is one long enough to be one. Held
+        // across the release, unlike every other gesture the painter draws:
+        // the question is asked about the line, so the line stays up until it
+        // is answered. See `Measuring`.
+        let measured = self.measure_line().map(|(from, to, _)| (from, to));
         // What the drag lined up with, and the chip beside the pointer that
         // says what the drag *is*. Both are cloned out of `self` here rather
         // than reached for inside the painter, which is `'static` and cannot
@@ -9930,6 +11735,16 @@ impl BoardView {
         };
         let badge = self.badge();
         let pointer = self.pointer;
+        // The places a drop still arriving has spoken for, flattened out of
+        // the per-drop rows because the painter does not care which folder a
+        // held place belongs to. Empty whenever nothing is arriving, which is
+        // what keeps this free the rest of the time. See [`Importing::ghosts`].
+        let ghosts: Vec<WorldPoint> = self
+            .importing
+            .as_ref()
+            .map(|i| i.ghosts.iter().flatten().copied().collect())
+            .unwrap_or_default();
+        let ghost_edge = self.theme.chrome_edge;
 
         let entity = cx.entity();
         // For the input handler, which is installed in the paint pass below
@@ -10120,6 +11935,47 @@ impl BoardView {
                     ));
                 }
 
+                // The places a drop has spoken for but not yet filled.
+                //
+                // Under the wires and under the cards, so a card landing in
+                // one covers it rather than jostling it — which is the whole
+                // effect: the block's shape is settled before the first
+                // photograph is read, and reading is watching squares fill
+                // in rather than watching a pile grow sideways.
+                //
+                // Dashed would be truer to a placeholder, and it is not worth
+                // it here: at the zoom a two-hundred-card block is seen at,
+                // one of these is a few pixels across and a dash pattern on
+                // it is noise. An outline in the chrome edge says "structure,
+                // not content" by the same argument the paper sheet does.
+                if !ghosts.is_empty() {
+                    let half_w = import::ARRIVAL_SIZE * 0.36;
+                    let half_h = import::ARRIVAL_SIZE * 0.28;
+                    window.paint_layer(bounds, |window| {
+                        for spot in &ghosts {
+                            let a = vp.to_screen(point(spot.x - half_w, spot.y - half_h));
+                            let b = vp.to_screen(point(spot.x + half_w, spot.y + half_h));
+                            // Off the screen entirely, which for a folder of
+                            // three hundred is most of them.
+                            if b.x < 0.0 || b.y < 0.0 || a.x > vp.size.width || a.y > vp.size.height
+                            {
+                                continue;
+                            }
+                            window.paint_quad(quad(
+                                Bounds::new(
+                                    gpui::point(origin.x + px(a.x), origin.y + px(a.y)),
+                                    gpui::size(px(b.x - a.x), px(b.y - a.y)),
+                                ),
+                                px(crate::theme::RADIUS_SM),
+                                gpui::transparent_black(),
+                                px(1.0),
+                                ghost_edge,
+                                BorderStyle::Solid,
+                            ));
+                        }
+                    });
+                }
+
                 // The lines, under the cards. That is what makes an elbow
                 // drawn behind something read as a connector rather than as
                 // damage: the wire goes under the card and out the other side,
@@ -10241,6 +12097,22 @@ impl BoardView {
                                 BorderStyle::Solid,
                             ));
                         }
+                        // Narrowed out by the tag filter. The *ground* rather
+                        // than the card's own colour, because this is a card
+                        // receding into the board rather than a picture that
+                        // has not arrived — and it is a wash laid over rather
+                        // than an alpha, because `paint_image` has none. See
+                        // `Draw::fade`.
+                        if draw.fade < 1.0 {
+                            window.paint_quad(quad(
+                                body,
+                                draw.radius,
+                                theme.ground.opacity(1.0 - draw.fade),
+                                px(0.0),
+                                gpui::transparent_black(),
+                                BorderStyle::Solid,
+                            ));
+                        }
                     } else if draw.broken {
                         // Corrupt bytes, or a format nothing here reads — an
                         // answer, centred and at reduced opacity, rather than
@@ -10263,6 +12135,17 @@ impl BoardView {
                             gpui::TransformationMatrix::unit(),
                             draw.text.opacity(0.5),
                             cx,
+                        );
+                    }
+
+                    // What it is tagged with, along the bottom. After the
+                    // words and before the padlock: a chip sits over the
+                    // card's own content by design — that is what makes it
+                    // findable on a photograph — and the lock is the one
+                    // mark allowed over everything.
+                    if !draw.tags.is_empty() {
+                        paint_tags(
+                            &draw.tags, body, draw.fade, draw.frame, &theme, &font, window, cx,
                         );
                     }
 
@@ -10610,6 +12493,38 @@ impl BoardView {
                     ));
                 }
 
+                // The measuring line, drawn like a draughtsman's dimension:
+                // the run itself and a tick square across each end, so what is
+                // being measured is the span between two marks rather than a
+                // stroke somebody has to guess the ends of.
+                //
+                // A `ribbon` rather than a quad, because a quad cannot be
+                // turned — see its own note, and `wire_list`, which draws
+                // every rope in this app the same way.
+                if let Some((from, to)) = measured {
+                    let a = vp.to_screen(from);
+                    let b = vp.to_screen(to);
+                    let a = gpui::point(origin.x + px(a.x), origin.y + px(a.y));
+                    let b = gpui::point(origin.x + px(b.x), origin.y + px(b.y));
+                    let (dx, dy) = (f(b.x) - f(a.x), f(b.y) - f(a.y));
+                    let len = (dx * dx + dy * dy).sqrt().max(0.0001);
+                    // The tick is the direction turned a quarter turn, at a
+                    // fixed number of *screen* pixels: it is a mark on the
+                    // window rather than a thing on the board, so zooming out
+                    // must not shrink it away.
+                    const TICK: f32 = 7.0;
+                    let (nx, ny) = (-dy / len * TICK, dx / len * TICK);
+                    let across = |p: gpui::Point<Pixels>| {
+                        [
+                            gpui::point(px(f(p.x) - nx), px(f(p.y) - ny)),
+                            gpui::point(px(f(p.x) + nx), px(f(p.y) + ny)),
+                        ]
+                    };
+                    if let Some(path) = ribbon(&[[a, b], across(a), across(b)], 1.0) {
+                        window.paint_path(path, accent);
+                    }
+                }
+
                 // What the drag lined up with, over everything: a rule drawn
                 // under the card it is about is a rule about nothing. See
                 // `core::guides`, which decides what these are; this only puts
@@ -10860,6 +12775,688 @@ impl BoardView {
         )
     }
 
+    /// The panel over a drop that is still arriving.
+    ///
+    /// **A status line is not enough for this one.** Everything else this app
+    /// says in a sentence is over in a moment; a folder of three hundred
+    /// photographs is seconds of watching, and seconds of watching need a
+    /// thing to watch — a count that moves, a bar that fills, and the button
+    /// that calls it off within reach of the eye already reading the count.
+    /// The status line still carries the same numbers, for somebody who has
+    /// gone back to work and only wants them in the corner.
+    ///
+    /// It does not take the board. No scrim, no catchers, nothing occluded:
+    /// the whole argument for reading off the drawing thread is that you can
+    /// keep working over it, and a panel that swallowed presses would undo
+    /// that at the last step. Only the pill itself stops one.
+    fn import_pill(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let importing = self.importing.as_ref()?;
+        let theme = self.theme;
+        let (done, found) = (importing.done, importing.found);
+        let skipped = importing.unreadable.len();
+        let heavy = importing.heavy.len();
+
+        // Two shares of one track rather than two bars. What was skipped is
+        // as finished as what landed — neither is coming back round — so the
+        // honest picture is one bar in two colours, walking together, with
+        // the ground behind them the part that has not been looked at yet.
+        let (share, missed) = match found {
+            0 => (0.0, 0.0),
+            found => {
+                let each = 1.0 / found as f32;
+                ((done as f32 * each).min(1.0), (skipped as f32 * each).min(1.0))
+            }
+        };
+
+        // Nought of nought reads as "0 of 0", which is a count somebody has
+        // to decide is a bug. Until the walk has finished counting there is
+        // no denominator to show and the honest word is the verb.
+        let counted = match found {
+            0 => format!("{done} so far"),
+            found => format!("{done} of {found}"),
+        };
+        let mut line = counted;
+        if skipped > 0 {
+            line = format!("{line} \u{b7} {skipped} skipped");
+        }
+        if let Some(left) = Self::import_left(importing) {
+            line = format!("{line} \u{b7} ~{left}s left");
+        }
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .flex()
+                .items_end()
+                .justify_center()
+                .pb(px(18.0))
+                .child(
+                    div()
+                        .w(px(IMPORT_PILL))
+                        .flex()
+                        .flex_col()
+                        .gap(px(9.0))
+                        .px(px(13.0))
+                        .py(px(11.0))
+                        .rounded(px(crate::theme::RADIUS_MD))
+                        .bg(theme.chrome)
+                        .border_1()
+                        .border_color(theme.chrome_edge)
+                        .shadow(theme.shadow_large())
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(9.0))
+                                .child(icon(Icon::Folder, crate::icons::ICON_MD, theme.accent))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(1.0))
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_baseline()
+                                                .gap(px(4.0))
+                                                .min_w_0()
+                                                .text_size(px(12.5))
+                                                .text_color(theme.text)
+                                                .child("Reading")
+                                                // The folder's name carries the
+                                                // weight because it is the one
+                                                // word here somebody can check
+                                                // against what they dragged.
+                                                .child(
+                                                    div()
+                                                        .truncate()
+                                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                        .child(importing.named.clone()),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .font(crate::opened::mono())
+                                                .text_size(px(10.5))
+                                                .text_color(theme.tertiary)
+                                                .child(line),
+                                        ),
+                                )
+                                // Named for what it does to the drop, not for
+                                // what it does to the cards: what has already
+                                // landed stays, and stopping is one press of
+                                // undo away from being as if it never ran.
+                                .child(
+                                    div()
+                                        .id("import-stop")
+                                        .flex_none()
+                                        .px(px(10.0))
+                                        .py(px(4.0))
+                                        .rounded(px(crate::theme::RADIUS_XS))
+                                        .border_1()
+                                        .border_color(theme.chrome_edge)
+                                        .text_size(px(11.5))
+                                        .text_color(theme.muted)
+                                        .hover(|s| s.bg(theme.accent.opacity(0.10)))
+                                        .active(|s| s.bg(theme.accent.opacity(0.18)))
+                                        .child("Stop")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _event, _window, cx| {
+                                                this.stop_importing(cx);
+                                                cx.stop_propagation();
+                                            }),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .h(px(3.0))
+                                .rounded(px(2.0))
+                                .bg(theme.chrome_edge)
+                                .overflow_hidden()
+                                .flex()
+                                .child(div().h_full().w(gpui::relative(share)).bg(theme.accent))
+                                .child(
+                                    div().h_full().w(gpui::relative(missed)).bg(theme.rope_danger),
+                                ),
+                        )
+                        // Said here rather than only at the end, because the
+                        // point of saying it at all is that somebody might
+                        // want to stop — and the button that stops is two
+                        // lines up while this is on the screen.
+                        .when(heavy > 0, |d| {
+                            d.child(
+                                div()
+                                    .id("import-heavy")
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(7.0))
+                                    .text_size(px(11.0))
+                                    .text_color(theme.tertiary)
+                                    .child(icon(
+                                        Icon::Warned,
+                                        crate::icons::ICON_SM,
+                                        theme.rope_danger,
+                                    ))
+                                    .child(format!(
+                                        "{heavy} too large to bring in comfortably \u{2014}"
+                                    ))
+                                    .child(
+                                        div()
+                                            .text_color(theme.accent)
+                                            .hover(|s| s.text_color(theme.text))
+                                            .child("see the list"),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _event, _window, cx| {
+                                            this.show_heavy();
+                                            cx.stop_propagation();
+                                        }),
+                                    ),
+                            )
+                        }),
+                ),
+        )
+    }
+
+    /// The strip that says what is being filtered, while anything is.
+    ///
+    /// **A fade is a symptom, not a report.** Two thirds of a board drawn at a
+    /// third of its usual weight is unmistakably *something*, and it is
+    /// perfectly ambiguous between "you have a filter on" and "this file has
+    /// gone wrong" — which is the state a board reopened after a coffee is
+    /// found in. The status bar already carries the tags as a fact, and that
+    /// is the right place for a *reading*; it is the wrong place for the way
+    /// out, because a fact in the corner is not a control and the filter is
+    /// the one standing state in this app with nothing on screen to press.
+    ///
+    /// So: the tags themselves, each with the cross that drops it, and how
+    /// much of the board is faded, and one press that clears the lot. It is up
+    /// only while there is a filter, which means it costs nothing and can
+    /// never be in the way of a board nobody has filtered.
+    ///
+    /// The count is *faded of total*, not "showing 14": what somebody wants to
+    /// know is how much of their board they are not looking at.
+    fn filter_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if self.tag_filter.is_empty() {
+            return None;
+        }
+        let theme = self.theme;
+        let content: Vec<&Item> =
+            self.doc.board.items.iter().filter(|i| i.kind.is_content()).collect();
+        let total = content.len();
+        let faded = content.iter().filter(|i| mbrd_core::tags::hidden(i, &self.tag_filter)).count();
+        let tags: Vec<String> = self.tag_filter.iter().cloned().collect();
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .h(px(36.0))
+                .px(px(12.0))
+                .bg(theme.chrome)
+                .border_b_1()
+                .border_color(theme.chrome_edge)
+                // Chrome over a live board: the same three presses the status
+                // bar and the tool strip stop, for the same reason.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .flex_none()
+                        .font(crate::opened::mono())
+                        .text_size(px(10.0))
+                        .text_color(theme.tertiary)
+                        .child("STANDING FILTER"),
+                )
+                .children(tags.into_iter().enumerate().map(|(i, tag)| {
+                    let dropped = tag.clone();
+                    div()
+                        .id(("filter-tag", i))
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(px(6.0))
+                        .px(px(8.0))
+                        .py(px(3.0))
+                        .rounded(px(crate::theme::RADIUS_XS))
+                        .bg(theme.accent.opacity(0.10))
+                        .border_1()
+                        .border_color(theme.accent.opacity(0.35))
+                        .text_size(px(11.5))
+                        .text_color(theme.accent_text)
+                        .hover(|s| s.bg(theme.accent.opacity(0.18)))
+                        // The funnel goes on the first chip only. It says what
+                        // the row of them *is*; repeating it on each would make
+                        // it look like a control every chip carries, which the
+                        // cross already is.
+                        .when(i == 0, |d| d.child(icon(Icon::Filter, 11.0, theme.accent_text)))
+                        .child(tag.clone())
+                        .child(icon(Icon::Close, 10.0, theme.accent_text.opacity(0.7)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _event, _window, cx| {
+                                // The same door the palette's rows use, so a
+                                // tag dropped here and a tag dropped there
+                                // mean the same thing — including the *or*
+                                // that several of them add up to.
+                                this.narrow_to(&dropped, cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                }))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(11.5))
+                        .text_color(theme.muted)
+                        .child(format!("{faded} of {total} faded")),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .id("filter-clear")
+                        .flex_none()
+                        .px(px(8.0))
+                        .py(px(3.0))
+                        .rounded(px(crate::theme::RADIUS_XS))
+                        .text_size(px(11.5))
+                        .text_color(theme.muted)
+                        .hover(|s| s.bg(theme.text.opacity(0.08)).text_color(theme.text))
+                        .child("Clear filter")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.clear_filter(cx);
+                                cx.stop_propagation();
+                            }),
+                        ),
+                ),
+        )
+    }
+
+    /// What a board with nothing on it says.
+    ///
+    /// `None` the moment there is a single card, which is the whole design: it
+    /// is not a panel that gets dismissed, it is the shape an empty board has.
+    /// Putting a card on the board is what closes it, so it can never be in
+    /// the way — and there is nothing to press to make it go, because a
+    /// dismiss button would leave somebody staring at a blank grid with the
+    /// three things they could do now hidden behind having pressed it.
+    ///
+    /// **It names where the origin is.** An infinite canvas with nothing on it
+    /// is the one state where "where am I" has no answer available by looking,
+    /// and the panel is sitting exactly on the spot the axes cross.
+    ///
+    /// Withheld while anything is arriving. A drop that has been read but
+    /// whose first card has not landed yet is a board that is empty for a
+    /// fraction of a second, and a panel that flashed up in that gap would be
+    /// the app saying "nothing here" about the files it is at that moment
+    /// holding.
+    fn empty_board(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if self.importing.is_some() || self.opening.is_some() || self.editing.is_some() {
+            return None;
+        }
+        if self.doc.board.items.iter().any(|item| item.kind.is_content()) {
+            return None;
+        }
+        let theme = self.theme;
+
+        /// One of the three ways to put the first thing on a board.
+        ///
+        /// The first is a target rather than a button — dropping is the way
+        /// most boards actually start, and it has no press to offer — so it
+        /// wears a dashed edge and no key. The other two are real buttons and
+        /// name the key that does the same thing, because the point of this
+        /// panel is to be the last time somebody needs it.
+        fn door(
+            id: &'static str,
+            mark: Icon,
+            tint: gpui::Hsla,
+            words: &'static str,
+            key: Option<&'static str>,
+            theme: crate::theme::Theme,
+        ) -> gpui::Stateful<gpui::Div> {
+            div()
+                .id(id)
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(7.0))
+                .w(px(118.0))
+                .px(px(10.0))
+                .py(px(14.0))
+                .rounded(px(crate::theme::RADIUS_MD))
+                .when(key.is_none(), |d| {
+                    d.border_dashed().border_1().border_color(theme.chrome_edge)
+                })
+                .when(key.is_some(), |d| {
+                    d.border_1()
+                        .border_color(theme.chrome_edge)
+                        .bg(theme.chrome)
+                        .hover(|s| s.bg(theme.accent.opacity(0.10)))
+                        .active(|s| s.bg(theme.accent.opacity(0.18)))
+                })
+                .child(icon(mark, crate::icons::ICON_LG, tint))
+                .child(div().text_size(px(11.5)).text_color(theme.text).text_center().child(words))
+                .when_some(key, |d, key| {
+                    d.child(div().text_size(px(10.0)).text_color(theme.tertiary).child(key))
+                })
+        }
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                // No handler on the backdrop, deliberately. An empty board
+                // is still a board, and a drag anywhere off the panel has to
+                // go on meaning "pan" — which is the one gesture the last
+                // line of this thing is teaching. Only the panel itself stops
+                // a press.
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(16.0))
+                        .px(px(30.0))
+                        .py(px(24.0))
+                        .rounded(px(crate::theme::RADIUS_LG))
+                        // Over the ground rather than over the grid: the dots
+                        // behind the words are the one place on this screen
+                        // where the grid is actively unhelpful.
+                        .bg(theme.ground.opacity(0.92))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .text_size(px(14.0))
+                                .text_color(theme.muted)
+                                .child("Nothing here yet. The origin is under this note."),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(10.0))
+                                .child(door(
+                                    "empty-drop",
+                                    Icon::Drop,
+                                    theme.muted,
+                                    "Drop files or a folder",
+                                    None,
+                                    theme,
+                                ))
+                                .child(
+                                    door(
+                                        "empty-note",
+                                        Icon::Write,
+                                        theme.note,
+                                        "Write a note",
+                                        Some(Command::AddNote.hint()),
+                                        theme,
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _event, window, cx| {
+                                            Command::AddNote.run(this, window, cx);
+                                            cx.stop_propagation();
+                                        }),
+                                    ),
+                                )
+                                .child(
+                                    door(
+                                        "empty-paste",
+                                        Icon::Paste,
+                                        theme.link,
+                                        "Paste a link",
+                                        Some(Command::Paste.hint()),
+                                        theme,
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _event, window, cx| {
+                                            Command::Paste.run(this, window, cx);
+                                            cx.stop_propagation();
+                                        }),
+                                    ),
+                                ),
+                        )
+                        // How to move, on the one screen where there is
+                        // nothing to move over and therefore no way to find
+                        // out by trying.
+                        .child(div().text_size(px(11.5)).text_color(theme.tertiary).child(
+                            format!(
+                                "Drag to pan · wheel to zoom · {} for everything else",
+                                Command::Palette.hint()
+                            ),
+                        )),
+                ),
+        )
+    }
+
+    /// The strip above the status bar while a tour is running: where you are,
+    /// what it is called, and the three ways out.
+    ///
+    /// `None` whenever no tour is running, which is why this returns an option
+    /// rather than drawing an empty bar — a fixture that is invisible most of
+    /// the time is still a fixture the layout has to reserve room for.
+    ///
+    /// The stops are resolved here, on the frame, for the reason
+    /// `mbrd_core::tour` gives: a card deleted under a running tour must cost a
+    /// clamp rather than a stale name. That also means the counter is right the
+    /// instant an undo puts a stop back.
+    fn tour_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let at = self.touring?;
+        let theme = self.theme;
+        let stops = mbrd_core::tour::stops(&self.doc.board);
+        let total = stops.len();
+        if total == 0 {
+            return None;
+        }
+        let at = at.min(total - 1);
+        let name = stops[at].name.trim();
+        // A card with no name is named by what it is, the same fallback the
+        // search list makes: an empty row would read as a stop that failed.
+        let name = match name.is_empty() {
+            true => stops[at].kind.as_str().to_string(),
+            false => name.to_string(),
+        };
+
+        // The two ends grey rather than wrap — see `step_tour`.
+        let arrow = |which: Icon, by: i32, live: bool| {
+            div()
+                .id(match by {
+                    -1 => "tour-back",
+                    _ => "tour-on",
+                })
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(22.0))
+                .rounded(px(crate::theme::RADIUS_SM))
+                .when(live, |d| {
+                    d.hover(|s| s.bg(theme.accent.opacity(0.16)))
+                        .active(|s| s.bg(theme.accent.opacity(0.3)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _event, _window, cx| {
+                                this.step_tour(by, cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                })
+                .child(icon(which, ICON_MD, if live { theme.text } else { theme.muted }))
+        };
+
+        Some(
+            div()
+                .absolute()
+                .bottom(px(STATUS_HEIGHT))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .pb(px(14.0))
+                // The bar is chrome over a live board, so a press on it must
+                // not reach the canvas underneath — the same three the status
+                // bar and the tool strip stop, for the same reason.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .px(px(10.0))
+                        .py(px(6.0))
+                        .rounded(px(crate::theme::RADIUS_MD))
+                        .bg(theme.chrome)
+                        .border_1()
+                        .border_color(theme.chrome_edge)
+                        .text_size(px(12.0))
+                        .child(arrow(Icon::CaretLeft, -1, at > 0))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .min_w(px(160.0))
+                                .max_w(px(320.0))
+                                .child(div().truncate().text_color(theme.text).child(name))
+                                .child(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .text_color(theme.muted)
+                                        .child(format!("{} of {total}", at + 1)),
+                                ),
+                        )
+                        .child(arrow(Icon::CaretRight, 1, at + 1 < total))
+                        .child(
+                            div()
+                                .id("tour-close")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(22.0))
+                                .rounded(px(crate::theme::RADIUS_SM))
+                                .hover(|s| s.bg(theme.accent.opacity(0.16)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.end_tour(false, cx);
+                                        cx.stop_propagation();
+                                    }),
+                                )
+                                .child(icon(Icon::Close, ICON_SM, theme.muted)),
+                        ),
+                ),
+        )
+    }
+
+    /// The one-line question the measuring mode asks: how long is that?
+    ///
+    /// `None` until there is a line to ask about — while the mode is merely
+    /// armed the status bar's standing hint is already saying what to do, and
+    /// a second fixture saying it again over the board would be the app
+    /// telling somebody twice. See `start_calibrating`.
+    ///
+    /// The same spot the tour bar uses, which is why arming this mode ends a
+    /// running tour: two bars in one place is one of them under the other.
+    fn measure_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let held = self.measuring.as_ref()?;
+        let answer = held.answer.as_ref()?;
+        let theme = self.theme;
+        // The example is in the units the board is already set to, because it
+        // is the answer format rather than decoration: a bare number is read
+        // in those units, and showing the wrong one would teach the wrong
+        // default. See `mbrd_core::paper::millimetres`.
+        let example = match self.doc.board.settings.desktop.units == "imperial" {
+            true => "12in",
+            false => "30cm",
+        };
+
+        Some(
+            div()
+                .absolute()
+                .bottom(px(STATUS_HEIGHT))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .pb(px(14.0))
+                // Chrome over a live board, so a press on it must not reach
+                // the canvas underneath — which here would start the line
+                // again, right underneath the question about the last one.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .px(px(12.0))
+                        .py(px(8.0))
+                        .rounded(px(crate::theme::RADIUS_MD))
+                        .bg(theme.chrome)
+                        .border_1()
+                        .border_color(theme.chrome_edge)
+                        .text_size(px(12.0))
+                        .child(div().flex_none().text_color(theme.text).child("How long is that?"))
+                        .child(
+                            div().min_w(px(120.0)).max_w(px(220.0)).child(
+                                crate::palette::query_line(answer, example, 13.0, true, &theme),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(10.5))
+                                .text_color(theme.muted)
+                                .child("enter to set \u{00b7} esc to cancel"),
+                        )
+                        .child(
+                            div()
+                                .id("measure-close")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(22.0))
+                                .rounded(px(crate::theme::RADIUS_SM))
+                                .hover(|s| s.bg(theme.accent.opacity(0.16)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.stop_calibrating(false, cx);
+                                        cx.stop_propagation();
+                                    }),
+                                )
+                                .child(icon(Icon::Close, ICON_SM, theme.muted)),
+                        ),
+                ),
+        )
+    }
+
     /// Bring the status bar's board-wide counts up to date. Costs a check
     /// while the board is unchanged, two walks of the items when it is not.
     fn tally(&mut self) {
@@ -10871,6 +13468,46 @@ impl BoardView {
         let cards = board.items.iter().filter(|item| item.kind.is_content()).count();
         let pictures = board.items.iter().filter(|item| picture_hash(item).is_some()).count();
         self.tallied = (revision, cards, pictures);
+    }
+
+    /// The mode line for standing inside a fence.
+    ///
+    /// **The state that used to have nothing on screen to show it.** Presses
+    /// reach *through* a grouping while you are inside one, and Escape means
+    /// "step out" rather than "deselect" — two changes to what the app does
+    /// with no change to what it looks like, which is the definition of a
+    /// trap. So it gets the one tone that stands until it is replaced, and it
+    /// names the key that leaves, like every other mode line here.
+    fn inside_line(&self) -> Option<Said> {
+        let fence = self.inside.last()?;
+        let name = self
+            .doc
+            .board
+            .item(fence)
+            .map(|it| it.name.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "the group".into());
+        Some(Said {
+            text: format!("Inside \u{201c}{name}\u{201d} \u{2014} esc steps out"),
+            until: None,
+            tone: Tone::Mode,
+        })
+    }
+
+    /// How many cards are inside the fence being stood in, at any depth.
+    ///
+    /// The count in the corner is otherwise the whole board's, which while
+    /// somebody is working inside a group is a number about somewhere they are
+    /// not.
+    fn inside_count(&self) -> Option<usize> {
+        let fence = self.inside.last()?;
+        Some(
+            self.fences
+                .contents(fence, &self.doc.board.items)
+                .iter()
+                .filter(|it| it.kind.is_content())
+                .count(),
+        )
     }
 
     fn status_bar(&self) -> impl IntoElement {
@@ -10896,7 +13533,13 @@ impl BoardView {
         // Only what the board cannot show for itself. Everything the bar used
         // to narrate is now said by the counts beside it — see the note above
         // and [`Tone`], which is where the division is written down.
-        let line = self.said.as_ref().filter(|said| said.tone.shown());
+        let line = self.said.as_ref().filter(|said| said.tone.shown()).cloned();
+        // Where you are, when nothing more urgent is being said. Derived every
+        // frame rather than set once on the way in — see `enter_group` — so it
+        // cannot be lost to a message that happened to land while you were
+        // standing inside a group, and it cannot outlive the group either.
+        // Yields to anything else, and comes back when that has gone.
+        let line = line.or_else(|| self.inside_line());
 
         // Counted by `tally`, which render runs before this every frame, and
         // re-counted only when the board changes: two walks of twenty thousand
@@ -10906,7 +13549,13 @@ impl BoardView {
         // Each of these is left out entirely when it is nought, rather than
         // reading "0 in the bin" all day. A count of nothing is the one number
         // that is worth no space at all: the board already says it.
-        let mut facts = vec![(Icon::Cards, plural(cards, "card"))];
+        // While somebody is standing inside a group, the board's own total is
+        // a number about somewhere they are not — every press they make lands
+        // in the group. So the count is the group's, and it says so.
+        let mut facts = match self.inside_count() {
+            Some(inside) => vec![(Icon::Cards, format!("{} inside", plural(inside, "card")))],
+            None => vec![(Icon::Cards, plural(cards, "card"))],
+        };
         if pictures > 0 {
             facts.push((Icon::Image, plural(pictures, "picture")));
         }
@@ -10915,6 +13564,29 @@ impl BoardView {
         }
         if !self.selection.is_empty() {
             facts.push((Icon::Selected, format!("{} selected", self.selection.len())));
+        }
+        // What is in the bin, which is a count worth carrying because the bin
+        // is the one place on a board with things in it that has nowhere to
+        // look: a binned card is off the canvas entirely, and `Ctrl Z` is the
+        // only way back. A number here is what says there is anything to go
+        // back *to*. See `BoardView::bin_selection`.
+        if !board.trash.is_empty() {
+            facts.push((Icon::Binned, format!("{} in bin", board.trash.len())));
+        }
+        // A standing report rather than a passing one. The fade on the board
+        // says *that* something is filtered; only this says what by — and
+        // without it, a board reopened after a coffee reads as one somebody
+        // has broken. Named tags while they fit, because "showing kitchen" is
+        // the whole answer and "3 tags" is a second question.
+        if !self.tag_filter.is_empty() {
+            let named: Vec<&str> = self.tag_filter.iter().map(String::as_str).collect();
+            facts.push((
+                Icon::Filter,
+                match named.len() {
+                    1..=2 => format!("showing {}", named.join(", ")),
+                    n => format!("showing {n} tags"),
+                },
+            ));
         }
 
         div()
@@ -10941,17 +13613,56 @@ impl BoardView {
             // sits hard against it however many facts there are — and so a long
             // failure is cut rather than pushing the zoom off the edge.
             .child(
-                div().flex().flex_1().min_w_0().items_center().child(match line {
+                div().flex().flex_1().min_w_0().items_center().child(match &line {
                     Some(said) => {
-                        let colour = said.tone.colour(&theme);
+                        let words = said.tone.colour(&theme);
+                        let mode = said.tone == Tone::Mode;
                         div()
                             .flex()
                             .items_center()
                             .gap(px(6.0))
                             .min_w_0()
                             .px(px(12.0))
-                            .child(icon(said.tone.icon(), 13.0, colour))
-                            .child(div().truncate().text_color(colour).child(said.text.clone()))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(7.0))
+                                    .min_w_0()
+                                    // **The only tone that gets a container.**
+                                    // A mode stands until it is replaced,
+                                    // which every other line here does not —
+                                    // so it has to read as a state the window
+                                    // is *in* rather than as something that
+                                    // just happened and is about to go. A
+                                    // border is what says that, and it is the
+                                    // difference between a line somebody
+                                    // stops seeing after ten seconds and one
+                                    // they can still find when they wonder
+                                    // why Escape is doing something odd.
+                                    .when(mode, |d| {
+                                        d.px(px(7.0))
+                                            .py(px(2.0))
+                                            .ml(px(-3.0))
+                                            .rounded(px(crate::theme::RADIUS_XS))
+                                            .bg(theme.accent.opacity(0.10))
+                                            .border_1()
+                                            .border_color(theme.accent.opacity(0.35))
+                                    })
+                                    .child(icon(said.tone.icon(), 13.0, said.tone.mark(&theme)))
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_color(words)
+                                            // A failure carries the weight as
+                                            // well as the colour: see
+                                            // `Tone::colour`.
+                                            .when(said.tone == Tone::Wrong, |d| {
+                                                d.font_weight(FontWeight::MEDIUM)
+                                            })
+                                            .child(said.text.clone()),
+                                    ),
+                            )
                             .into_any_element()
                     }
                     None => div()
@@ -11073,7 +13784,7 @@ fn tidy_hex(text: &str) -> Option<String> {
 ///
 /// `None` for a run with nothing in it, so the caller does not paint an empty
 /// path — which is a draw call for no pixels.
-fn ribbon(runs: &[[gpui::Point<Pixels>; 2]], half: f32) -> Option<gpui::Path<Pixels>> {
+pub(crate) fn ribbon(runs: &[[gpui::Point<Pixels>; 2]], half: f32) -> Option<gpui::Path<Pixels>> {
     let quads = ribbon_quads(runs, half);
     let first = quads.first()?;
     let mut path = gpui::Path::new(first[0]);
@@ -11188,10 +13899,11 @@ fn dashed(points: &[gpui::Point<Pixels>], on: f32, off: f32) -> Vec<[gpui::Point
 /// field, a note's words are a `meta` key, and a rope's label is on a
 /// connection rather than on an item at all.
 fn write_to(board: &mut mbrd_core::Board, on: &Subject, text: &str, adv: &dyn Advance) {
+    let to_grid = lattice(board);
     match on {
         Subject::Card(id, field) => {
             if let Some(item) = board.item_mut(id) {
-                write_field(item, *field, text, adv);
+                write_field(item, *field, text, adv, to_grid);
             }
         }
         Subject::Rope(a, b) => {
@@ -11241,14 +13953,16 @@ fn hint_for(field: Field) -> String {
     }
 }
 
-fn write_field(item: &mut Item, field: Field, text: &str, adv: &dyn Advance) {
+fn write_field(item: &mut Item, field: Field, text: &str, adv: &dyn Advance, to_grid: Option<f32>) {
     match field {
         Field::Name => {
             item.name = text.to_string();
             // A swatch has no name of its own — the format says its `name` and
             // its `meta.hex` carry the same value, one uppercased. So typing a
-            // colour into a swatch *is* how you recolour it, which is the whole
-            // colour picker this build needs.
+            // colour into a swatch *is* how you recolour it. The grid on the
+            // card menu is no help here and is not meant to be: that one offers
+            // the theme's own shades, and a swatch is a card whose whole point
+            // is a colour from somewhere else.
             if item.kind == ItemType::Swatch {
                 if let Some(hex) = tidy_hex(text) {
                     item.name = hex.to_uppercase();
@@ -11278,7 +13992,7 @@ fn write_field(item: &mut Item, field: Field, text: &str, adv: &dyn Advance) {
     // `show_edit` — and that is the whole feel of the thing: the card grows
     // under the caret as the words reach the end of a line, instead of
     // arriving at its new size once typing has stopped.
-    refit(item, adv);
+    refit(item, adv, to_grid);
 }
 
 /// How far a download has got, for a status line.
@@ -11301,17 +14015,23 @@ fn megabytes(bytes: u64) -> String {
 
 /// Where a board that has never had a file goes.
 ///
-/// `~/mbrd`, named after the board's title, and never over the top of something
-/// already there. See `dirs::boards` for why a document does not live in an
-/// application data directory.
+/// The boards folder, named after the board's title, and never over the top of
+/// something already there. See `dirs::boards` for why a document does not live
+/// in an application data directory, and `Prefs::boards` for why the folder is
+/// a question with an answer rather than a constant — which is why this takes
+/// the prefs rather than asking `dirs` itself.
 ///
 /// `None` only where there is no home directory to put it in, which on a
 /// desktop means something is badly wrong — and the caller says so rather than
 /// inventing a path relative to whatever directory the app happened to be
 /// started from. That is what this used to do, and it scattered boards
 /// wherever a launcher's working directory pointed.
-fn fresh_board_path(board: &mbrd_core::Board) -> Option<PathBuf> {
-    let dir = crate::dirs::boards()?;
+fn fresh_board_path(board: &mbrd_core::Board, prefs: &crate::prefs::Prefs) -> Option<PathBuf> {
+    let dir = prefs.boards()?;
+    // A folder somebody chose and then deleted, or one on a mount that is not
+    // there this morning, fails here exactly as a missing home directory does
+    // — and the caller's message is the right one for both: there is nowhere
+    // to put a board.
     std::fs::create_dir_all(&dir).ok()?;
     Some(unused_in(&dir, &mbrd_core::naming::file_name_for(board)))
 }
@@ -11419,6 +14139,15 @@ struct Controls {
     length: Option<Duration>,
     /// Whether there is anything behind the playhead yet. See `Drawn::moves`.
     moves: bool,
+    /// The recording's shape, already resampled to the number of bars this
+    /// scrubber will draw — see `transport::bars`. Empty for a card the archive
+    /// carries no `waveforms/` sidecar for, which is what the level bars are
+    /// for: they say "a recording" without claiming to say what is in it.
+    ///
+    /// Resampled here rather than in the painter so that a card carrying five
+    /// hundred stored peaks and drawing ninety bars copies ninety numbers a
+    /// frame rather than five hundred.
+    peaks: Vec<f32>,
     /// `0:12 / 3:40`, or just the length before anything has played.
     time: String,
     /// Which button the pointer is over, of the three with no other
@@ -11495,6 +14224,23 @@ struct Draw {
     /// which is what stops a broken file from looking identical to a slow
     /// decode forever.
     broken: bool,
+    /// How much of this card is drawn at all: `1.0` normally, and [`FADED`]
+    /// for a card the tag filter has narrowed out.
+    ///
+    /// Carried rather than folded into the colours, because a picture has no
+    /// colour to fold it into — `paint_image` takes no opacity, so a faded
+    /// photograph is the photograph with the board's own ground washed back
+    /// over it. That is the same trick the arrival dissolve plays one field
+    /// up, and for the same reason.
+    fade: f32,
+    /// What this card is tagged with, in the order the card carries them.
+    ///
+    /// Passed whole rather than already reduced to what fits, because how many
+    /// fit is a question about *shaped text* — see [`paint_tags`], which is
+    /// where the answer can actually be measured. Empty on a card with no tags
+    /// and on dust, which is what keeps this free on the overwhelmingly common
+    /// board where nothing is tagged at all.
+    tags: Vec<String>,
     /// The colour to draw the padlock in, on a card the author has locked,
     /// and `None` on one they have not.
     ///
@@ -11504,6 +14250,309 @@ struct Draw {
     /// which does, at the one place that has both.
     lock: Option<Hsla>,
 }
+
+/// How wide a card has to be, in screen pixels, before its tags are drawn as
+/// wrapped chips, as one chip and a count, and as a single mark.
+///
+/// Three widths rather than one scaling chip, because the failure a chip has
+/// is not gradual: below a certain width the word inside it is truncated, and
+/// a tag truncated to `zell…` is worse than no tag at all — it looks like a
+/// tag whose *name* is that. So each step drops the thing that no longer fits
+/// and keeps a true statement: all of them, then one of them and how many
+/// others, then only that there are some.
+const TAG_WIDE: f32 = 220.0;
+const TAG_NARROW: f32 = 120.0;
+const TAG_MARK: f32 = 44.0;
+
+/// How tall a card has to be before a chip along its bottom is a chip rather
+/// than the whole card.
+const TAG_ROOM: f32 = 34.0;
+
+/// How big the words in a chip are, in screen pixels.
+///
+/// Fixed, at every zoom, for the reason [`LOCK_MARK`] is: this is a mark about
+/// the card rather than part of what is on it. A chip that grew with the card
+/// would be a label the size of a wall on a photograph blown up.
+const TAG_TEXT: f32 = 10.0;
+
+/// At most this many rows of chips, however many tags a card carries.
+///
+/// Two, because a card wearing eight tags would otherwise be a card you cannot
+/// see — and the whole argument for drawing them on the card at all is that
+/// they are cheaper to read there than in a panel. Past two rows they are not.
+const TAG_ROWS: usize = 2;
+
+/// Which chips go on which row, and how many are left over.
+///
+/// Returns the indices per row — at most [`TAG_ROWS`] of them — and the count
+/// that did not fit, which the caller draws as `+n` on the end of the last
+/// row. `counted` is how wide that `+n` chip will be, wanted here because
+/// making room for it can push another chip out and *change the number it is
+/// about*: dropping a chip to fit "+2" makes it "+3", which may no longer fit
+/// either. Getting that wrong is a card that says it has three more tags when
+/// it has four, which is worse than saying nothing.
+///
+/// Split out of [`paint_tags`] because it is arithmetic and everything around
+/// it is a window: this is the part that can be wrong in a way nobody notices.
+fn pack_tags(widths: &[f32], room: f32, gap: f32, counted: f32) -> (Vec<Vec<usize>>, usize) {
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    let mut row: Vec<usize> = Vec::new();
+    let mut used = 0.0;
+    let mut placed = 0usize;
+
+    for (at, &wide) in widths.iter().enumerate() {
+        let needed = wide + if row.is_empty() { 0.0 } else { gap };
+        if used + needed > room && !row.is_empty() {
+            rows.push(std::mem::take(&mut row));
+            used = 0.0;
+            if rows.len() == TAG_ROWS {
+                break;
+            }
+        }
+        // A single tag wider than the whole card goes down anyway, and is
+        // clipped by the card it is on. The alternative is a card that
+        // silently drops the one tag it has.
+        used += wide + if row.is_empty() { 0.0 } else { gap };
+        row.push(at);
+        placed += 1;
+    }
+    if rows.len() < TAG_ROWS && !row.is_empty() {
+        rows.push(row);
+    }
+
+    // Now make room for the count, if there is one to make room for. Each chip
+    // dropped is one more tag counted, so the loop re-asks rather than
+    // subtracting once — and it never empties a row, because a row holding
+    // only "+7" says less than one holding a tag and "+6".
+    while placed < widths.len() {
+        let Some(row) = rows.last_mut() else { break };
+        let wide: f32 = row.iter().map(|&at| widths[at] + gap).sum::<f32>() + counted;
+        if wide <= room || row.len() <= 1 {
+            break;
+        }
+        row.pop();
+        placed -= 1;
+    }
+    (rows, widths.len() - placed)
+}
+
+/// The chips along the bottom of a card, at whichever of the three sizes fits.
+///
+/// A free function because it is a self-contained piece of painting with eight
+/// arguments and no state, and folding it into `paint_board`'s closure would
+/// add fifty lines to the one function in this file that is already the
+/// longest. See [`TAG_WIDE`] for why there are three sizes.
+///
+/// `top` moves the stack to the far corner instead, and is what a fence gets. A
+/// fence is a region rather than a thing, so the bottom-left of one is not a
+/// corner of anything — it is a patch of board with somebody's cards on it, and
+/// a chip drawn there reads as a label on whichever card is underneath. The top
+/// right is the one corner of a fence that belongs to the fence: its name is at
+/// the top left, and the two together read as a band across the top of the
+/// region, which is what they are.
+#[expect(clippy::too_many_arguments, reason = "one call's worth of where and what")]
+fn paint_tags(
+    tags: &[String],
+    body: Bounds<Pixels>,
+    fade: f32,
+    top: bool,
+    theme: &Theme,
+    font: &Font,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) {
+    let (w, h) = (f32::from(body.size.width), f32::from(body.size.height));
+    if w < TAG_MARK || h < TAG_ROOM {
+        return;
+    }
+    // Dark behind the words whatever the card is, because a chip has to be
+    // legible over a photograph and a photograph can be any colour. The board's
+    // own ground at most of its weight is the one colour on the screen that is
+    // already the app's idea of "behind things".
+    let back = theme.ground.opacity(0.86 * fade);
+    let edge = theme.chrome_edge.opacity(fade);
+    let ink = theme.text.opacity(fade);
+    let pad = px(6.0);
+    let gap = px(4.0);
+    let size = px(TAG_TEXT);
+    let height = size * 1.7;
+    let inset = px(7.0);
+
+    // The smallest card that carries anything: one square with the app's own
+    // tag mark in it, which says *that* this card is tagged and nothing more.
+    // Hovering names them — see `BoardView::hovering`.
+    if w < TAG_NARROW {
+        let side = px(15.0);
+        let mark = Bounds::new(
+            match top {
+                true => gpui::point(
+                    body.origin.x + body.size.width - inset - side,
+                    body.origin.y + inset,
+                ),
+                false => gpui::point(
+                    body.origin.x + inset,
+                    body.origin.y + body.size.height - inset - side,
+                ),
+            },
+            gpui::size(side, side),
+        );
+        window.paint_quad(quad(mark, px(3.0), back, px(1.0), edge, BorderStyle::Solid));
+        let _ = window.paint_svg(
+            mark.dilate(px(-3.0)),
+            Icon::Tag.path().into(),
+            gpui::TransformationMatrix::unit(),
+            ink,
+            cx,
+        );
+        return;
+    }
+
+    /// One chip, shaped and measured but not yet placed.
+    struct Chip {
+        line: gpui::ShapedLine,
+        width: Pixels,
+    }
+
+    let shape = |text: String, window: &mut Window| -> Chip {
+        let text: SharedString = text.into();
+        let run = TextRun {
+            len: text.len(),
+            font: font.clone(),
+            color: ink,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let line = window.text_system().shape_line(text, size, &[run], None);
+        let width = line.width + pad * 2.0;
+        Chip { line, width }
+    };
+
+    // How much room the row has. The inset on both sides, so a chip never runs
+    // out of the card it belongs to.
+    let room = body.size.width - inset * 2.0;
+
+    // What to draw, as a list of rows. The narrow card gets exactly one row of
+    // at most two things — the first tag and how many others — because a
+    // second row on a card this size is most of the card.
+    let mut rows: Vec<Vec<Chip>> = Vec::new();
+    if w < TAG_WIDE {
+        let first = shape(tags[0].clone(), window);
+        let mut row = Vec::new();
+        let rest = tags.len() - 1;
+        let more = (rest > 0).then(|| shape(format!("+{rest}"), window));
+        // Only if the pair actually fits. A first chip that had to be
+        // truncated to make room for the count would be the exact failure the
+        // three sizes exist to avoid — so in that case the count goes and the
+        // tag stays whole.
+        let both = first.width + gap + more.as_ref().map_or(px(0.0), |c| c.width);
+        row.push(first);
+        if let Some(more) = more {
+            if both <= room {
+                row.push(more);
+            }
+        }
+        rows.push(row);
+    } else {
+        // Shaped first, packed second. The packing is arithmetic over widths
+        // and is tested on its own — see [`pack_tags`] — because "+3" being
+        // "+4" is the kind of wrong that looks right.
+        let chips: Vec<Chip> = tags.iter().map(|tag| shape(tag.clone(), window)).collect();
+        let widths: Vec<f32> = chips.iter().map(|c| f32::from(c.width)).collect();
+        let (packed, left) =
+            pack_tags(&widths, f32::from(room), f32::from(gap), f32::from(px(20.0)));
+
+        let mut chips: Vec<Option<Chip>> = chips.into_iter().map(Some).collect();
+        for line in packed {
+            let mut row: Vec<Chip> = line
+                .into_iter()
+                .filter_map(|at| chips.get_mut(at).and_then(Option::take))
+                .collect();
+            rows.push(std::mem::take(&mut row));
+        }
+        // Whatever did not fit, counted, on the end of the last row. "+3" is
+        // the whole difference between a card showing four of seven tags and a
+        // card that appears to have four.
+        if left > 0 {
+            if let Some(row) = rows.last_mut() {
+                row.push(shape(format!("+{left}"), window));
+            }
+        }
+    }
+
+    // Bottom up, so the last row sits against the card's bottom edge and the
+    // stack grows towards the middle. A stack anchored at the top would move
+    // every chip whenever a tag was added. A fence's stack hangs the other way
+    // for the same reason, from its own top edge downwards.
+    let mut baseline = match top {
+        true => body.origin.y + inset,
+        false => body.origin.y + body.size.height - inset - height,
+    };
+    let order: Vec<&Vec<Chip>> = match top {
+        true => rows.iter().collect(),
+        false => rows.iter().rev().collect(),
+    };
+    for row in order {
+        // Right-aligned in the top corner, left-aligned in the bottom one:
+        // each stack is squared off against the edge it hangs from, so a row
+        // that happens to be short does not leave the corner empty.
+        let wide: Pixels = row.iter().fold(px(0.0), |so_far, chip| so_far + chip.width)
+            + gap * row.len().saturating_sub(1) as f32;
+        let mut left = match top {
+            true => body.origin.x + body.size.width - inset - wide,
+            false => body.origin.x + inset,
+        };
+        for chip in row {
+            let at = Bounds::new(gpui::point(left, baseline), gpui::size(chip.width, height));
+            window.paint_quad(quad(at, px(4.0), back, px(1.0), edge, BorderStyle::Solid));
+            let _ = chip.line.paint(
+                gpui::point(left + pad, baseline + (height - size) / 2.0),
+                height,
+                window,
+                cx,
+            );
+            left += chip.width + gap;
+        }
+        baseline += match top {
+            true => height + gap,
+            false => -(height + gap),
+        };
+    }
+}
+
+/// Whether a card of this kind can be given a colour of its own.
+///
+/// The three that are a coloured rectangle with words on — a note, a text file,
+/// a sticker — and the fence, which is a coloured rectangle with a name on and
+/// is the one item on a board that stands for a batch of work rather than a
+/// file. A photograph's fill is the photograph, so tinting one would be a
+/// colour nobody can see.
+fn tintable(kind: &ItemType) -> bool {
+    matches!(kind, ItemType::Note | ItemType::Text | ItemType::Sticker | ItemType::Fence)
+}
+
+/// How far in one stop of the tour is allowed to take the camera.
+///
+/// Half again over the resting zoom rather than the camera's own ceiling.
+/// Without a cap a tour is unusable rather than merely imperfect: a stop on a
+/// sticker or a small note flies the whole way in and the board disappears
+/// behind one object. This is the point where a card fills a comfortable part
+/// of the window and what is around it is still visible — which is the whole
+/// difference between a tour and a slideshow.
+const TOUR_ZOOM: f32 = BASE_ZOOM * 1.5;
+
+/// The room left round a stop, in world units. Generous: a stop is meant to sit
+/// in a room rather than to fill the window.
+const TOUR_PAD: f32 = 140.0;
+
+/// How much of a card the tag filter has narrowed out is still drawn.
+///
+/// Faint enough that what matched reads as the foreground at a glance, and far
+/// enough from nothing that the board keeps its shape: a filter is a way of
+/// finding something *among* everything else, so cards going fully invisible
+/// would throw away the only thing that makes the answer mean anything — where
+/// it sits.
+const FADED: f32 = 0.34;
 
 /// How big the padlock on a locked card is drawn, in screen pixels.
 ///
@@ -11730,16 +14779,30 @@ fn paint_controls(
         // A voice memo has nothing to look at, so the sound is the picture.
         // Bars from the middle outwards, which is how a waveform is read.
         //
-        // Phase B measures these off the recording and into the board's
-        // `waveforms` sidecar. Until then the bars are level, which is honest:
-        // it says "a recording" without claiming to say what is in it.
+        // The heights are the recording's own where the archive carries a
+        // `waveforms/` sidecar for it, and level where it does not — which is
+        // honest rather than a placeholder: a flat run of bars says "a
+        // recording" without claiming to say what is in it. See
+        // `Controls::peaks`, which has already reduced the stored readings to
+        // exactly the number of bars drawn here.
         Face::Memo => {
-            let half = track.height() * 0.42 * 0.35;
-            let bars = ((track.width() / 3.0).floor() as usize).clamp(1, 160);
+            let full = track.height() * 0.42;
+            // Just over a third of the full height, which is what a level run
+            // looked like before any of them were measured — so a card with no
+            // sidecar draws exactly what it always did.
+            let flat = full * 0.35;
+            let bars = transport::bars(track);
             for i in 0..bars {
                 let across = (i as f32 + 0.5) / bars as f32;
                 let x = track.x0 + track.width() * across;
                 let lit = across <= controls.progress;
+                // A floor of one pixel: a silent moment in the middle of a
+                // recording is still part of the recording, and a bar of no
+                // height at all would read as a gap in the card.
+                let half = match controls.peaks.get(i) {
+                    Some(peak) => (peak.clamp(0.0, 1.0) * full).max(1.0),
+                    None => flat,
+                };
                 let box2 = transport::Box2::new(x - 1.0, middle - half, x + 1.0, middle + half);
                 // `muted` is solid now — see the field's own doc — so this is
                 // the wash's real effective weight rather than one more
@@ -11957,6 +15020,9 @@ fn controls_for(
     image: Option<&Arc<RenderImage>>,
     hovered: bool,
     sound: bool,
+    // What the archive measured this recording at, where it carries a sidecar
+    // for it at all. See `Controls::peaks`.
+    measured: Option<&[f32]>,
     hover: Option<transport::Hit>,
     press: Option<transport::Hit>,
 ) -> Option<Controls> {
@@ -11967,14 +15033,19 @@ fn controls_for(
     // Whether this card actually moves, which for a picture is a question only
     // its bytes can answer: a `.gif` holding one frame is a photograph, and one
     // holding forty is an animation, and nothing before the decode knows which.
-    let moves = image.is_some_and(|image| image.frame_count() > 1);
+    let animated = image.is_some_and(|image| image.frame_count() > 1);
     let animation = matches!(item.kind, ItemType::Image);
-    if animation && !moves {
+    if animation && !animated {
         return None;
     }
+    // A recording moves because it is a recording. Nothing has been decoded
+    // yet at this point and nothing needs to have been: whether this machine
+    // can *play* it is `pipeline::Stack`'s answer and is given at the press,
+    // which is where the card can be left alone if the answer is no.
+    let moves = animated || matches!(item.kind, ItemType::Audio | ItemType::Video);
 
     let flags = mbrd_core::media::playback(item);
-    let length = match moves {
+    let length = match animated {
         // An animation's length is a property of its frames, which is the one
         // length on the board nobody has to be told — read off the measured
         // clock rather than summed per frame.
@@ -11989,6 +15060,9 @@ fn controls_for(
     // what is left to check is that there is something to play and that nobody
     // has pressed this card before. A card somebody paused must not be started
     // again by the next frame, which is what the last clause is for.
+    // `moves` rather than `animated`: a board saved with a video running opens
+    // with it running, and the reel it needs is opened by the next
+    // `pump_media` — see `BoardView::start_reel`.
     if flags.autoplay && moves && media.get(&item.id).is_none() {
         media.play(&item.id, length, flags.looping);
     }
@@ -12033,6 +15107,14 @@ fn controls_for(
         loudness: flags.volume,
         length,
         moves,
+        // Down to what will be drawn, and by taking the loudest reading in each
+        // bucket rather than the mean — the same rule `peaks::measure` follows
+        // on the way in, and for the same reason: the bar a person recognises
+        // is the loudest thing in that slice of time.
+        peaks: measured
+            .filter(|peaks| !peaks.is_empty())
+            .map(|peaks| mbrd_core::peaks::measure_slice(peaks, transport::bars(strip.scrub)))
+            .unwrap_or_default(),
         time,
         hover,
         press,
@@ -12281,8 +15363,18 @@ fn fitted_height(item: &Item, adv: &dyn Advance) -> Option<f32> {
 ///
 /// A no-op on anything that is not a fitted note, so callers do not have to
 /// ask first.
-fn refit(item: &mut Item, adv: &dyn Advance) {
+///
+/// On a snapped board the measured height is rounded **up** to whole cells.
+/// Up, not to the nearest: the height is what the words need, and taking a
+/// cell off it to reach a rounder number would cut a line off the bottom of
+/// somebody's note. Rounding up is only ever air, and it means a fitted note
+/// grows a cell at a time on a board whose sizes are all cells.
+fn refit(item: &mut Item, adv: &dyn Advance, to_grid: Option<f32>) {
     let Some(height) = fitted_height(item, adv) else { return };
+    let height = match to_grid {
+        Some(step) => geometry::cells_up(height, step),
+        None => height,
+    };
     // `y` points up, so the top edge is the *larger* coordinate. See
     // `viewport.rs`, which is the only place that flip happens.
     let top = item.y + item.h / 2.0;
@@ -12629,6 +15721,10 @@ impl Render for BoardView {
             Overlay::Opened(opened) => opened_ready
                 .as_ref()
                 .map(|ready| crate::opened::render(opened, ready, self, cx).into_any_element()),
+            Overlay::Stock(sheet) => Some(crate::stock::render(sheet, self, cx).into_any_element()),
+            Overlay::Welcome(screen) => {
+                Some(crate::welcome::render(screen, self, cx).into_any_element())
+            }
         };
 
         let mut root = div()
@@ -12695,7 +15791,21 @@ impl Render for BoardView {
                         this.take_files(paths.paths(), at, cx);
                     }))
                     .child(board)
+                    // Over the board and under the strip: it is about the
+                    // board rather than part of it, and the tool strip is
+                    // still a live control while it is up.
+                    .children(self.empty_board(cx))
+                    // Same layer, and they cannot both be up: the panel that
+                    // says a board is empty stands down the moment anything
+                    // is arriving. See `empty_board`.
+                    .children(self.import_pill(cx))
+                    // At the top rather than beside the status bar's own
+                    // reading of the same fact, because this one is a set of
+                    // controls: see `filter_bar`.
+                    .children(self.filter_bar(cx))
                     .child(tools)
+                    .children(self.tour_bar(cx))
+                    .children(self.measure_bar(cx))
                     .child(self.status_bar())
                     // Above the strip as well as the board: a menu opened near
                     // the bottom of the window flips upward, but one opened on
@@ -12836,6 +15946,55 @@ mod tests {
         assert_eq!(out.len(), 4);
     }
 
+    #[test]
+    fn a_card_put_down_on_a_snapped_board_arrives_on_the_lattice() {
+        // A note is born 220 by 180, which is neither a whole number of cells
+        // nor anywhere near one. Dropped on a snapped board it used to stay
+        // that way, so the setting tidied what was already there and then let
+        // every new card sit across the pattern it had just tidied them onto.
+        let step = 64.0;
+        let mut note = Item::new("n", ItemType::Note);
+        note.w = 220.0;
+        note.h = 180.0;
+        note.x = 37.0;
+        note.y = -91.0;
+        settle(&mut note, Some(step));
+        assert_eq!((note.w, note.h), (192.0, 192.0), "three cells each way");
+        for edge in [
+            note.x - note.w / 2.0,
+            note.x + note.w / 2.0,
+            note.y - note.h / 2.0,
+            note.y + note.h / 2.0,
+        ] {
+            let cells = edge / step;
+            assert!((cells - cells.round()).abs() < 0.001, "an edge {cells} cells out is halfway");
+        }
+
+        // And an unsnapped board leaves it exactly as it was.
+        let mut free = Item::new("f", ItemType::Note);
+        free.w = 220.0;
+        free.h = 180.0;
+        free.x = 37.0;
+        settle(&mut free, None);
+        assert_eq!((free.w, free.h, free.x), (220.0, 180.0, 37.0));
+    }
+
+    #[test]
+    fn a_fitted_note_on_a_snapped_board_is_a_whole_number_of_cells_tall() {
+        // The height is the words' to decide, so it rounds *up*: a note a cell
+        // shorter than its text is a note with a line cut off the bottom.
+        let step = 64.0;
+        let mut note = fitted(&"word ".repeat(60), 220.0);
+        refit(&mut note, &guess(), None);
+        let measured = note.h;
+
+        let mut snapped = fitted(&"word ".repeat(60), 220.0);
+        refit(&mut snapped, &guess(), Some(step));
+        assert!(snapped.h >= measured, "a fitted note may not lose a line to the grid");
+        assert!((snapped.h / step).fract().abs() < 0.001, "{} is not whole cells", snapped.h);
+        assert!(snapped.h - measured < step, "and it grows by less than a whole cell");
+    }
+
     fn fitted(text: &str, w: f32) -> Item {
         let mut note = Item::new("n", ItemType::Note);
         note.w = w;
@@ -12898,7 +16057,7 @@ mod tests {
         note.h = 180.0;
         note.meta.insert("text".into(), "one line".into());
         assert_eq!(fitted_height(&note, &guess()), None);
-        refit(&mut note, &guess());
+        refit(&mut note, &guess(), None);
         assert_eq!(note.h, 180.0, "the default is a card that stays where you put it");
     }
 
@@ -12911,7 +16070,7 @@ mod tests {
         let mut note = fitted(&"line\n".repeat(12), 220.0);
         note.y = 100.0;
         let top = note.y + note.h / 2.0;
-        refit(&mut note, &guess());
+        refit(&mut note, &guess(), None);
         assert!(note.h > 180.0, "the premise: twelve lines want more than this note has");
         assert_eq!(note.y + note.h / 2.0, top, "the top edge stays put");
 
@@ -12920,7 +16079,7 @@ mod tests {
         let mut note = fitted("one line", 220.0);
         note.y = 100.0;
         let top = note.y + note.h / 2.0;
-        refit(&mut note, &guess());
+        refit(&mut note, &guess(), None);
         assert!(note.h < 180.0, "the premise: one line wants less than this note has");
         assert_eq!(note.y + note.h / 2.0, top);
     }
@@ -12930,26 +16089,42 @@ mod tests {
         // The path that actually runs sixty times a second while somebody is
         // typing. See `show_edit`, which reaches `write_field` on every press.
         let mut note = fitted("one line", 220.0);
-        write_field(&mut note, Field::Note, &"word ".repeat(60), &guess());
+        write_field(&mut note, Field::Note, &"word ".repeat(60), &guess(), None);
         assert!(note.h > 180.0);
 
         let mut plain = Item::new("p", ItemType::Note);
         plain.w = 220.0;
         plain.h = 180.0;
-        write_field(&mut plain, Field::Note, &"word ".repeat(60), &guess());
+        write_field(&mut plain, Field::Note, &"word ".repeat(60), &guess(), None);
         assert_eq!(plain.h, 180.0);
     }
 
     #[test]
     fn a_card_dragged_free_follows_the_pointer_exactly() {
-        let to = dropped_at(point(10.0, 20.0), 3.5, -4.25, None);
+        let to = dropped_at(point(10.0, 20.0), 3.5, -4.25, (128.0, 128.0), None);
         assert_eq!((to.x, to.y), (13.5, 15.75));
     }
 
     #[test]
     fn a_card_dragged_to_the_grid_lands_on_the_nearest_cell() {
-        let to = dropped_at(point(0.0, 0.0), 40.0, 20.0, Some(64.0));
+        // Two cells each way, so the card's centre is on a dot and this reads
+        // the way it always did.
+        let to = dropped_at(point(0.0, 0.0), 40.0, 20.0, (128.0, 128.0), Some(64.0));
         assert_eq!((to.x, to.y), (64.0, 0.0), "40 is nearer 64 than 0, and 20 is nearer 0");
+    }
+
+    #[test]
+    fn a_dragged_card_lands_its_edges_on_the_grid_whatever_size_it_is() {
+        // The bug: rounding the centre puts a card of an odd number of cells
+        // half a cell off the pattern on both sides, however carefully it is
+        // dropped. Three cells at a step of 64 is 192 wide.
+        let step = 64.0;
+        let to = dropped_at(point(0.0, 0.0), 40.0, 20.0, (192.0, 192.0), Some(step));
+        for edge in [to.x - 96.0, to.x + 96.0, to.y - 96.0, to.y + 96.0] {
+            let cells = edge / step;
+            assert!((cells - cells.round()).abs() < 0.001, "an edge {cells} cells out is halfway");
+        }
+        assert_eq!((to.x, to.y), (32.0, 32.0), "the centre of an odd card is between two dots");
     }
 
     #[test]
@@ -12961,7 +16136,7 @@ mod tests {
         let step = Some(64.0);
         let mut x = home.x;
         for frame in 1..=30 {
-            x = dropped_at(home, frame as f32 * 10.0, 0.0, step).x;
+            x = dropped_at(home, frame as f32 * 10.0, 0.0, (128.0, 128.0), step).x;
         }
         assert_eq!(x, 320.0, "300 units of pointer is roughly five cells, not none");
     }
@@ -13418,7 +16593,7 @@ mod hex_tests {
     #[test]
     fn a_colour_typed_into_a_swatch_becomes_its_colour() {
         let mut swatch = Item::new("s", ItemType::Swatch);
-        write_field(&mut swatch, Field::Name, "#3A5F2C", &guess());
+        write_field(&mut swatch, Field::Name, "#3A5F2C", &guess(), None);
         assert_eq!(swatch.meta.get("hex").and_then(|v| v.as_str()), Some("#3a5f2c"));
         assert_eq!(swatch.name, "#3A5F2C", "the name carries the same value, uppercased");
     }
@@ -13426,7 +16601,7 @@ mod hex_tests {
     #[test]
     fn the_short_spelling_is_stored_the_long_way() {
         let mut swatch = Item::new("s", ItemType::Swatch);
-        write_field(&mut swatch, Field::Name, "#fa0", &guess());
+        write_field(&mut swatch, Field::Name, "#fa0", &guess(), None);
         assert_eq!(swatch.meta.get("hex").and_then(|v| v.as_str()), Some("#ffaa00"));
     }
 
@@ -13434,7 +16609,7 @@ mod hex_tests {
     fn something_that_is_not_a_colour_is_just_a_name() {
         let mut swatch = Item::new("s", ItemType::Swatch);
         swatch.meta.insert("hex".into(), serde_json::json!("#123456"));
-        write_field(&mut swatch, Field::Name, "warm grey", &guess());
+        write_field(&mut swatch, Field::Name, "warm grey", &guess(), None);
         assert_eq!(swatch.name, "warm grey");
         assert_eq!(
             swatch.meta.get("hex").and_then(|v| v.as_str()),
@@ -13447,7 +16622,7 @@ mod hex_tests {
     fn only_a_swatch_gets_this_treatment() {
         // A photograph called `#ff0000.png` is a photograph.
         let mut photo = Item::new("p", ItemType::Image);
-        write_field(&mut photo, Field::Name, "#ff0000", &guess());
+        write_field(&mut photo, Field::Name, "#ff0000", &guess(), None);
         assert_eq!(photo.name, "#ff0000");
         assert!(photo.meta.get("hex").is_none());
     }
@@ -13455,7 +16630,7 @@ mod hex_tests {
     #[test]
     fn a_notes_words_go_where_the_format_keeps_them() {
         let mut note = Item::new("n", ItemType::Note);
-        write_field(&mut note, Field::Note, "some words", &guess());
+        write_field(&mut note, Field::Note, "some words", &guess(), None);
         assert_eq!(note.note_text(), Some("some words"));
         assert_eq!(note.name, "", "the name is not the words");
     }
@@ -13577,5 +16752,180 @@ mod zoom_tests {
         assert_eq!(zoom_reading(2.36), "2.4");
         assert_eq!(zoom_reading(0.4), "0.40");
         assert_eq!(zoom_reading(mbrd_core::viewport::MIN_ZOOM * 100.0), "0.02");
+    }
+}
+
+#[cfg(test)]
+mod import_pill_tests {
+    use super::*;
+
+    /// An `Importing` with nothing in flight, for the counters to be set on.
+    fn arriving(done: usize, found: usize, ago: Duration) -> Importing {
+        Importing {
+            named: "Tiles & stone".into(),
+            began: std::time::Instant::now() - ago,
+            ghosts: Vec::new(),
+            open: Pending,
+            token: 0,
+            drops: 1,
+            found,
+            done,
+            parted: 0,
+            unreadable: Vec::new(),
+            heavy: Vec::new(),
+            described: None,
+            placed: Vec::new(),
+            ours: true,
+        }
+    }
+
+    #[test]
+    fn a_drop_is_called_what_was_dragged() {
+        assert_eq!(BoardView::drop_name(&[PathBuf::from("/a/b/Tiles & stone")]), "Tiles & stone");
+        // A file, not only a folder: the pill is up for a slow single file too.
+        assert_eq!(BoardView::drop_name(&[PathBuf::from("/a/kitchen.png")]), "kitchen.png");
+    }
+
+    #[test]
+    fn several_dropped_at_once_are_counted_rather_than_named() {
+        // There is no shared name to use, and picking the first would be a
+        // pill that says it is reading one folder while reading three.
+        let many = [PathBuf::from("/a/one"), PathBuf::from("/a/two"), PathBuf::from("/a/three")];
+        assert_eq!(BoardView::drop_name(&many), "3 items");
+        assert_eq!(BoardView::drop_name(&[]), "nothing");
+    }
+
+    #[test]
+    fn there_is_no_estimate_until_there_is_something_to_estimate_from() {
+        // The walk has not finished counting: no denominator, no estimate.
+        assert_eq!(BoardView::import_left(&arriving(0, 0, Duration::from_secs(2))), None);
+        // Counted, but nothing has landed, so there is no rate yet.
+        assert_eq!(BoardView::import_left(&arriving(0, 300, Duration::from_secs(2))), None);
+        // Everything has landed. Zero seconds left is not a thing to say.
+        assert_eq!(BoardView::import_left(&arriving(300, 300, Duration::from_secs(2))), None);
+    }
+
+    #[test]
+    fn the_estimate_is_the_rate_so_far_times_what_is_left() {
+        // A hundred in four and a half seconds, three hundred to go: thirteen
+        // and a half seconds, and rounded *up* rather than down so it never
+        // promises to be done sooner than it will be.
+        let left = BoardView::import_left(&arriving(100, 400, Duration::from_millis(4500)));
+        assert_eq!(left, Some(14));
+
+        // Faster than a second per card still says a second, because "~0s
+        // left" reads as finished on a pill that is plainly still going.
+        let left = BoardView::import_left(&arriving(999, 1000, Duration::from_millis(10)));
+        assert_eq!(left, Some(1));
+    }
+
+    #[test]
+    fn a_drop_holds_a_place_for_every_file_it_has_not_read_yet() {
+        // What the drain loop does, at the point the walk has counted three
+        // hundred and twelve have landed.
+        let at = point(0.0, 0.0);
+        let across = import::across(300);
+        let ghosts: Vec<WorldPoint> =
+            (12..300).take(GHOSTS_SHOWN).map(|nth| import::spot(at, across, nth)).collect();
+
+        assert_eq!(ghosts.len(), GHOSTS_SHOWN, "a big drop stops at the ceiling");
+        // And the first held place is exactly where the thirteenth card will
+        // land, which is the whole point of holding it.
+        assert_eq!(ghosts[0], import::spot(at, across, 12));
+    }
+
+    #[test]
+    fn a_small_drop_holds_exactly_what_is_left() {
+        let at = point(40.0, -20.0);
+        let across = import::across(9);
+        let ghosts: Vec<WorldPoint> =
+            (7..9).take(GHOSTS_SHOWN).map(|nth| import::spot(at, across, nth)).collect();
+        assert_eq!(ghosts.len(), 2);
+        assert_eq!(ghosts, vec![import::spot(at, across, 7), import::spot(at, across, 8)]);
+    }
+}
+
+#[cfg(test)]
+mod tag_chip_tests {
+    use super::*;
+
+    /// The gap and the `+n` chip's width, in the units the widths are in.
+    const GAP: f32 = 4.0;
+    const COUNT: f32 = 20.0;
+
+    #[test]
+    fn everything_that_fits_goes_on_one_row() {
+        let (rows, left) = pack_tags(&[30.0, 30.0, 30.0], 200.0, GAP, COUNT);
+        assert_eq!(rows, vec![vec![0, 1, 2]]);
+        assert_eq!(left, 0, "nothing to count");
+    }
+
+    #[test]
+    fn a_row_that_fills_wraps_to_the_second() {
+        // 30 + 4 + 30 = 64 fits in 70; a third would be 98.
+        let (rows, left) = pack_tags(&[30.0, 30.0, 30.0, 30.0], 70.0, GAP, COUNT);
+        assert_eq!(rows, vec![vec![0, 1], vec![2, 3]]);
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn past_two_rows_the_rest_are_counted() {
+        // Two rows of two, and the fifth and sixth become "+2" — except that
+        // making room for the count costs the fourth chip, so it is "+3".
+        let (rows, left) = pack_tags(&[30.0; 6], 70.0, GAP, COUNT);
+        assert_eq!(rows, vec![vec![0, 1], vec![2]]);
+        assert_eq!(left, 3, "the chip dropped to fit the count is in the count");
+    }
+
+    #[test]
+    fn the_count_is_reasked_each_time_a_chip_is_dropped() {
+        // The bug this exists to catch: subtract once and this says "+1"
+        // while showing four of six tags. Two chips have to go to fit the
+        // count here, and both of them are in the number it prints.
+        let (rows, left) = pack_tags(&[30.0, 30.0, 30.0, 30.0, 30.0, 30.0], 104.0, GAP, 40.0);
+        let shown: usize = rows.iter().map(Vec::len).sum();
+        assert_eq!(shown + left, 6, "every tag is either drawn or counted");
+    }
+
+    #[test]
+    fn a_row_is_never_emptied_to_make_room_for_the_count() {
+        // "+7" alone on a card says less than "zellige +6" does, so the last
+        // chip stays even where the pair overflows.
+        let (rows, left) = pack_tags(&[60.0; 8], 62.0, GAP, COUNT);
+        assert_eq!(rows.last().map(Vec::len), Some(1));
+        assert_eq!(left + rows.iter().map(Vec::len).sum::<usize>(), 8);
+    }
+
+    #[test]
+    fn one_tag_wider_than_the_card_is_still_drawn() {
+        // Clipped by the card rather than dropped: a card that silently threw
+        // away the one tag it has would be a card that looks untagged.
+        let (rows, left) = pack_tags(&[400.0], 90.0, GAP, COUNT);
+        assert_eq!(rows, vec![vec![0]]);
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn no_tags_pack_to_no_rows() {
+        let (rows, left) = pack_tags(&[], 200.0, GAP, COUNT);
+        assert!(rows.is_empty());
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn every_tag_is_accounted_for_at_every_width() {
+        // The invariant the whole thing rests on: nothing is drawn twice and
+        // nothing goes missing, whatever the card is doing.
+        let widths = [22.0, 48.0, 31.0, 90.0, 17.0, 64.0, 25.0];
+        for room in [40.0, 60.0, 95.0, 140.0, 220.0, 400.0] {
+            let (rows, left) = pack_tags(&widths, room, GAP, COUNT);
+            let mut seen: Vec<usize> = rows.iter().flatten().copied().collect();
+            let shown = seen.len();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(seen.len(), shown, "a tag drawn twice at room={room}");
+            assert_eq!(shown + left, widths.len(), "a tag lost at room={room}");
+            assert!(rows.len() <= TAG_ROWS, "three rows at room={room}");
+        }
     }
 }

@@ -705,10 +705,195 @@ fn rail(item: &Item, view: &BoardView, cx: &mut Context<BoardView>) -> AnyElemen
             theme,
             mbrd_core::facts::of(item, view.asset_of(item))
                 .into_iter()
+                // Every one but the tags, which are drawn as themselves a
+                // little further down: a tag is a thing you can add and take
+                // away, and a comma-separated line of them says it is not.
+                .filter(|fact| fact.name != "Tags")
                 .map(|fact| told(&fact, theme))
                 .collect(),
         ))
+        .child(section(
+            "On the board",
+            theme,
+            standing(item, view).iter().map(|fact| told(fact, theme)).collect(),
+        ))
+        .children(tags(item, view, cx))
         .into_any_element()
+}
+
+/// What is true of this card *here* rather than of the file behind it.
+///
+/// A separate section from "About", and separate for a reason that is not
+/// tidiness: everything above it is a fact about bytes and would read the same
+/// on any board that held them, and everything here would be different on a
+/// different board. How many cards share this file, how the picture is fitted
+/// into the one you are looking at, what is roped to it. So it cannot live in
+/// [`mbrd_core::facts`], which is given an item and its asset and nothing else.
+///
+/// Empty rows are left out, the same rule the section above follows: a card
+/// with no ropes has no "Ropes" line rather than a line reading "none".
+fn standing(item: &Item, view: &BoardView) -> Vec<Fact> {
+    let board = &view.doc.board;
+    let mut out = Vec::new();
+
+    // How many cards are the same file. Worth saying because it is the one
+    // fact on this page that changes what deleting the card means: a photograph
+    // used twice is still on the board after one of them goes.
+    if let Some(ItemAsset::Embedded { hash, .. }) = item.asset.as_ref() {
+        let uses = board
+            .items
+            .iter()
+            .filter(|other| {
+                matches!(other.asset.as_ref(), Some(ItemAsset::Embedded { hash: h, .. }) if h == hash)
+            })
+            .count();
+        out.push(Fact { name: "Used by", value: plural(uses, "card"), mono: false });
+    }
+
+    // Only where there is a picture to fit. The card's own choice where it has
+    // made one, and the board's where it has not — which is the same order
+    // `draw_list` reads them in, so the rail cannot say "Contain" about a card
+    // being drawn cropped.
+    if matches!(item.kind, ItemType::Image | ItemType::Video) {
+        let fit = item
+            .meta
+            .get("fit")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(&board.media_fit)
+            .to_string();
+        let mut said = fit.chars();
+        let said = match said.next() {
+            Some(first) => first.to_uppercase().collect::<String>() + said.as_str(),
+            None => fit,
+        };
+        out.push(Fact { name: "Fit", value: said, mono: false });
+    }
+
+    if let Some(said) = rope_tally(&board.connections, &item.id) {
+        out.push(Fact { name: "Ropes", value: said, mono: false });
+    }
+
+    out
+}
+
+/// The ropes touching one card, counted the way somebody looking at it counts.
+///
+/// By direction, because "2 ropes" and "1 in, 1 out" answer different questions
+/// and the second is the one somebody looking at a card in the middle of a
+/// diagram is asking. Direction is read *from this card's end*: the same rope
+/// is an "out" on one of the two cards it joins and an "in" on the other, which
+/// is the whole reason the arrow is drawn. A rope with no arrow is neither, and
+/// is counted as itself rather than guessed at.
+///
+/// `None` where there are none, so the caller leaves the row out entirely
+/// instead of printing "Ropes — none", which is a line that says nothing and
+/// takes a line to say it.
+fn rope_tally(wires: &[mbrd_core::model::Connection], id: &str) -> Option<String> {
+    use mbrd_core::model::ConnDir;
+    let (mut incoming, mut outgoing, mut plain) = (0usize, 0usize, 0usize);
+    for wire in wires {
+        // A rope from a card to itself would otherwise be read as leaving only.
+        // It counts once at each end, which is what it is.
+        for first in [true, false] {
+            if (if first { &wire.a } else { &wire.b }) != id {
+                continue;
+            }
+            match (wire.meta.dir, first) {
+                (ConnDir::Fwd, true) | (ConnDir::Back, false) => outgoing += 1,
+                (ConnDir::Fwd, false) | (ConnDir::Back, true) => incoming += 1,
+                (ConnDir::Both, _) => {
+                    incoming += 1;
+                    outgoing += 1;
+                }
+                (ConnDir::None, _) => plain += 1,
+            }
+        }
+    }
+    let mut said: Vec<String> = Vec::new();
+    if incoming > 0 {
+        said.push(format!("{incoming} in"));
+    }
+    if outgoing > 0 {
+        said.push(format!("{outgoing} out"));
+    }
+    if plain > 0 {
+        said.push(plural(plain, "rope"));
+    }
+    match said.is_empty() {
+        true => None,
+        false => Some(said.join(", ")),
+    }
+}
+
+/// The card's tags, as tags, with somewhere to add one.
+///
+/// Nothing at all for a card that cannot carry them — see
+/// [`mbrd_core::tags::taggable`] — because an "add a tag" button on a card that
+/// will not take one is the exact failure that made fences look broken.
+fn tags(item: &Item, view: &BoardView, cx: &mut Context<BoardView>) -> Option<AnyElement> {
+    if !mbrd_core::tags::taggable(item) {
+        return None;
+    }
+    let theme = view.theme;
+    let worn = mbrd_core::tags::of(item);
+    let id = item.id.clone();
+
+    let chip = |text: SharedString, dashed: bool| {
+        div()
+            .px(px(8.0))
+            .py(px(2.0))
+            .rounded(px(crate::theme::RADIUS_XS))
+            .text_size(px(11.0))
+            .border_1()
+            .border_color(theme.chrome_edge)
+            .when(!dashed, |d| d.bg(theme.chrome).text_color(theme.text))
+            .when(dashed, |d| d.border_dashed().text_color(theme.tertiary))
+            .child(text)
+    };
+
+    Some(
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.tertiary)
+                    .child("Tags"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(5.0))
+                    .children(worn.into_iter().map(|tag| chip(tag.into(), false)))
+                    .child(
+                        div()
+                            .id("opened-add-tag")
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(theme.text))
+                            // Selects the card first. The tag list works on the
+                            // selection — see `BoardView::tag_selection` — and
+                            // the card you have open is not necessarily the
+                            // card that was selected when you opened it.
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.open_tag_list_for(&id, cx);
+                            }))
+                            .child(chip("+ tag".into(), true)),
+                    ),
+            )
+            .into_any_element(),
+    )
+}
+
+/// "3 cards", and "1 card" rather than "1 cards".
+fn plural(n: usize, word: &str) -> String {
+    match n {
+        1 => format!("1 {word}"),
+        n => format!("{n} {word}s"),
+    }
 }
 
 fn section(name: &'static str, theme: Theme, rows: Vec<AnyElement>) -> AnyElement {
@@ -1890,6 +2075,66 @@ fn nothing_said(said: &'static str, theme: Theme) -> AnyElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The direction is read from *this card's* end, which is the whole point
+    /// of the row: the same rope has to say "out" on one card and "in" on the
+    /// other, or the arrow drawn between them is decoration.
+    #[test]
+    fn a_rope_is_an_out_at_one_end_and_an_in_at_the_other() {
+        use mbrd_core::model::{ConnDir, ConnMeta, Connection};
+        let wire = |a: &str, b: &str, dir| Connection {
+            a: a.into(),
+            b: b.into(),
+            meta: ConnMeta { dir, ..ConnMeta::default() },
+        };
+        let wires = [wire("one", "two", ConnDir::Fwd)];
+        assert_eq!(rope_tally(&wires, "one").as_deref(), Some("1 out"));
+        assert_eq!(rope_tally(&wires, "two").as_deref(), Some("1 in"));
+        // And a rope pointing the other way says the opposite at each end.
+        let back = [wire("one", "two", ConnDir::Back)];
+        assert_eq!(rope_tally(&back, "one").as_deref(), Some("1 in"));
+        assert_eq!(rope_tally(&back, "two").as_deref(), Some("1 out"));
+    }
+
+    /// A rope with no arrow is not a direction anybody chose, so it is counted
+    /// as itself rather than folded into one of the two that were.
+    #[test]
+    fn a_rope_with_no_arrow_is_counted_as_a_rope() {
+        use mbrd_core::model::{ConnDir, ConnMeta, Connection};
+        let wire = |dir| Connection {
+            a: "one".into(),
+            b: "two".into(),
+            meta: ConnMeta { dir, ..ConnMeta::default() },
+        };
+        assert_eq!(rope_tally(&[wire(ConnDir::None)], "one").as_deref(), Some("1 rope"));
+        assert_eq!(
+            rope_tally(&[wire(ConnDir::None), wire(ConnDir::None)], "one").as_deref(),
+            Some("2 ropes")
+        );
+        // Both ways at once is both, which is what the two arrowheads say.
+        assert_eq!(rope_tally(&[wire(ConnDir::Both)], "one").as_deref(), Some("1 in, 1 out"));
+    }
+
+    /// Nothing rather than a row saying nothing. Every other line on the rail
+    /// follows the same rule — see [`standing`].
+    #[test]
+    fn a_card_with_no_ropes_gets_no_rope_row() {
+        use mbrd_core::model::{ConnDir, ConnMeta, Connection};
+        let wires = [Connection {
+            a: "two".into(),
+            b: "three".into(),
+            meta: ConnMeta { dir: ConnDir::Fwd, ..ConnMeta::default() },
+        }];
+        assert_eq!(rope_tally(&wires, "one"), None);
+        assert_eq!(rope_tally(&[], "one"), None);
+    }
+
+    #[test]
+    fn one_of_a_thing_is_not_one_things() {
+        assert_eq!(plural(1, "card"), "1 card");
+        assert_eq!(plural(2, "card"), "2 cards");
+        assert_eq!(plural(0, "rope"), "0 ropes");
+    }
 
     #[test]
     fn a_note_with_no_name_is_titled_by_its_first_words() {

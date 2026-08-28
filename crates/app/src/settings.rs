@@ -130,6 +130,24 @@ impl Section {
         }
     }
 
+    /// The picture on the section's row in the sidebar.
+    ///
+    /// So a section is found by shape rather than by reading six words every
+    /// time. Never the only thing naming a row — the word is right beside it —
+    /// which is what makes it safe for two of these to be marks that already
+    /// mean something elsewhere in the app: a board's worth of cards *is* what
+    /// Arranging is about, and a thing coming down *is* what Updates does.
+    pub fn mark(self) -> Icon {
+        match self {
+            Self::Canvas => Icon::SectionCanvas,
+            Self::Arranging => Icon::Board,
+            Self::Media => Icon::SectionMedia,
+            Self::General => Icon::SectionGeneral,
+            Self::Appearance => Icon::SectionAppearance,
+            Self::Updates => Icon::Drop,
+        }
+    }
+
     /// The sentence under the section's title, which is where the
     /// board/person split gets said in words.
     fn blurb(self) -> &'static str {
@@ -187,7 +205,7 @@ impl Picker {
     /// "where am I" the first question every time, and — because arrowing
     /// previews — would leave somebody who opened it to look at their options
     /// one keystroke away from having silently changed nothing back.
-    fn open(appearance: Appearance, was: impl Into<String>, names: &[String]) -> Self {
+    pub(crate) fn open(appearance: Appearance, was: impl Into<String>, names: &[String]) -> Self {
         let was = was.into();
         let cursor = names.iter().position(|name| *name == was).unwrap_or(0);
         Self { appearance, query: Editor::new("", 64, false), cursor, was }
@@ -199,7 +217,7 @@ impl Picker {
     /// this does not — and because a name is what ends up written down. With
     /// an empty query the order is the registry's, which puts the built-in
     /// first.
-    fn matches(&self, names: &[String]) -> Vec<String> {
+    pub(crate) fn matches(&self, names: &[String]) -> Vec<String> {
         let query = self.query.text().to_lowercase();
         if query.is_empty() {
             return names.to_vec();
@@ -217,7 +235,7 @@ impl Picker {
         scored.into_iter().map(|(_, name)| name.clone()).collect()
     }
 
-    fn step(&mut self, by: isize, len: usize) {
+    pub(crate) fn step(&mut self, by: isize, len: usize) {
         if len == 0 {
             self.cursor = 0;
             return;
@@ -314,6 +332,15 @@ pub enum Reply {
     /// the Appearance page is for.
     /// Ctrl V, which needs the clipboard, which is the view's.
     Paste,
+    /// The welcome screen's folder field took the key and its text may now be
+    /// different. The view writes it through to the prefs — see
+    /// `BoardView::commit_welcome_folder`.
+    ///
+    /// A reply of its own rather than `Held`, because a field that only saved
+    /// when somebody happened to press Next would be a field that loses what
+    /// was typed into it by the one gesture this screen promises is safe:
+    /// pressing Escape.
+    Folder,
 }
 
 impl Page {
@@ -367,17 +394,44 @@ impl Page {
         text: Option<&str>,
         names: &[String],
     ) -> Reply {
-        let Some(picker) = &mut self.picking else { return Reply::Held };
+        picker_key(&mut self.picking, key, mods, text, names)
+    }
+
+    /// Paste into whichever field is currently taking keys.
+    pub fn insert(&mut self, text: &str) {
+        match &mut self.picking {
+            Some(picker) => picker.query.insert(text),
+            None => self.query.insert(text),
+        }
+    }
+}
+
+/// One key press, while a theme picker is open.
+///
+/// A free function over `&mut Option<Picker>` rather than a method, because
+/// the welcome screen has a picker too and it is the *same* picker — see
+/// `welcome.rs`. Two copies of this would be two places for the rule that
+/// arrowing previews and Escape puts back to drift apart, on the one surface
+/// where drifting means the app is left wearing a theme nobody agreed to.
+pub(crate) fn picker_key(
+    picking: &mut Option<Picker>,
+    key: &str,
+    mods: Modifiers,
+    text: Option<&str>,
+    names: &[String],
+) -> Reply {
+    {
+        let Some(picker) = picking.as_mut() else { return Reply::Held };
         match key {
             "escape" => {
                 let (appearance, was) = (picker.appearance, picker.was.clone());
-                self.picking = None;
+                *picking = None;
                 return Reply::Cancel(appearance, was);
             }
             "enter" => {
                 let chosen = picker.matches(names).get(picker.cursor).cloned();
                 let (appearance, was) = (picker.appearance, picker.was.clone());
-                self.picking = None;
+                *picking = None;
                 // Enter on a list with nothing in it is not a choice. It puts
                 // back what was there, which is the same thing Escape does —
                 // there is no third answer to "keep the theme you cannot see".
@@ -416,14 +470,6 @@ impl Page {
             None => Reply::Held,
         }
     }
-
-    /// Paste into whichever field is currently taking keys.
-    pub fn insert(&mut self, text: &str) {
-        match &mut self.picking {
-            Some(picker) => picker.query.insert(text),
-            None => self.query.insert(text),
-        }
-    }
 }
 
 /// The steps the grid can be set to.
@@ -432,7 +478,7 @@ impl Page {
 /// pitch and not a measurement: any value *works*, but the ones anybody
 /// chooses on purpose are the halvings and doublings around the default. A
 /// board whose file carries some other number simply shows no choice lit.
-const GRID_STEPS: [f32; 5] = [32.0, 48.0, 64.0, 96.0, 128.0];
+pub(crate) const GRID_STEPS: [f32; 5] = [32.0, 48.0, 64.0, 96.0, 128.0];
 
 /// The gaps the arrangement engine can be told to leave between cards.
 const GAPS: [f32; 7] = [0.0, 4.0, 8.0, 12.0, 16.0, 24.0, 32.0];
@@ -860,6 +906,9 @@ fn group_block(
                     .py(px(4.0))
                     .mb(px(1.0))
                     .rounded(px(crate::theme::RADIUS_SM))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
                     .text_size(px(12.0))
                     .when(active, |d| {
                         d.bg(theme.accent.opacity(0.12))
@@ -873,6 +922,15 @@ fn group_block(
                             this.show_settings_section(section, cx);
                         }),
                     )
+                    // The mark lights with the row rather than staying one
+                    // colour, so the whole row is one thing that is either
+                    // where you are or not — an icon that held its own tint
+                    // through the change would read as a second control.
+                    .child(icon(
+                        section.mark(),
+                        crate::icons::ICON_MD,
+                        if active { theme.accent_text } else { theme.tertiary },
+                    ))
                     .child(section.label())
                     .into_any_element()
             }))
@@ -1054,14 +1112,89 @@ fn general_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
     // same warning `toggle_pref` says after the fact, said before it instead.
     let motion_note = crate::prefs::Prefs::forced(crate::prefs::Setting::Motion)
         .map(|var| format!("Set by {var}, which wins at startup."));
-    vec![toggle(
-        Section::General,
-        Command::ToggleMotion,
-        "Let the interface move. Turn off to land every change instantly.",
-        motion_note,
-        view,
-        cx,
-    )]
+    let theme = view.theme;
+
+    // Where boards go, and what a new one is born with.
+    //
+    // These are here because the welcome screen says, in so many words, that
+    // everything it asks can be changed later in Settings — and a sentence
+    // like that is either true or it is the app lying to somebody on their
+    // first day. So the three answers that screen collects and this page did
+    // not previously own all live here now, in the section that already means
+    // "about this computer, not the board".
+    //
+    // The two new-board rows say *new* in their descriptions rather than
+    // relying on being in an Application section. See `prefs::NewBoard`: the
+    // settings they seed are Board settings, and the Canvas section three rows
+    // up is where the board that is actually open changes its mind. Nothing
+    // here touches that board.
+    let steps: Vec<String> = GRID_STEPS.iter().map(|s| format!("{}", *s as i32)).collect();
+    let chosen = GRID_STEPS.iter().position(|s| (*s - view.prefs.new_board.grid_step).abs() < 0.5);
+    let boards_note = match (view.prefs.boards_dir.as_deref(), crate::dirs::boards()) {
+        (Some(chosen), _) => format!("New boards go in {}.", chosen.display()),
+        (None, Some(fallback)) => {
+            format!("New boards go in {} — this computer's usual place.", fallback.display())
+        }
+        (None, None) => "This computer has no home directory to keep boards in.".to_string(),
+    };
+
+    vec![
+        toggle(
+            Section::General,
+            Command::ToggleMotion,
+            "Let the interface move. Turn off to land every change instantly.",
+            motion_note,
+            view,
+            cx,
+        ),
+        spec(
+            Section::General,
+            "Boards folder",
+            format!("{boards_note} Boards you already have stay where they are."),
+            button("settings-boards-folder", "Browse…", true, theme, cx, |this, cx| {
+                this.browse_for_boards(cx);
+            }),
+        ),
+        spec(
+            Section::General,
+            "Snap new boards to the grid",
+            "What a board this app makes starts with. It does not change the board you have open.",
+            switch_at(
+                "settings-new-snap",
+                view.prefs.new_board.snap,
+                view,
+                cx,
+                |this, _window, cx| this.set_new_board_snap(!this.prefs.new_board.snap, cx),
+            ),
+        ),
+        spec(
+            Section::General,
+            "Grid step for new boards",
+            "The lattice a board this app makes starts on. It does not change the board you have \
+             open.",
+            segmented(
+                "settings-new-step",
+                &steps,
+                chosen,
+                |this, at, cx| this.set_new_board_step(GRID_STEPS[at], cx),
+                view,
+                cx,
+            ),
+        ),
+        // The way back to the four questions. It is the only route to the
+        // demonstration board and the tour standing side by side, and without
+        // it the first-run screen is a thing that happened once and cannot be
+        // consulted again.
+        spec(
+            Section::General,
+            Command::Welcome.label(),
+            "The four questions this app asked the first time it opened, and the ways in it \
+             offered.",
+            button("settings-welcome", "Run setup again", true, theme, cx, |this, cx| {
+                this.open_welcome(cx);
+            }),
+        ),
+    ]
 }
 
 fn update_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
@@ -1135,11 +1268,17 @@ fn appearance_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
                     .into()
             }
         };
+        let id = match appearance {
+            Appearance::Dark => "settings-theme-dark",
+            Appearance::Light => "settings-theme-light",
+        };
         all.push(spec(
             Section::Appearance,
             format!("{} theme", appearance.label()),
             about,
-            dropdown(appearance, &name, known, live, theme, cx),
+            dropdown(id, appearance, &name, known, live, theme, cx, |this, appearance, cx| {
+                this.pick_theme(appearance, cx)
+            }),
         ));
     }
 
@@ -1170,18 +1309,20 @@ fn appearance_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
 /// Wears the two carets a dropdown wears, because from where somebody is
 /// sitting that is what it is — what it *opens* is a searchable panel rather
 /// than a popup, for the reasons [`Picker`] gives.
-fn dropdown(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one control, and every one of these is a fact about the row it sits in"
+)]
+pub(crate) fn dropdown(
+    id: &'static str,
     appearance: Appearance,
     name: &str,
     known: bool,
     live: bool,
     theme: Theme,
     cx: &mut Context<BoardView>,
+    open: fn(&mut BoardView, Appearance, &mut Context<BoardView>),
 ) -> AnyElement {
-    let id = match appearance {
-        Appearance::Dark => "settings-theme-dark",
-        Appearance::Light => "settings-theme-light",
-    };
     div()
         .id(id)
         .flex()
@@ -1205,7 +1346,7 @@ fn dropdown(
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _event, _window, cx| {
-                this.pick_theme(appearance, cx);
+                open(this, appearance, cx);
             }),
         )
         .child(
@@ -1220,7 +1361,11 @@ fn dropdown(
 }
 
 /// The list itself: a panel over the page, searchable, previewing live.
-fn picker_panel(picker: &Picker, view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
+pub(crate) fn picker_panel(
+    picker: &Picker,
+    view: &BoardView,
+    cx: &mut Context<BoardView>,
+) -> AnyElement {
     let theme = view.theme;
     let offered = view.themes.of(picker.appearance);
     let names: Vec<String> = offered.iter().map(|t| t.name.clone()).collect();
@@ -1401,8 +1546,34 @@ const SWITCH_TRAVEL: f32 = SWITCH_W - 2.0 * SWITCH_PAD - SWITCH_KNOB;
 /// rather than switching at the end, and a second press mid-flight bends
 /// the knob back out of its own motion instead of teleporting it.
 fn switch(command: Command, on: bool, view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
+    switch_at(command.label(), on, view, cx, move |this, window, cx| {
+        command.run(this, window, cx);
+        // Aimed at where the state *now* is, read back off the same table the
+        // tick reads, so a run that did nothing moves nothing.
+        command.ticked(this) == Some(true)
+    })
+}
+
+/// The same switch, for a state that is not a [`Command`].
+///
+/// Everything on the settings page is a command and can use [`switch`]. The
+/// welcome screen's "Defaults for new boards" rows are not — they set what a
+/// board is *born* with, which is a preference rather than something the
+/// menus or the palette could ever run. Rather than let that grow a second
+/// switch that looks the same and animates differently, the drawing lives
+/// here once and the two callers differ only in what a press does.
+///
+/// `press` performs the change and answers where the state ended up, which is
+/// what the knob is then aimed at. Answering rather than assuming is what
+/// makes a press that was refused move nothing.
+pub(crate) fn switch_at(
+    id: &'static str,
+    on: bool,
+    view: &BoardView,
+    cx: &mut Context<BoardView>,
+    press: impl Fn(&mut BoardView, &mut gpui::Window, &mut Context<BoardView>) -> bool + 'static,
+) -> AnyElement {
     let theme = view.theme;
-    let id = command.label();
     let p = view.control_at(id, if on { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
     div()
         .id(SharedString::from(id))
@@ -1415,11 +1586,7 @@ fn switch(command: Command, on: bool, view: &BoardView, cx: &mut Context<BoardVi
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _event, window, cx| {
-                command.run(this, window, cx);
-                // Aimed at where the state *now* is, read back off the same
-                // table the tick reads, so a run that did nothing moves
-                // nothing.
-                let now = command.ticked(this) == Some(true);
+                let now = press(this, window, cx);
                 this.move_control(id, if now { 0.0 } else { 1.0 }, if now { 1.0 } else { 0.0 });
                 cx.notify();
             }),
@@ -1470,7 +1637,7 @@ fn pick_mode(view: &mut BoardView, at: usize, cx: &mut Context<BoardView>) {
 /// segment captures it and a listener must be `'static` — a pointer is
 /// `Copy` and carries nothing, which is exactly the amount of state picking
 /// from a fixed list needs.
-fn segmented(
+pub(crate) fn segmented(
     name: &'static str,
     labels: &[String],
     chosen: Option<usize>,
@@ -1529,7 +1696,7 @@ fn segmented(
 }
 
 /// A control that is a verb rather than a state.
-fn button(
+pub(crate) fn button(
     id: &'static str,
     word: impl Into<SharedString>,
     live: bool,
@@ -1569,7 +1736,9 @@ fn update_row(view: &BoardView, cx: &mut Context<BoardView>) -> Spec {
     let theme = view.theme;
     let live = Command::CheckForUpdates.available(view);
     let word = match view.update_badge() {
-        None => "Check now",
+        // Nothing waiting, or a build with no updater in it at all. Either way
+        // the only thing a press can do is ask.
+        None | Some(UpdateBadge::Resting { .. }) => "Check now",
         Some(UpdateBadge::Available { .. }) => "Download",
         Some(UpdateBadge::Downloading { .. }) => "Downloading…",
         Some(UpdateBadge::Ready { .. }) => "Restart to update",

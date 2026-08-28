@@ -19,6 +19,9 @@ jobs:
       - uses: actions/checkout@v7
 
       # Same list as the release build. See the comment there, and the README.
+      # The two GStreamer `-dev` packages are what `pipeline.rs` links against,
+      # and they are installed on Linux alone because that module is compiled
+      # on Linux alone — see crates/app/Cargo.toml.
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
@@ -28,6 +31,8 @@ jobs:
             libfontconfig-dev \
             libfreetype6-dev \
             libxcb1-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
             pkg-config
 
       - uses: dtolnay/rust-toolchain@stable
@@ -85,6 +90,8 @@ jobs:
             libfontconfig-dev \
             libfreetype6-dev \
             libxcb1-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
             pkg-config
 
       - uses: dtolnay/rust-toolchain@stable

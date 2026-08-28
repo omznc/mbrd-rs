@@ -63,6 +63,16 @@ pub struct Switcher {
     /// original are the same scroll.
     pub scroll: ScrollHandle,
     boards: Vec<PathBuf>,
+    /// How many of [`Self::boards`] came out of `recent.json`.
+    ///
+    /// Everything from this index on was *found* rather than remembered — see
+    /// [`beside_boards`] — and the list says so, because the two are different
+    /// claims. A remembered board is one somebody has had open. A found one is
+    /// a file that happens to be in the same folder, which might be a
+    /// colleague's, a backup, or something they have never opened in their
+    /// life. Presenting the second as though it were the first is how a list
+    /// of "your boards" quietly stops being one.
+    recent: usize,
     /// The board a delete has been asked for and not yet confirmed.
     ///
     /// Deleting is the one thing this list does that cannot be undone by doing
@@ -98,15 +108,29 @@ impl Switcher {
     /// [`beside_boards`] there and hands the answer to [`Switcher::extend_boards`]
     /// once it is ready.
     pub fn open(current: Option<&Path>) -> Self {
+        let boards = crate::recent::load();
         Self {
             query: Editor::new("", crate::palette::QUERY_MAX, false),
             cursor: 0,
             scroll: ScrollHandle::new(),
-            boards: crate::recent::load(),
+            // Everything here so far is remembered. Anything the scan adds
+            // lands past this mark. See [`Self::recent`].
+            recent: boards.len(),
+            boards,
             confirming: None,
             refused: None,
             open: current.map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf())),
         }
+    }
+
+    /// Whether this row is a board that was found rather than remembered.
+    ///
+    /// A search over the list rather than a flag on each entry, because the
+    /// list is capped at [`SHOWN`] and this is asked once per drawn row: a
+    /// parallel structure to keep in step would cost more to be right than
+    /// the scan costs to run.
+    pub fn found_beside(&self, board: &Path) -> bool {
+        self.boards.iter().position(|p| p == board).is_some_and(|at| at >= self.recent)
     }
 
     /// Add the boards found beside the one that is open, once the background
@@ -164,6 +188,12 @@ impl Switcher {
     /// nothing else is going to notice that a file has gone. Without this the
     /// row stays, and pressing it opens a board that is not there.
     pub fn dropped(&mut self, board: &Path) {
+        // Before the retain, or the mark that separates remembered from found
+        // slides by one every time a remembered board is forgotten — and the
+        // section header would start appearing over rows that belong above it.
+        if self.boards.iter().position(|p| p == board).is_some_and(|at| at < self.recent) {
+            self.recent -= 1;
+        }
         self.boards.retain(|p| p != board);
         self.confirming = None;
         self.refused = None;
@@ -175,16 +205,23 @@ impl Switcher {
         if self.query.text().is_empty() {
             return self.boards.iter().take(SHOWN).map(PathBuf::as_path).collect();
         }
-        let mut scored: Vec<(i32, usize, &Path)> = self
+        let recent = self.recent;
+        let mut scored: Vec<(bool, i32, usize, &Path)> = self
             .boards
             .iter()
             .enumerate()
-            .filter_map(|(i, p)| score(self.query.text(), p).map(|s| (s, i, p.as_path())))
+            .filter_map(|(i, p)| {
+                score(self.query.text(), p).map(|s| (i >= recent, s, i, p.as_path()))
+            })
             .collect();
-        // Best score first, and where two score the same the more recent one —
-        // which is the order `boards` is already in.
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        scored.into_iter().take(SHOWN).map(|(_, _, p)| p).collect()
+        // Remembered before found, whatever either scores. The grouping is
+        // load-bearing rather than cosmetic: the list draws a heading over the
+        // found ones saying what they are, and a heading is a lie if a row
+        // above it belongs below. Within a group, best score first, and where
+        // two score the same the more recent one — which is the order `boards`
+        // is already in.
+        scored.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+        scored.into_iter().take(SHOWN).map(|(_, _, _, p)| p).collect()
     }
 
     /// What Enter would open.
@@ -307,15 +344,23 @@ fn boards_contains(boards: &[PathBuf], path: &Path) -> bool {
     boards.iter().any(|p| p == path)
 }
 
-/// Every `.mbrd` beside the board that is open, and beside wherever the app
-/// was started from, deduplicated and canonicalised.
+/// Every `.mbrd` in the boards folder, beside the board that is open, and
+/// beside wherever the app was started from, deduplicated and canonicalised.
 ///
 /// Pure disk IO and no `Switcher` in sight, which is what lets
 /// `BoardView::open_switcher` hand this to the background executor rather
 /// than running it on the thread that draws — the whole point of splitting
 /// it out of what [`Switcher::open`] used to do inline. See
 /// [`Switcher::extend_boards`], where the answer lands.
-pub fn beside_boards(current: Option<&Path>) -> Vec<PathBuf> {
+///
+/// **The boards folder is looked in first**, and that is the promise the
+/// welcome screen makes in so many words when it asks where boards should
+/// live: a folder somebody nominated as the place their work goes is not
+/// worth less than whichever directory a launcher happened to start the app
+/// in. `boards` is passed in rather than read off the prefs here, for the
+/// reason the rest of this module is a plain struct — it runs on the
+/// background executor and has no view to ask.
+pub fn beside_boards(current: Option<&Path>, boards: Option<&Path>) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut add = |extra: Vec<PathBuf>| {
         for path in extra {
@@ -325,6 +370,9 @@ pub fn beside_boards(current: Option<&Path>) -> Vec<PathBuf> {
             }
         }
     };
+    if let Some(dir) = boards {
+        add(crate::recent::beside(dir));
+    }
     if let Some(dir) = current.and_then(Path::parent) {
         add(crate::recent::beside(dir));
     }
@@ -361,10 +409,17 @@ pub fn render(
     let presence = view.overlay_presence.value();
     let matches = switcher.matches();
 
-    let rows: Vec<_> = matches
-        .iter()
-        .enumerate()
-        .map(|(i, path)| {
+    // Whether the heading over the found boards has been placed yet. The
+    // matches are grouped — see `Switcher::matches` — so the first found board
+    // is where the section starts, and there is exactly one of them.
+    let mut headed = false;
+    let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(matches.len() + 1);
+    for (i, path) in matches.iter().enumerate() {
+        if !headed && switcher.found_beside(path) {
+            headed = true;
+            rows.push(beside_heading(theme));
+        }
+        rows.push({
             let highlighted = i == switcher.cursor;
             let name =
                 path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -426,11 +481,11 @@ pub fn render(
                                 .child(name),
                         ),
                 )
-                .child(match (refused, doomed) {
+                .child(match refused {
                     // The reason a delete failed, in the row it was asked
                     // for — see `Switcher::refuse` for why here rather than
                     // the status bar.
-                    (Some(reason), _) => div()
+                    Some(reason) => div()
                         .flex_none()
                         .max_w(px(240.0))
                         .text_size(px(11.0))
@@ -438,8 +493,7 @@ pub fn render(
                         .truncate()
                         .child(reason.to_string())
                         .into_any_element(),
-                    (None, true) => confirm(cx, theme, i),
-                    (None, false) => div()
+                    None => div()
                         .flex()
                         .flex_none()
                         .items_center()
@@ -451,14 +505,19 @@ pub fn render(
                                 .overflow_hidden()
                                 .child(where_),
                         )
-                        .when(switcher.deletable(path), |d| {
+                        // No cross while this row is the one being asked
+                        // about: the question is at the foot of the panel and
+                        // it has its own two buttons, and a third way to
+                        // answer it sitting in the row would be a control
+                        // whose meaning changed under the pointer.
+                        .when(switcher.deletable(path) && !doomed, |d| {
                             d.child(delete_button(cx, theme, path, i))
                         })
                         .into_any_element(),
                 })
                 .into_any_element()
-        })
-        .collect();
+        });
+    }
 
     // Keep the highlight on screen. The arrows can walk past the bottom of a
     // list this tall, and a selection you cannot see is a selection you have to
@@ -594,20 +653,49 @@ pub fn render(
                         })
                         .children(rows),
                 )
+                // The question, where there is one, in place of the keys —
+                // not under them. While it is up it is the only thing on this
+                // panel worth reading, and two strips of small print at the
+                // foot of a list is how a question gets missed.
+                .children(switcher.doomed().map(|board| confirm(cx, theme, &board)))
                 // Names the keys that leave this mode, the same rule
                 // `board_view.rs` applies everywhere else a mode is entered:
                 // every mode names the key that gets out of it.
-                .child(
-                    div()
-                        .px(px(14.0))
-                        .py(px(7.0))
-                        .border_t_1()
-                        .border_color(theme.chrome_edge)
-                        .text_size(px(10.0))
-                        .text_color(theme.muted)
-                        .child("\u{2191}\u{2193} move · enter open · del remove · esc close"),
-                ),
+                .when(switcher.doomed().is_none(), |d| {
+                    d.child(
+                        div()
+                            .px(px(14.0))
+                            .py(px(7.0))
+                            .border_t_1()
+                            .border_color(theme.chrome_edge)
+                            .text_size(px(10.0))
+                            .text_color(theme.muted)
+                            .child("\u{2191}\u{2193} move · enter open · del remove · esc close"),
+                    )
+                }),
         )
+}
+
+/// The line over the boards that were found rather than remembered.
+///
+/// It says what they *are* rather than titling them: "sitting next to this
+/// one" is the whole difference between these rows and the ones above, and a
+/// heading reading "Nearby" would leave somebody to work that out.
+fn beside_heading(theme: crate::theme::Theme) -> gpui::AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .child(div().h(px(1.0)).mx(px(12.0)).my(px(5.0)).bg(theme.chrome_edge))
+        .child(
+            div()
+                .px(px(18.0))
+                .pb(px(4.0))
+                .font(crate::opened::mono())
+                .text_size(px(9.5))
+                .text_color(theme.tertiary)
+                .child("SITTING NEXT TO THIS ONE"),
+        )
+        .into_any_element()
 }
 
 /// The cross that asks whether a board should go.
@@ -673,58 +761,97 @@ fn delete_button(
 /// hover wash, [`crate::theme::Theme::text`] at 8% — because it is the answer
 /// that changes nothing, and a safe answer dressed up to compete with the
 /// dangerous one is not actually safer to press.
-fn confirm(cx: &mut Context<BoardView>, theme: crate::theme::Theme, row: usize) -> AnyElement {
+/// The question a delete asks before it happens.
+///
+/// **The one thing in this app that undo cannot bring back**, and the strip
+/// says so in those words. Everywhere else the answer to "are you sure" is to
+/// let somebody find out and press Ctrl Z; here there is no Ctrl Z, so the
+/// question gets asked and the reason it is being asked gets said with it.
+///
+/// At the foot of the panel rather than in the row it is about — where it used
+/// to be — for two reasons. There is room to *name the board*, which is the
+/// fact somebody is actually checking, and a list of forty rows arrowed
+/// through at speed should not have one row that is a different height and
+/// holds two buttons.
+///
+/// Both answers are buttons and only the destructive one fills, in the colour
+/// the app uses for damage. Keep is also what Escape does and what every arrow
+/// key does — see `Switcher::key` — so the safe answer has four ways to give it
+/// and the other has two.
+fn confirm(cx: &mut Context<BoardView>, theme: crate::theme::Theme, board: &Path) -> AnyElement {
+    let name = board.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     div()
         .flex()
-        .flex_none()
         .items_center()
-        .gap(px(6.0))
-        .child(div().text_size(px(11.0)).text_color(theme.muted).child("delete it?"))
+        .gap(px(9.0))
+        .px(px(15.0))
+        .py(px(11.0))
+        .border_t_1()
+        .border_color(theme.chrome_edge)
+        .bg(theme.rope_danger.opacity(0.10))
+        .child(icon(Icon::Warned, crate::icons::ICON_MD, theme.rope_danger))
         .child(
             div()
-                .id(("delete-yes", row))
+                .flex_1()
+                .min_w_0()
                 .flex()
-                .flex_none()
-                .items_center()
-                .px(px(8.0))
-                .py(px(3.0))
-                .rounded(px(crate::theme::RADIUS_XS))
+                .items_baseline()
+                .gap(px(4.0))
                 .text_size(px(12.0))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.ground)
-                .bg(theme.accent)
-                .hover(|s| s.bg(theme.accent.opacity(0.85)))
-                .active(|s| s.bg(theme.accent.opacity(0.7)))
-                .child("delete")
+                .text_color(theme.text)
+                .child("Delete")
+                // The name carries the weight, because it is the one word in
+                // the sentence somebody has to check before answering.
+                .child(div().min_w_0().truncate().font_weight(FontWeight::SEMIBOLD).child(name))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(theme.muted)
+                        .child("\u{2014} this is the one thing undo can't bring back."),
+                ),
+        )
+        .child(
+            div()
+                .id("delete-no")
+                .flex_none()
+                .px(px(10.0))
+                .py(px(4.0))
+                .rounded(px(crate::theme::RADIUS_XS))
+                .border_1()
+                .border_color(theme.chrome_edge)
+                .text_size(px(11.5))
+                .text_color(theme.text)
+                .hover(|s| s.bg(theme.text.opacity(0.08)))
+                .active(|s| s.bg(theme.text.opacity(0.14)))
+                .child("Keep")
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _event, _window, cx| {
+                    cx.listener(|this, _event, _window, cx| {
                         cx.stop_propagation();
-                        this.delete_doomed_board(cx);
+                        this.ask_about_board(None);
                         cx.notify();
                     }),
                 ),
         )
         .child(
             div()
-                .id(("delete-no", row))
-                .flex()
+                .id("delete-yes")
                 .flex_none()
-                .items_center()
-                .px(px(8.0))
-                .py(px(3.0))
+                .px(px(10.0))
+                .py(px(4.0))
                 .rounded(px(crate::theme::RADIUS_XS))
-                .text_size(px(12.0))
-                .text_color(theme.text)
-                .bg(theme.text.opacity(0.08))
-                .hover(|s| s.bg(theme.text.opacity(0.14)))
-                .active(|s| s.bg(theme.text.opacity(0.2)))
-                .child("keep")
+                .text_size(px(11.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme.ground)
+                .bg(theme.rope_danger)
+                .hover(|s| s.bg(theme.rope_danger.opacity(0.85)))
+                .active(|s| s.bg(theme.rope_danger.opacity(0.7)))
+                .child("Delete")
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, _event, _window, cx| {
+                    cx.listener(move |this, _event, _window, cx| {
                         cx.stop_propagation();
-                        this.ask_about_board(None);
+                        this.delete_doomed_board(cx);
                         cx.notify();
                     }),
                 ),
@@ -789,16 +916,80 @@ fn shorten(dir: &Path) -> String {
 mod tests {
     use super::*;
 
+    /// Every path remembered, none found. The split is exercised by
+    /// [`beside`] below.
     fn switcher(paths: &[&str]) -> Switcher {
+        beside(paths, &[])
+    }
+
+    /// `remembered` came out of `recent.json`; `found` was scanned up beside
+    /// the open board. See [`Switcher::recent`].
+    fn beside(remembered: &[&str], found: &[&str]) -> Switcher {
+        let boards: Vec<PathBuf> = remembered.iter().chain(found).map(PathBuf::from).collect();
         Switcher {
             query: Editor::new("", crate::palette::QUERY_MAX, false),
             cursor: 0,
             scroll: ScrollHandle::new(),
-            boards: paths.iter().map(PathBuf::from).collect(),
+            recent: remembered.len(),
+            boards,
             confirming: None,
             refused: None,
             open: None,
         }
+    }
+
+    #[test]
+    fn a_found_board_sits_below_every_remembered_one_however_well_it_matches() {
+        // The found board is the better match by every measure the scorer
+        // has — the letters start its name rather than sitting in the middle
+        // of a longer one — and it still comes second, because the heading
+        // over the found group says what those rows *are* and a heading is a
+        // lie the moment a row above it belongs below.
+        let mut s = beside(&["/b/old-kit-notes.mbrd"], &["/b/kit.mbrd"]);
+        s.query = typed("kit");
+        assert_eq!(names(&s), ["old-kit-notes.mbrd", "kit.mbrd"]);
+        assert!(
+            score("kit", Path::new("/b/kit.mbrd"))
+                > score("kit", Path::new("/b/old-kit-notes.mbrd")),
+            "and it really is the better match"
+        );
+    }
+
+    #[test]
+    fn inside_a_group_the_better_match_still_wins() {
+        let mut s = beside(&["/b/studio.mbrd", "/b/kitchen.mbrd"], &[]);
+        s.query = typed("kitchen");
+        assert_eq!(names(&s), ["kitchen.mbrd"]);
+    }
+
+    #[test]
+    fn forgetting_a_remembered_board_does_not_move_the_heading() {
+        // The retain shifts every index after it. Without the matching
+        // adjustment to `recent`, the last remembered board would start
+        // claiming to have been found.
+        let mut s = beside(&["/b/one.mbrd", "/b/two.mbrd"], &["/b/three.mbrd"]);
+        s.dropped(Path::new("/b/one.mbrd"));
+        assert!(!s.found_beside(Path::new("/b/two.mbrd")), "still remembered");
+        assert!(s.found_beside(Path::new("/b/three.mbrd")), "still found");
+    }
+
+    #[test]
+    fn forgetting_a_found_board_leaves_the_heading_where_it_was() {
+        let mut s = beside(&["/b/one.mbrd"], &["/b/two.mbrd", "/b/three.mbrd"]);
+        s.dropped(Path::new("/b/two.mbrd"));
+        assert!(!s.found_beside(Path::new("/b/one.mbrd")));
+        assert!(s.found_beside(Path::new("/b/three.mbrd")));
+    }
+
+    #[test]
+    fn a_board_that_is_both_remembered_and_beside_is_only_remembered() {
+        // `extend_boards` skips what is already in the list, so the scan
+        // cannot demote a board somebody has actually had open.
+        let mut s = beside(&["/b/one.mbrd"], &[]);
+        s.extend_boards(vec![PathBuf::from("/b/one.mbrd"), PathBuf::from("/b/two.mbrd")]);
+        assert!(!s.found_beside(Path::new("/b/one.mbrd")));
+        assert!(s.found_beside(Path::new("/b/two.mbrd")));
+        assert_eq!(names(&s), ["one.mbrd", "two.mbrd"]);
     }
 
     fn typed(text: &str) -> Editor {

@@ -71,6 +71,18 @@ pub struct Player {
     /// being looked at. `tick` reads it to keep off-screen playback from
     /// asking for frames.
     seen: u64,
+    /// Whether a real decoder is telling this playhead where it is.
+    ///
+    /// Set by [`Media::sync`] and **cleared by every `tick`**, so it is a claim
+    /// about the frame that just happened rather than a mode. That is what
+    /// makes it self-healing: a card whose pipeline is torn down simply stops
+    /// being synced, and the wall clock picks the playhead up again on the very
+    /// next frame with no bookkeeping anywhere.
+    ///
+    /// A GIF is never driven — there is no decoder behind one, only frames and
+    /// a measured clock — which is why this defaults to false and why every
+    /// test in this module is about the undriven case.
+    driven: bool,
 }
 
 impl Player {
@@ -115,6 +127,15 @@ impl Media {
             // see the module doc. The playhead still advances, so a clip that
             // runs out off screen is found finished rather than found frozen.
             let visible = player.seen >= self.round;
+            // A decoder owns this playhead, so the clock must not also move it
+            // — see `Player::driven`. The stamp is still brought level, so that
+            // the frame after a pipeline goes away measures from now rather
+            // than from whenever it was last on the clock.
+            if std::mem::take(&mut player.driven) {
+                player.since = now;
+                moving |= visible;
+                continue;
+            }
             // Saturating, because a clock that went backwards — which happens
             // on a machine coming out of sleep — must not panic here.
             let dt = now.saturating_duration_since(player.since);
@@ -142,6 +163,26 @@ impl Media {
         }
         self.round = self.round.wrapping_add(1);
         moving
+    }
+
+    /// Put a real decoder's answer in, for a card that has one.
+    ///
+    /// The pipeline is the truth for anything it is playing: a decoder that
+    /// stalls for two hundred milliseconds has a playhead that stalls with it,
+    /// and a scrubber running on a wall clock would slide away from the sound
+    /// and then snap back. See `pipeline::Beat`, which is what this takes.
+    ///
+    /// Nothing is created here. A card with no player is a card nobody has
+    /// pressed, and a decoder reporting a position for one would be a
+    /// scrubber appearing on a card that is not playing.
+    pub fn sync(&mut self, id: &str, at: Duration, length: Option<Duration>) {
+        let Some(player) = self.players.get_mut(id) else { return };
+        player.at = at;
+        // `or`, not a replacement: a container that stops reporting its length
+        // half way through — which happens on a live stream and on a truncated
+        // file — must not take the length off a scrubber that already had one.
+        player.length = length.or(player.length);
+        player.driven = true;
     }
 
     /// Bring one player's copy of the board's flags level, and tell it how long
@@ -173,6 +214,15 @@ impl Media {
         self.players.get(id).is_some_and(|p| p.playing)
     }
 
+    /// Every card whose playhead is running, for the frame loop.
+    ///
+    /// Bounded by [`AT_ONCE`] and so never more than a handful, which is what
+    /// makes collecting it once a frame cheaper than handing the whole map out
+    /// and letting the caller hold a borrow across the work it does.
+    pub fn playing(&self) -> Vec<String> {
+        self.players.iter().filter(|(_, p)| p.playing).map(|(id, _)| id.clone()).collect()
+    }
+
     /// Where a card's playhead is. Zero for one that has never played, which is
     /// the same place it would be.
     pub fn at(&self, id: &str) -> Duration {
@@ -201,6 +251,7 @@ impl Media {
             since: now,
             started: now,
             seen: round,
+            driven: false,
         });
 
         player.length = length.or(player.length);
@@ -235,6 +286,7 @@ impl Media {
             since: now,
             started: now,
             seen: round,
+            driven: false,
         });
         player.length = length.or(player.length);
         player.since = now;

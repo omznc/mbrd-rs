@@ -292,20 +292,23 @@ fn card<'a>(it: &'a Item) -> Card<'a> {
     Card { x: it.x, y: it.y, w: it.w, h: it.h, it }
 }
 
-/// An item's box grown to whole grid cells, plus one.
+/// An item's box grown to whole grid cells.
 ///
-/// The original anchors a snapped card's *edge* to the lattice and keeps a seam
-/// inside each cell, so whole-cell footprints survive two independent
-/// edge-snaps. This build's lattice takes **centres** — `snap::engage` rounds
-/// `x` and `y` to the nearest multiple of the step — so two neighbours can each
-/// move up to half a step *towards each other* when the board is snapped
-/// afterwards. One whole extra cell per footprint is what absorbs that: bodies
-/// end up separated by at least a step before the snap, and at worst touching
-/// after it. The proof is in `tests::a_snapped_layout_does_not_overlap`.
+/// This used to reserve one whole extra cell per card, and the extra cell was
+/// paying for a lattice that took **centres**: rounding `x` and `y` let two
+/// neighbours each drift half a step *towards* each other when the board was
+/// snapped after the layout, so every footprint had to carry a spare cell to
+/// absorb the pair of them. The lattice takes **edges** now — see
+/// [`geometry::conform`](crate::geometry::conform) — and an edge-snapped card
+/// of whole cells cannot cross a cell boundary it did not already cross. There
+/// is nothing left to absorb, so the layouts get their cell back and a snapped
+/// arrangement comes out a step tighter.
+///
+/// The proof is still in `tests::a_snapped_layout_does_not_overlap`, which
+/// snaps the way the app does and insists nothing touches.
 fn to_cells(c: &mut Card, step: f32) {
-    let cells = |v: f32| ((v / step).round().max(1.0)) * step + step;
-    c.w = cells(c.w);
-    c.h = cells(c.h);
+    c.w = crate::geometry::cells(c.w, step);
+    c.h = crate::geometry::cells(c.h, step);
 }
 
 /// The room an item wants, as half-extents: its rectangle plus half a gap.
@@ -596,23 +599,16 @@ fn clustered(
 }
 
 /// Which block a card belongs in under `Tag`: its alphabetically first tag, or
-/// [`UNTAGGED`]. Read straight off `meta` and picked by a linear scan rather
-/// than trusted to arrive sorted — this module is pure, takes anything shaped
-/// like an item, and a `.mbrd` written by hand is a perfectly ordinary thing
-/// to open.
+/// [`UNTAGGED`].
+///
+/// Through [`crate::tags::of`] rather than off `meta` directly, which is what
+/// makes this agree with the filter and the tag list about what a tag *is*.
+/// It matters here more than it looks: a hand-written `.mbrd` — or one from a
+/// build that wrote what it was given — can carry `Kitchen` on one card and
+/// `kitchen` on another, and reading the raw strings would lay those out as two
+/// blocks that appear to be the same word twice.
 fn first_tag(it: &Item) -> String {
-    let Some(Value::Array(raw)) = it.meta.get("tags") else {
-        return UNTAGGED.to_string();
-    };
-    let mut best: Option<&str> = None;
-    for t in raw {
-        if let Some(s) = t.as_str() {
-            if !s.is_empty() && best.is_none_or(|b| s < b) {
-                best = Some(s);
-            }
-        }
-    }
-    best.map_or_else(|| UNTAGGED.to_string(), str::to_string)
+    crate::tags::of(it).into_iter().next().unwrap_or_else(|| UNTAGGED.to_string())
 }
 
 /// Item indices, oldest first.
@@ -1203,8 +1199,8 @@ mod tests {
         // Pre-sized to the lattice, as the app sizes cards before laying out.
         let mut items = mixed();
         for it in &mut items {
-            it.w = crate::geometry::clamp_size(crate::geometry::snap(it.w, step));
-            it.h = crate::geometry::clamp_size(crate::geometry::snap(it.h, step));
+            it.w = crate::geometry::cells(it.w, step);
+            it.h = crate::geometry::cells(it.h, step);
         }
         for name in [
             Arrangement::Grid,
@@ -1216,11 +1212,15 @@ mod tests {
         ] {
             let opts = Opts { cell_step: step, spacing: 8.0, ..Opts::default() };
             let out = arrange(&refs(&items), name, &opts);
+            // Snapped the way the app snaps: the *edges* onto the lattice,
+            // which is what `geometry::place` does and what a centre-rounding
+            // model here would quietly get wrong.
             let snapped: Vec<Point> = out
                 .iter()
-                .map(|p| Point {
-                    x: crate::geometry::snap(p.x, step),
-                    y: crate::geometry::snap(p.y, step),
+                .zip(&items)
+                .map(|(p, it)| Point {
+                    x: crate::geometry::place(p.x, it.w, step),
+                    y: crate::geometry::place(p.y, it.h, step),
                 })
                 .collect();
             assert_clear(&items, &snapped, name);

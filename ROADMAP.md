@@ -13,7 +13,7 @@ expensive if they are skipped.
 
 Pan, zoom-to-cursor, marquee select, drag to move, arrow nudge, delete,
 new note, save. Client-side titlebar with window controls. The `.mbrd` format in
-both directions. **Phase 1: the mutation door and undo** — see below. 71 tests.
+both directions. **Phase 1: the mutation door and undo** — see below.
 See `README.md`.
 
 **Getting it onto other people's machines** — installers for all three
@@ -80,6 +80,12 @@ native dependency, a decode thread, and frame delivery into a GPU texture every
 still cut from its first frame (which the format already stores under
 `meta.cover`) and double-click opens it in the system player. That is 90% of the
 value of video on a moodboard for 5% of the work. Revisit when the rest is real.
+
+**Settled at Phase 7, and it plays.** The "large native dependency" was the
+part that turned out to be avoidable: only Linux needed one installed, because
+macOS and Windows already carry a decoder. What survived the revisit is the
+rest of the sentence — a decode thread and a frame every 16ms — and neither is
+free. See Phase 7 for where each of them ended up.
 
 ### 3. 3D models: do them, or cut them?
 
@@ -195,7 +201,7 @@ it everywhere else.
 
 ---
 
-## Phase 3 — Getting things onto the board — **mostly done**
+## Phase 3 — Getting things onto the board — **done**
 
 - ~~Drag-and-drop of files and folders; paste from the clipboard.~~ A folder
   brings what is directly in it and goes no deeper: somebody who drops their
@@ -204,22 +210,29 @@ it everywhere else.
   points at a file is *followed*: a pasted MP4, GIF or `.obj` is fetched and
   becomes that card, because a link to a video is a video somebody meant to put
   on their board. `Ctrl Shift V` is how to say you meant the link. See
-  `fetch.rs` for the bounds on it. **A file picker via the XDG portal is still
-  to do.**
+  `fetch.rs` for the bounds on it. ~~A file picker via the XDG portal.~~
+  `Command::AddFiles` — gpui's own `prompt_for_paths` reaches the portal on
+  Linux and the native panel on the other two, so this cost no dependency at
+  all. What comes back goes through the same `take_files` a drop does, which is
+  what keeps one import path rather than two.
 - ~~Classify by extension and magic bytes into an `ItemType`.~~ The bytes get the
   first word — a `.jpg` that is really a PNG is common, and a pasted screenshot
   has no name at all. **The catalogue is a hand-written subset**, not the
   original's generated ~1,350 formats: the families that matter for the four
-  card types this build draws, plus enough of a tail that a `.sldprt` reads
-  "3D / CAD" and anything else arrives as a named card rather than as nothing.
-  Generating the full table is still worth doing.
+  card types this build draws. ~~Generating the full table.~~ `scripts/formats.mjs`
+  now reads the original's own `formats.ts` and emits `core/formats.rs` — 1,367
+  names over 102 families, in sorted tables the binary searches. The generated
+  half **names** and never classifies: a catalogue that could pick an
+  `ItemType` would make `.cr3` an image card this build cannot draw, so the
+  hand table still decides what a card *is* and the catalogue answers what the
+  file is *called*.
 - ~~Content-hash dedup on the way in.~~ SHA-256, the format's own identity, so
   dropping the same folder twice costs cards and no bytes.
 - ~~Size ceilings, and the **consent** model.~~ `import.rs` reports
   (`Ready::is_heavy`); `board_view.rs` decides, and what it decides is to name
   the file and its size rather than to drop it quietly.
 
-**Left:** the portal, and the generated catalogue.
+**Left:** nothing.
 
 ---
 
@@ -261,6 +274,9 @@ it everywhere else.
 - ~~Copy, cut, paste, duplicate, and the internal clipboard.~~ `Ctrl V` tries
   the app's own cards first and falls through to the system clipboard, so one
   key does both in the order somebody would guess.
+
+**Left:** the stored rich-note model (`meta.rich`), sticker shapes, and
+input-method support. Rotation drawing stays blocked on GPUI, as above.
 
 **One thing that was not on this list and turned out to belong to it:** a
 clipboard that is *two* clipboards. A card is not text — it has a size, a type
@@ -363,11 +379,64 @@ corrupted on save, but nothing here reads it as a second layout to show.
 
 ---
 
-## Phase 7 — Media
+## Phase 7 — Media — **done, on all three**
 
-- Audio: decode, play, and draw the waveform from the `waveforms/` sidecar
-  (already parsed and written). The playlist, `audioOrder`, the now-playing bar.
-- Video: see decision 2. If it goes ahead, GStreamer.
+**Settled: audio *and* video, through whatever the machine already decodes
+with.** That is decision 2 answered in the widest of its three directions, and
+the cost is written down rather than discovered: the single-binary promise
+becomes a single binary *plus the media stack the desktop already has*. On
+Windows and macOS that costs nothing, because the stack is part of the OS. On
+Linux it is a package, so the `.deb` and `.rpm` gain a `depends` line, the
+AppImage carries the plugins, and `SHIPPING.md` and `RELEASING.md` gain a
+section. It is the only way a clip on a moodboard plays rather than sits there
+as a poster.
+
+- ~~Audio: decode, play, and draw the waveform from the `waveforms/` sidecar
+  (already parsed and written).~~ `app/pipeline.rs` — one `playbin3` per card
+  that is playing, sound straight out to the desktop. The waveform is drawn
+  from the sidecar where the archive carries one, resampled to the number of
+  bars the scrubber will actually draw; a card with no sidecar keeps the level
+  bars, which say "a recording" without claiming to say what is in it.
+- ~~Video: decode to frames the canvas can draw, at the size the card is drawn
+  at.~~ Pulled back through an `appsink` as BGRA, capped at 1024 on the long
+  edge by `videoscale`, and drawn in front of the card's poster.
+- **Where the playhead lives is settled, and it is not here.** `playback.rs`
+  decides what is playing — the cap, one sound at a time, a clip that has run
+  out — and `board_view::pump_media` brings the decoders level with whatever it
+  decided, once a frame, in that one direction. Nothing pushes back except the
+  position, through `Media::sync`. A card evicted by `AT_ONCE` is the case that
+  proves it: no call site knows it happened, and a `stack.pause` beside every
+  `media.pause` would have missed it.
+- The playlist — `audioOrder` given meaning, and a now-playing bar. **Still
+  open.** It is `core/tour.rs`'s shape rather than the pipeline's: a saved
+  order, a place you have got to, and the route between them. Now that
+  something plays, it is worth building.
+- Measuring a waveform on *import*, so a file dropped on this build gets a
+  `waveforms/` sidecar of its own rather than only reading one somebody else
+  wrote. GStreamer is the decoder for it and `core/peaks.rs` is the rest.
+- The half of Phase 10 that waits on this: re-encoding sound to Opus. The
+  encoder is here now (`opusenc`, and `avenc_opus` behind it), so this is
+  unblocked rather than done.
+
+**Three backends, one door.** GStreamer is a link-time dependency — an
+executable built against it does not start on a machine without it — so
+shipping it on Windows and macOS would have meant carrying the runtime inside
+the installer, which costs Windows its single-file portable `.exe` and macOS
+its ad-hoc signature. The way out was not to ship a decoder at all: macOS has
+AVFoundation and Windows has the Media Foundation Media Engine, both part of
+the OS, both able to open a file and hand back BGRA frames.
+
+So `main.rs` picks the file by target — `pipeline.rs`, `pipeline_mac.rs`,
+`pipeline_win.rs`, and `pipeline_off.rs` for anything else — and `board_view.rs`
+knows only `Stack`. All four are polled from the frame loop rather than
+signalled, observed or called back into, because the rule at the top of this
+phase is a rule about a direction and a callback is the other one. `spill.rs`
+is the part all three share: a played asset laid out on disk under its own
+hash, because a path buys seeking for free on every one of them.
+
+Two of the three cannot be compiled on Linux, which is the standing weakness
+here. `spill.rs` is where the testable part went, and the platform CI jobs are
+the rest; `CONTRIBUTING.md` says so plainly.
 
 ---
 
@@ -381,9 +450,21 @@ corrupted on save, but nothing here reads it as a second layout to show.
 - The command palette (`Shift` `Shift`) — `command.rs`'s whole table as a list
   you type at, which is the only way to reach the third of it that has no key.
   Done alongside the search, since they are one mechanism with two lists.
-- Tags, and filtering the board by them.
-- The tour: a saved route, walked with a camera move per stop.
-- The viewer: double-click to zoom to an item, and a full-screen look at one.
+- ~~Tags, and filtering the board by them.~~ `core/tags.rs` holds the word rules
+  — 24 characters, 12 to an item, folded to lower case, and a block-list rather
+  than an allow-list so a tag can be written in any language somebody has. The
+  palette gained two more modes for it: `#` puts a word on the selection off a
+  list of the words already on the board, and the filter fades what does not
+  wear one rather than hiding it, because a filter is a way of finding something
+  *among* everything else. See `FADED` in `board_view.rs`.
+- ~~The tour: a saved route, walked with a camera move per stop.~~
+  `core/tour.rs`. `board.tour` had round-tripped through this build since the
+  format was first read and nothing consumed it. The route is board data; where
+  you have got to reading it is not, so it lives on the view — writing it down
+  would make *opening* a board a change to it.
+- ~~The viewer: double-click to zoom to an item, and a full-screen look at one.~~
+  `app/opened.rs` — one card on the whole window, with an info rail and an Edit
+  button.
 - The bin as a place on the canvas you can drag things back out of. **Dropped.**
   A bin earns its keep by being somewhere you can take things back *out* of, and
   nothing here ever built that — so what the format's `trash` section actually
@@ -393,11 +474,16 @@ corrupted on save, but nothing here reads it as a second layout to show.
   back, and it survives a reopen because the ledger does. See
   `core/model.rs`'s `TrashEntry`. If this comes back it comes back as the
   draggable place described here, not as a number in the corner.
-- The inventory sheet — what this board is made of, and what it weighs.
+- ~~The inventory sheet — what this board is made of, and what it weighs.~~
+  `core/inventory.rs` and `app/stock.rs`. Two rules it may not break, both in
+  its own note: every size comes from the stored bytes, and building the report
+  may not decode a picture — this is asked *about* a heavy board and must not be
+  another reason it feels heavy. Every row that has a card behind it travels
+  there. It is also where Phase 10 lives, for the reason that phase gives.
 
 ---
 
-## Phase 9 — Real-world size ◐
+## Phase 9 — Real-world size — **done**
 
 Scale calibration against a sheet of paper, the paper outlines, the scale bar,
 the HUD, metric and imperial. Small, self-contained, and pleasant.
@@ -425,17 +511,36 @@ have been a worse way to show. All three go through `BoardView::set_paper` /
 `toggle_setting` / `toggle_units`, the same one-door `board.edit` every other
 board setting already goes through.
 
-Left, and the only piece of Phase 9 still open: the calibration gesture
-itself — draw a line against the paper, say what it measures, and `scale`
-follows. That one wants a real window to get right and is the riskiest piece
-left in the whole phase.
+And the last piece: ~~the calibration gesture~~. `Command::Calibrate` arms a
+mode, a drag draws a dimension line with a tick at each end, and a one-line bar
+asks how long it is — "30cm", "12 in", `1,5m`, `6"`, or a bare number read in
+the board's own units. `paper::calibrate` turns the answer into `scale` and
+`paper::millimetres` parses the sentence, both of which refuse anything that is
+not a measurement: a stray scale is worse than none, because every other
+measurement on the board is read through it. The scale bar comes on in the same
+step, since it is the only thing on screen that shows what a scale *is*.
 
 ---
 
-## Phase 10 — Making boards smaller
+## Phase 10 — Making boards smaller — **the pictures are done**
 
-Recompress images; re-encode audio to Opus. Says what it will do before it does
-it, and is undoable. Depends on Phase 1 for the undo half.
+~~Recompress images.~~ `core/shrink.rs` decides what is worth trying — nothing
+under 100 KB, nothing that animates, nothing no card is using, and nothing that
+would not come out at least a tenth smaller — and `app/shrink.rs` does the
+re-encode: JPEG for anything opaque, PNG for anything that is not, and
+transparency decided by *looking* rather than by the channel count, so the
+commonest heavy file on a board (a screenshot stored as RGBA and opaque in every
+pixel) is not left a PNG forever.
+
+It says what it will do before it does it, and the way it says so is the point:
+the offer sits at the bottom of the inventory page, under the list that has just
+named the 12 MB photograph. A run copies one file at a time, decodes it off the
+thread that draws, and repoints every card in a **single** `edit` at the end —
+so it is one `Ctrl Z`, and the originals are never deleted, which is what makes
+that undo real rather than nominal.
+
+**Left:** re-encoding audio to Opus, which needs an encoder and therefore waits
+for Phase 7.
 
 ---
 
@@ -487,14 +592,14 @@ Still last in this list, and no longer last because it is doubtful.
 ## Ordering, in one line
 
 **1 → 2 → 3** is the spine and is not reorderable: undo before mutations,
-rendering before content, content before everything. **1, 2 and most of 3 are
-done**, so is most of **4**, and **5** is done — structure between things, which
-is what a moodboard is *for* once the things are on it. So the next thing is
-**6**, the seven arrangements, and **7–11** are breadth. What is left of 3 and
-4 — the XDG portal, the generated format
-catalogue, rich notes, sticker shapes — can be picked up any time; none of it
-blocks anything. **Rotation drawing is the one genuine dependency**: it is
-blocked on GPUI's scene primitives, and it blocks the rotate gesture.
+rendering before content, content before everything. **1, 2, 3, 5, 6, 8, 9 and
+11 are done**, **10** is done except for the half that needs an encoder, and
+**4** is done except for the stored rich-note model and sticker shapes — neither
+of which blocks anything. So the next thing is **7**, the media stack, which is
+the last phase with real breadth left in it and now also the thing Phase 10's
+remaining half is waiting on. **Rotation drawing is the one genuine
+dependency**: it is blocked on GPUI's scene primitives, and it blocks the
+rotate gesture.
 
 ## Where the work lands
 
@@ -504,11 +609,13 @@ Roughly, and worth watching — the split is what keeps the format testable.
 | --- | --- | --- |
 | 1 ✓ | the door, the ledger, the timeline format | rewiring the view |
 | 2 ✓ | spatial index | painted layer, decode cache |
-| 3 ◐ | classify, ceilings *(catalogue partial)* | drop targets *(portal to do)* |
+| 3 ✓ | classify, ceilings, the generated catalogue | drop targets, the portal picker |
 | 4 ◐ | *(the stored rich-note model, still ahead)* | grips ✓, the text input ✓, Markdown ✓ |
 | 5 ✓ | fence measurement, the router, align/distribute, locking, snap | the ribbon, the anchors, the rope menu |
 | 6 ✓ | all eight arrangements | — |
-| 9 ◐ | scale and paper maths ✓ | the outline ✓, the status bar's scale segment ✓, the Paper/Landscape/Units menu ✓, the calibration gesture *(still ahead)* |
+| 8 ✓ | tags, the tour, the inventory | the search, the palette, the filter fade, the tour bar, the sheet |
+| 9 ✓ | scale and paper maths, the calibration arithmetic | the outline, the scale segment, the Paper/Landscape/Units menu, the measuring gesture |
+| 10 ◐ | what is worth re-encoding | the encoder, the run, the offer on the sheet |
 | 11 ✓ | the rasteriser, `stl`, `obj`, `glb` | the decode dispatch, the picture pipeline |
 
 If a phase turns out to be mostly right-hand column, that is usually a sign

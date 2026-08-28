@@ -186,41 +186,37 @@ said it was taking on.
 
 ---
 
-## The media stack — a real one
+## The media stack — a real one — **done**
 
 **Settled: decode and play, both.** `ROADMAP.md`'s decision 2 chose poster
-frames only, and that is being revisited: a moodboard where the video cards are
-coloured rectangles and the audio cards are silent is a moodboard missing two of
-its four content types.
+frames only; it was revisited, because a moodboard where the video cards are
+coloured rectangles and the audio cards are silent is a moodboard missing two
+of its four content types. See `ROADMAP.md` Phase 7 for what was built.
 
-What is actually there today is worth stating, because it is less than it
-looks:
+**What this section got wrong is worth keeping.** It planned the two halves as
+two jobs with two dependency stories — `symphonia` plus `cpal` for audio,
+because that is pure Rust and finishable; GStreamer or FFmpeg for video,
+because that is not — and sequenced them so the cheap half landed first.
 
-- **No decoder of any kind.** No `cpal`, `rodio`, `symphonia`, GStreamer or
-  FFmpeg in the tree. `playback.rs` says so: "Phase A has nothing behind a
-  player but a playhead."
-- **`meta.cover` is never written.** Only `demo.rs` sets one. A real `.mp4`
-  dropped on the board has no poster frame — not the first frame, not anything.
-- The transport strip on a card is a clock. It advances. Nothing is behind it.
+Neither of those turned out to be the shape of the work:
 
-The two halves are very different amounts of work and are not one job:
+- **They are one job, not two.** A `playbin3` decodes an MP3 as readily as an
+  MP4; so does an `AVPlayer`, so does the Media Engine. Doing audio through a
+  second stack would have been a second stack for no second capability, and a
+  second set of bugs about who owns the playhead. Splitting the halves would
+  have *added* work rather than deferred it.
+- **The dependency was the platform's, not the tree's.** The premise here was
+  that a native decoder means shipping a native decoder. It does not: only
+  Linux needed a package, because macOS and Windows have one in the OS.
+  `pipeline_mac.rs` and `pipeline_win.rs` are more code than a `cpal` stream
+  would have been, and they cost the installers nothing at all.
+- **The poster path was not a prerequisite.** It was listed as needed first,
+  since "a card is a still until it is pressed". A card that is playing is not
+  a still, and one that is not playing already had somewhere to draw. Poster
+  extraction on import is still unwritten, and nothing waited for it.
 
-**Audio** is tractable and pure Rust. `symphonia` decodes MP3, AAC, FLAC, WAV,
-Vorbis and ALAC with no C toolchain; `cpal` opens an output stream on all three
-platforms. The waveform sidecar the format already carries is drawn against a
-playhead that finally means something. This is a self-contained piece of work
-with a small dependency footprint.
-
-**Video** is GStreamer or FFmpeg: a large native dependency, a decode thread,
-and a frame into a GPU texture every 16ms — on three platforms with three
-different packaging stories, against an installer that currently ships one
-binary. It also wants a poster path first, since a card is a still until it is
-pressed.
-
-So they are sequenced rather than done together: audio first because it is
-finishable, poster extraction second because the video card needs it either
-way, and the video pipeline last because it is the one that changes what
-shipping this app means.
+The one thing this section did call correctly is that video is the half that
+changes what shipping the app means — it just lands on Linux alone.
 
 ---
 
@@ -239,8 +235,8 @@ Marked by where it stands, not by how it would look in a list.
 | Raster images | `png` `jpg` `gif` `webp` `bmp` `tiff` `ico` `tga` `qoi` `exr` `hdr` | contained | name | **done** |
 | Images claimed and undecodable | `avif` `heic` `heif` `jxl` | — | name | **done** — reclassified, see below |
 | Vector | `svg` | contained, rasterised by `resvg` | text, its XML still edits it | **done** |
-| Audio | `mp3` `wav` `flac` `ogg` `m4a` `aac` `opus` | waveform where the archive has one; **plays** later | name | tranche 2 — `symphonia` + `cpal` |
-| Video | `mp4` `mov` `webm` `mkv` … | poster where the board has one; **plays** later | name | tranche 3 — GStreamer |
+| Audio | `mp3` `wav` `flac` `ogg` `m4a` `aac` `opus` | waveform where the archive has one, and it **plays** | name | **done** — the system's decoder, so the list is a label and the machine is the test |
+| Video | `mp4` `mov` `webm` `mkv` … | poster where the board has one, and it **plays** | name | **done** — same, drawn in front of the poster |
 | PDF | `pdf` | its text, and how many pages | name | **done** — no rasteriser, which stays a native dependency and not the price of entry |
 | Fonts | `ttf` `otf` `ttc` | a specimen sheet, set in the face itself | name | **done** |
 | Fonts | `woff` `woff2` | — | name | later — a compressed wrapper around the shape above, and unwrapping one is a second dependency |
@@ -518,14 +514,16 @@ Not in it, and deferred on purpose: syntax highlighting, and `core/text.rs` —
 see "One text, one door" above for why the accessor turned out to be a
 tidiness win rather than one this crate needs to cash in.
 
-**2 — Notes as files, and audio that plays.** The load-bearing half of the
-format change — `notes/` outranking `board.json`, and a note with no asset that
-grows past `NOTE_MAX` being promoted to one instead of clipped — is **done**;
-see "Notes become Markdown files" above. Left: `symphonia` and `cpal`, the
-waveform against a real playhead, the now-playing bar.
+**2 — Notes as files, and audio that plays — done.** The load-bearing half of
+the format change — `notes/` outranking `board.json`, and a note with no asset
+that grows past `NOTE_MAX` being promoted to one instead of clipped — is done;
+see "Notes become Markdown files" above. So is playback, though not through
+`symphonia` and `cpal`; see the media section. Left: the now-playing bar, which
+is a playlist rather than a decoder.
 
-**3 — Video.** Poster extraction, then GStreamer, then what that does to
-packaging on three platforms.
+**3 — Video — done.** It arrived with tranche 2 rather than after it, for the
+reason written up above: one stack decodes both. Poster extraction on import is
+the piece that did not land, and it never blocked anything.
 
 **4 — Breadth.** The largest tranche by count and the smallest by risk: every
 format above that needs one pure-Rust dependency or none at all. Roughly in the

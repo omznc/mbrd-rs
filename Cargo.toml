@@ -21,6 +21,83 @@ image = "0.25"
 # verifies and cannot sign, which is the only half that belongs in a binary
 # handed to other people.
 flate2 = "1"
+# Sound and video, three times over. Every one of these is a *binding* and
+# carries no codec of its own: what plays is whatever the machine's own media
+# stack can already play, which is why there is one of these per platform
+# rather than a pile of vendored decoders, a patent question per format, and a
+# video card that still could not use the GPU somebody has.
+#
+# The split is a shipping decision and it is argued in `main.rs`,
+# `pipeline.rs` and `SHIPPING.md`. Briefly: GStreamer is the best of the three
+# and the only one that is a *system* dependency, which on Linux is free and on
+# the other two would cost Windows its single-file portable `.exe` and macOS a
+# bundled framework and a real signature. AVFoundation and Media Foundation are
+# already in those operating systems.
+
+# Linux. `-app` is the sink frames come back through and `-video` reads the
+# frame layout; both track `gstreamer` itself and are not separable from it.
+gstreamer = "0.25"
+gstreamer-app = "0.25"
+gstreamer-video = "0.25"
+
+# macOS. Features rather than the whole of AVFoundation, which is enormous:
+# what is wanted is a player, an item and a video output, plus the two Core
+# frameworks that carry a timestamp and a pixel buffer between them.
+objc2 = "0.6"
+objc2-av-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "AVPlayer",
+    "AVPlayerItem",
+    "AVPlayerItemOutput",
+    "objc2-core-media",
+    "objc2-core-video",
+] }
+# `objc2` on each of these is the interop half — the `Encode` and `Retained`
+# impls that let a `CMTime` cross a message send and a pixel buffer be held.
+# It is in their defaults, and these turn defaults off to keep the compile
+# down, so it has to be named.
+objc2-core-media = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2",
+    "CMTime",
+] }
+objc2-core-video = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2",
+    "CVBase",
+    "CVBuffer",
+    "CVImageBuffer",
+    "CVPixelBuffer",
+    "CVReturn",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSDictionary",
+    "NSError",
+    "NSObject",
+    "NSString",
+    "NSURL",
+    "NSValue",
+] }
+
+# Windows. Features rather than the whole of Win32, which is a third of a
+# gigabyte of generated bindings. `implement` needs no feature of its own, which
+# matters here: the Media Engine will not be created without a callback, so one
+# COM interface has to be implemented rather than only called.
+#
+# `windows-core` is named separately even though `windows` re-exports it as
+# `windows::core`, because `#[implement]` expands to absolute `windows_core::`
+# paths and those only resolve if the crate is in the graph under that name. The
+# version has to track `windows`, or the macro would implement a `IUnknownImpl`
+# from a different copy of the trait than the one `windows` asks for.
+windows-core = "0.62"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Imaging",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+] }
 # A PDF's page count and the text pulled out of it, with no rasteriser
 # anywhere behind it — that is a native dependency and, per `VIEWING.md`,
 # not the price of entry for reading what a PDF actually says.

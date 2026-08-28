@@ -235,6 +235,40 @@ in-app updater writing over a file `dpkg` or `rpm` believes it owns. There is a
 `/usr` prefix check behind that as a safety net, but the marker is the exact
 answer.
 
+## Why only the Linux release installs anything for media
+
+All three platforms play sound and video, each through its own backend and its
+own system decoder — `pipeline.rs` against GStreamer, `pipeline_mac.rs` against
+AVFoundation, `pipeline_win.rs` against the Media Foundation Media Engine. The
+deps sit under three `cfg(target_os = ...)` tables in `crates/app/Cargo.toml`,
+so a build only ever pulls one set.
+
+The difference at release time is that GStreamer is a *link-time* dependency
+and not an optional one — a binary built against it will not start on a machine
+without it — while the other two are part of the OS and always there. So Linux
+is the only platform where shipping media is a packaging job at all.
+
+What that means for a release:
+
+- The Linux runner installs `libgstreamer1.0-dev` and
+  `libgstreamer-plugins-base1.0-dev` to build, and the `-plugins-good` and
+  `-libav` runtime sets for the AppImage to copy. No other runner installs
+  anything, and no other runner needs to.
+- The AppImage runs `linuxdeploy-plugin-gstreamer`, which is what carries the
+  plugins in. `ldd` finds the libraries by itself; the plugins are `dlopen`ed
+  and it cannot. An AppImage built without it starts and then has no decoder
+  for anything, which is a worse failure than not shipping media at all.
+- The `.deb` requires the two libraries and *recommends* the codecs; the `.rpm`
+  requires the libraries. A machine with the libraries and no codecs runs the
+  app and opens every board — only the play button says it cannot.
+- The Windows `.exe` and the macOS `.app` install nothing, bundle nothing and
+  are still one file and one bundle. That is the whole reason those two
+  backends are native rather than a fourth copy of GStreamer; `SHIPPING.md`
+  has what the other choice would have cost.
+- Neither of those two can be built or type-checked on the Linux runner that
+  builds them, so a media change is checked by the platform's own job or not at
+  all. A tag is a bad place to find that out — see `CONTRIBUTING.md`.
+
 ## Building locally
 
 ```sh

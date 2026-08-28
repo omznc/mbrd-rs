@@ -26,6 +26,33 @@ trash.workspace = true
 ttf-parser.workspace = true
 ureq.workspace = true
 
+# One media backend per platform, and none of them shared. See `main.rs`, which
+# is where the three files behind `mod pipeline` are chosen between, and the
+# workspace manifest, which has the argument for why it is three.
+
+# Linux: GStreamer, which is a link-time dependency and the only one of the
+# three that is not already part of the operating system. Every Linux desktop
+# has it; the packages name it in `depends` below.
+[target.'cfg(target_os = "linux")'.dependencies]
+gstreamer.workspace = true
+gstreamer-app.workspace = true
+gstreamer-video.workspace = true
+
+# macOS: AVFoundation, which ships with the system. Nothing to install, nothing
+# to bundle, and the `.app` stays exactly as standalone as it was.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-av-foundation.workspace = true
+objc2-core-media.workspace = true
+objc2-core-video.workspace = true
+objc2-foundation.workspace = true
+
+# Windows: the Media Foundation Media Engine, which also ships with the system —
+# so the portable `.exe` is still one file.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows.workspace = true
+windows-core.workspace = true
+
 # Only to put an icon on the Windows executable — but declared unconditionally
 # on purpose. Cargo evaluates `[target.'cfg(...)'.build-dependencies]` against
 # the **host**, not the target, so gating this on `cfg(windows)` would remove
@@ -52,7 +79,14 @@ section = "graphics"
 priority = "optional"
 # The floor the release build is compiled against — Ubuntu 22.04's glibc. See
 # RELEASING.md for why the runner is pinned there.
-depends = "libc6 (>= 2.35), libxkbcommon-x11-0, libfontconfig1, libfreetype6"
+# The GStreamer pair are hard dependencies rather than recommendations: they
+# are linked, so the binary does not start without them. See `pipeline.rs`.
+depends = "libc6 (>= 2.35), libxkbcommon-x11-0, libfontconfig1, libfreetype6, libgstreamer1.0-0, libgstreamer-plugins-base1.0-0"
+# The decoders. Not `depends`, because a machine missing them still runs the
+# app and every card on a board — only the play button says it cannot, which
+# is exactly what `pipeline.rs` reports a broken reel as. `libav` is where H.264
+# and AAC actually come from, and is what makes a phone video play.
+recommends = "gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-libav"
 extended-description = """A moodboard on an endless canvas. Pan, zoom, drop images, notes and connections onto a board that has no edges, and save it as a single .mbrd file that travels."""
 assets = [
     ["../../target/release/mbrd", "usr/bin/", "755"],
@@ -77,3 +111,8 @@ glibc = ">= 2.35"
 libxkbcommon-x11 = "*"
 fontconfig = "*"
 freetype = "*"
+# Linked, so required. The decoders are not listed: rpm has no `Recommends`
+# that `cargo-generate-rpm` writes, and every Fedora desktop pulls the plugin
+# sets in already. See the deb block above for the reasoning.
+gstreamer1 = "*"
+gstreamer1-plugins-base = "*"

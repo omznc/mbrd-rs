@@ -46,6 +46,22 @@ pub struct Meshes {
     /// "claim before starting" gate `images::Images::begin` uses, so a slow
     /// decode does not get asked for twice while it is still on its way.
     pending: HashSet<String>,
+    /// The same gate for *live* frames, plus the one thing a resting decode
+    /// never needs: the newest orbit that arrived while one was in flight.
+    ///
+    /// A resting decode is asked for once per committed change, so a claim is
+    /// all it wants. A turning mesh is asked for once per **mouse move**,
+    /// which arrives faster than any rasteriser finishes — so a bare claim
+    /// would drop every frame but the first, and no claim at all queues an
+    /// unbounded pile of them on the background executor and shows you
+    /// whichever finishes last. Neither is what a drag should look like.
+    ///
+    /// So: at most one in flight, and at most one waiting behind it, the
+    /// waiting one always overwritten by whatever the pointer did most
+    /// recently. Latency is then one rasterise rather than a backlog, and
+    /// because there is only ever one in flight per card, a stale frame
+    /// cannot land after a newer one and turn the mesh back.
+    turning: HashMap<String, Option<Orbit>>,
 }
 
 impl Meshes {
@@ -76,6 +92,7 @@ impl Meshes {
     pub fn forget(&mut self, item_id: &str) {
         self.resting.remove(item_id);
         self.pending.remove(item_id);
+        self.turning.remove(item_id);
     }
 
     /// Claim an item before starting a background rasterise. `false` means
@@ -88,6 +105,51 @@ impl Meshes {
     /// The rasterise this item claimed has landed, one way or another.
     pub fn settle(&mut self, item_id: &str) {
         self.pending.remove(item_id);
+    }
+
+    /// Claim an item before starting a *live* rasterise, the turning
+    /// counterpart of [`Meshes::begin`]. `false` means one is already on its
+    /// way and this orbit belongs in [`Meshes::want_live`] instead.
+    pub fn begin_live(&mut self, item_id: &str) -> bool {
+        if self.turning.contains_key(item_id) {
+            return false;
+        }
+        self.turning.insert(item_id.to_string(), None);
+        true
+    }
+
+    /// Hold this orbit as the one to draw next, replacing whatever was
+    /// waiting. Does nothing for a card with no live rasterise in flight —
+    /// there is nothing to wait behind, and the caller should have started
+    /// one.
+    pub fn want_live(&mut self, item_id: &str, orbit: Orbit) {
+        if let Some(waiting) = self.turning.get_mut(item_id) {
+            *waiting = Some(orbit);
+        }
+    }
+
+    /// Give up on turning this card: release the claim and drop whatever was
+    /// waiting behind it.
+    ///
+    /// For the paths where a live rasterise cannot be started at all — the
+    /// card is gone, its bytes are not in the archive, its mesh has not been
+    /// parsed yet. Draining the waiting orbit into the same path that just
+    /// failed would only fail again; the claim has to come off instead, or
+    /// the card is never drawn again for the rest of the session.
+    pub fn abandon_live(&mut self, item_id: &str) {
+        self.turning.remove(item_id);
+    }
+
+    /// A live rasterise has landed. Hands back the orbit that queued up
+    /// behind it, if the pointer moved while it was drawing — and keeps the
+    /// claim, because the caller is about to start that one. `None` releases
+    /// the claim: the drag has caught up, and the next move starts fresh.
+    pub fn settle_live(&mut self, item_id: &str) -> Option<Orbit> {
+        let waiting = self.turning.get_mut(item_id)?.take();
+        if waiting.is_none() {
+            self.turning.remove(item_id);
+        }
+        waiting
     }
 }
 
@@ -114,22 +176,53 @@ pub fn parse(bytes: &[u8]) -> Option<Arc<Mesh>> {
 /// the mesh's own silhouette at this orbit, the same way `images::svg` fits
 /// one to a document's `viewBox` — moved here from `images.rs` because it now
 /// needs an orbit, which `images::decode(bytes)` has no way to be handed.
+/// Rasterised at [`mbrd_core::mesh::ANTIALIAS`], both tiers, because this is
+/// the picture that is kept: a still nobody is currently dragging is looked
+/// at, and a hard silhouette edge shows on one. The turning half is
+/// [`rasterize_live`].
 pub fn rasterize_tiers(mesh: &Mesh, orbit: Orbit) -> Option<Decoded> {
-    let (span_w, span_h) = mbrd_core::mesh::aspect(mesh, orbit.yaw, orbit.pitch)?;
-    let longest = span_w.max(span_h);
-    if longest.is_nan() || longest <= 0.0 {
-        return None;
-    }
+    // The rotation, paid for once and spent on both tiers — the two are the
+    // same camera at two sizes, and it is only the canvas that differs.
+    let view = mbrd_core::mesh::view(mesh, orbit.yaw, orbit.pitch)?;
+    let (longest, span_w, span_h) = fit(&view)?;
     let zoom = zoom_of(orbit.dist);
-    let thumb = one(mesh, longest, span_w, span_h, THUMB_SIDE, &orbit, zoom)?;
-    let sharp = one(mesh, longest, span_w, span_h, LONGEST_SIDE, &orbit, zoom)?;
+    let ss = mbrd_core::mesh::ANTIALIAS;
+    let thumb = one(&view, mesh, longest, span_w, span_h, THUMB_SIDE, &orbit, zoom, ss)?;
+    let sharp = one(&view, mesh, longest, span_w, span_h, LONGEST_SIDE, &orbit, zoom, ss)?;
     Some(Decoded { thumb, sharp: Some(sharp) })
+}
+
+/// The one tier that is actually about to be shown, at one sample per pixel —
+/// what a mesh being turned under the pointer is worth.
+///
+/// [`rasterize_tiers`] draws both tiers because it is filling a cache that
+/// will be asked for either. A live frame is thrown away on the next mouse
+/// move, so drawing the tier that is not on screen is the whole of the work
+/// wasted, and on the board that is the 1024-side one: sixteen times the
+/// pixels of the thumbnail beside it. Dropping the supersample takes another
+/// four off, and costs an antialiased edge on an object that is moving. The
+/// still that lands on release comes back through [`rasterize_tiers`] with
+/// both back.
+pub fn rasterize_live(mesh: &Mesh, orbit: Orbit, target: u32) -> Option<Arc<RenderImage>> {
+    let view = mbrd_core::mesh::view(mesh, orbit.yaw, orbit.pitch)?;
+    let (longest, span_w, span_h) = fit(&view)?;
+    let zoom = zoom_of(orbit.dist);
+    one(&view, mesh, longest, span_w, span_h, target, &orbit, zoom, 1)
+}
+
+/// The silhouette a canvas is shaped to, and the longer of its two sides —
+/// `None` for a view whose extent is not a number a canvas can be cut from.
+fn fit(view: &mbrd_core::mesh::View) -> Option<(f32, f32, f32)> {
+    let (span_w, span_h) = view.aspect();
+    let longest = span_w.max(span_h);
+    (!longest.is_nan() && longest > 0.0).then_some((longest, span_w, span_h))
 }
 
 /// One rasterisation of a mesh, on a canvas shaped to its own silhouette and
 /// scaled so the longer of the two sides lands on `target`.
 #[allow(clippy::too_many_arguments)]
 fn one(
+    view: &mbrd_core::mesh::View,
     mesh: &Mesh,
     longest: f32,
     span_w: f32,
@@ -137,19 +230,20 @@ fn one(
     target: u32,
     orbit: &Orbit,
     zoom: f32,
+    ss: u32,
 ) -> Option<Arc<RenderImage>> {
     let scale = target as f32 / longest;
     let w = ((span_w * scale).round() as u32).max(1);
     let h = ((span_h * scale).round() as u32).max(1);
-    let raster = mbrd_core::mesh::rasterize(
+    let raster = mbrd_core::mesh::rasterize_view(
+        view,
         mesh,
         w,
         h,
-        orbit.yaw,
-        orbit.pitch,
         zoom,
         orbit.pan_x,
         orbit.pan_y,
+        ss,
     )?;
     let mut rgba = RgbaImage::from_raw(w, h, raster.rgba)?;
     to_bgra(&mut rgba);
@@ -262,6 +356,30 @@ mod tests {
     }
 
     #[test]
+    fn a_live_frame_is_the_one_tier_it_was_asked_for() {
+        let mesh = parse(&stl_bytes()).expect("that is a binary stl");
+        for target in [THUMB_SIDE, LONGEST_SIDE] {
+            let frame =
+                rasterize_live(&mesh, Orbit::default(), target).expect("a quad has an extent");
+            assert_eq!(longest(&frame), target as i32);
+            assert!(opaque(&frame), "the quad's face never made it onto the canvas");
+        }
+    }
+
+    #[test]
+    fn a_live_frame_is_the_size_the_resting_one_will_be() {
+        // What the drop to one sample per pixel is not allowed to change. The
+        // swap from `live` to `resting` on release has to be a change of
+        // sharpness and nothing else — a card that resized on mouse-up would
+        // read as the picture flinching at the exact moment you let go.
+        let mesh = parse(&stl_bytes()).expect("that is a binary stl");
+        let orbit = Orbit { yaw: 200.0, ..Orbit::default() };
+        let live = rasterize_live(&mesh, orbit, THUMB_SIDE).unwrap();
+        let resting = rasterize_tiers(&mesh, orbit).unwrap();
+        assert_eq!(live.size(0), resting.thumb.size(0));
+    }
+
+    #[test]
     fn turning_the_orbit_changes_the_resting_picture() {
         let mesh = parse(&stl_bytes()).expect("that is a binary stl");
         let a = rasterize_tiers(&mesh, Orbit::default()).unwrap();
@@ -288,14 +406,60 @@ mod tests {
     }
 
     #[test]
+    fn a_live_rasterise_is_claimed_the_same_way_a_resting_one_is() {
+        let mut meshes = Meshes::default();
+        assert!(meshes.begin_live("card"), "nobody is turning it yet");
+        assert!(!meshes.begin_live("card"), "a second claim while the first is in flight");
+        assert_eq!(meshes.settle_live("card"), None, "the pointer never moved while it drew");
+        assert!(meshes.begin_live("card"), "settled, so a new one may be claimed");
+    }
+
+    #[test]
+    fn only_the_newest_orbit_waits_behind_the_one_being_drawn() {
+        // The whole of the coalescing: a drag emits mouse moves faster than
+        // anything rasterises them, and every one of those but the last is
+        // already out of date by the time a slot opens. Keeping them all is
+        // the backlog; keeping the newest is the drag.
+        let mut meshes = Meshes::default();
+        assert!(meshes.begin_live("card"));
+
+        for yaw in [10.0, 20.0, 30.0] {
+            meshes.want_live("card", Orbit { yaw, ..Orbit::default() });
+        }
+        let next = meshes.settle_live("card").expect("three moves arrived while it drew");
+        assert_eq!(next.yaw, 30.0, "the frame drawn next is where the pointer is now");
+
+        // The claim is still held, because the caller is about to draw that
+        // one — a second `begin_live` here would be the second in flight.
+        assert!(!meshes.begin_live("card"));
+        assert_eq!(meshes.settle_live("card"), None, "nothing arrived behind it this time");
+        assert!(meshes.begin_live("card"), "and now it is free again");
+    }
+
+    #[test]
+    fn an_orbit_wanted_by_a_card_nobody_is_drawing_is_not_kept() {
+        // `want_live` is only ever "queue behind the one in flight". With
+        // none in flight there is nothing to queue behind, and inventing a
+        // claim here would strand it: no rasterise is coming to drain it.
+        let mut meshes = Meshes::default();
+        meshes.want_live("card", Orbit { yaw: 90.0, ..Orbit::default() });
+        assert_eq!(meshes.settle_live("card"), None);
+        assert!(meshes.begin_live("card"), "the card was never claimed");
+    }
+
+    #[test]
     fn forgetting_a_card_drops_its_resting_picture_and_its_claim() {
         let mut meshes = Meshes::default();
         let mesh = parse(&stl_bytes()).unwrap();
         let decoded = rasterize_tiers(&mesh, Orbit::default()).unwrap();
         meshes.set_resting("card", decoded);
         meshes.begin("other");
+        meshes.begin_live("card");
+        meshes.begin_live("other");
         meshes.forget("card");
         assert!(meshes.resting("card").is_none());
+        assert!(meshes.begin_live("card"), "a card that left the board is not still turning");
         assert!(!meshes.begin("other"), "forgetting one card must not touch another's claim");
+        assert!(!meshes.begin_live("other"), "nor another's live claim");
     }
 }

@@ -153,8 +153,27 @@ pub fn render(view: &BoardView, window: &Window, cx: &mut Context<BoardView>) ->
                 .items_center()
                 .gap(px(2.0))
                 .child(switcher_button(view, cx))
+                // Which group you are standing in is *not* here. It was, and it
+                // was wrong: the titlebar is where the things that never change
+                // live, and a crumb that appears and disappears as you step in
+                // and out of groups makes the whole row jump. It belongs with
+                // the other passing facts, in the status bar — see
+                // `BoardView::inside_line` and `BoardView::inside_count`, which
+                // together say the group's name and the group's count down
+                // there beside the rest of them.
+                // Every surface you *go to* rather than do something with, in
+                // the order they are reached for. A button here has to earn
+                // its two dozen pixels twice over — the bar is the one piece
+                // of chrome nobody can put away — so the rule is that it
+                // opens a whole screen and there is no other way to it than
+                // a name typed into the palette. Everything that acts on the
+                // board stays out: those have keys, and a row of verbs up
+                // here would be a toolbar, which is the thing this app got
+                // rid of. See the note over `BoardView::status_bar`.
                 .child(reach(view, "commands", Command::Palette, Icon::Commands, cx))
                 .child(reach(view, "find", Command::Search, Icon::Find, cx))
+                .child(reach(view, "inventory", Command::Inventory, Icon::Cards, cx))
+                .child(reach(view, "tour", Command::Tour, Icon::Tour, cx))
                 .child(reach(view, "settings", Command::Settings, Icon::Settings, cx)),
         )
         // The right-hand side: the update badge, then the window buttons where
@@ -385,16 +404,27 @@ fn reach(
 
 /// How wide the download's progress track is.
 ///
-/// Wide enough to visibly move on an ordinary release and no wider — this is
-/// the corner of a titlebar, not a download manager.
-const PROGRESS_TRACK: f32 = 64.0;
+/// Narrow on purpose. It stands where the dot stands in the two states either
+/// side of it, so the badge changes what it is saying without changing how
+/// much room it takes — see [`update_badge`]. This is the corner of a
+/// titlebar, not a download manager.
+const PROGRESS_TRACK: f32 = 34.0;
 
-/// What the bar says about an update, when there is one to speak of.
+/// What the bar says about an update.
 ///
-/// `None` almost always — see `BoardView::update_badge` — which is what makes
-/// the spot worth glancing at when it is not. The three states are the three
-/// sentences of the whole flow: *update available* (click to download), the
-/// bar filling, and *restart to update* (click to save, install and restart).
+/// `None` only on a build with no updater in it — see `BoardView::update_badge`.
+/// Otherwise it is always drawn, and the four states are one chip walking a
+/// stepper rather than four different pieces of chrome: *resting* (the version
+/// you are running; press to check), *available* (press to download), the bar
+/// filling, and *ready* (press to save, install and restart).
+///
+/// **Loudness is earned.** Resting has no border and no fill. The middle two
+/// have a wash and an edge. Only Ready fills, and it is also the only one
+/// whose words are a verb — which is the whole of why it is allowed to.
+///
+/// The dot and the progress track occupy the same slot, so the chip's width
+/// barely moves as it walks; a badge that jumped the window title sideways
+/// every few seconds during a download would be its own small emergency.
 ///
 /// Clicks land on [`BoardView::update_step`], the same door `Ctrl U` uses, so
 /// the badge cannot drift from what the key does: each is a face on the one
@@ -410,7 +440,7 @@ fn update_badge(view: &BoardView, cx: &mut Context<BoardView>) -> Option<gpui::A
         .gap(px(6.0))
         .px(px(9.0))
         .h(px(22.0))
-        .rounded_full()
+        .rounded(px(crate::theme::RADIUS_XS))
         .text_size(px(11.0))
         // Mouse-down and claimed, for the reason every button on this bar
         // gives: the bar starts a window move on press, and on Windows the
@@ -423,26 +453,50 @@ fn update_badge(view: &BoardView, cx: &mut Context<BoardView>) -> Option<gpui::A
             }),
         );
 
+    /// The mark that stands in the slot the progress track takes over.
+    fn dot(colour: gpui::Hsla) -> gpui::Div {
+        div().size(px(5.0)).rounded_full().bg(colour)
+    }
+
     Some(match badge {
+        UpdateBadge::Resting { version } => pill
+            .text_color(theme.tertiary)
+            // No border and no wash. It is the version, sitting there, and it
+            // has to be ignorable for a week without becoming invisible.
+            .hover(|s| s.text_color(theme.muted).bg(theme.text.opacity(0.06)))
+            .tooltip(tip(theme, format!("mbrd {version}"), "click to check for updates"))
+            .child(dot(theme.chrome_edge))
+            .child(format!("v{version}"))
+            .into_any_element(),
+
         UpdateBadge::Available { version } => pill
             .text_color(theme.accent_text)
             .bg(theme.accent.opacity(0.10))
+            .border_1()
+            .border_color(theme.accent.opacity(0.35))
             .hover(|s| s.bg(theme.accent.opacity(0.18)))
             .active(|s| s.bg(theme.accent.opacity(0.26)))
             .tooltip(tip(theme, format!("mbrd {version} is out"), "click to download"))
-            .child(div().size(px(6.0)).rounded_full().bg(theme.accent))
-            .child("update available")
+            // The version is the whole message. "update available" said the
+            // same thing in two words that the changed colour was already
+            // saying, and left out the one fact somebody wants: which one.
+            .child(dot(theme.accent))
+            .child(format!("v{version}"))
             .into_any_element(),
 
         UpdateBadge::Downloading { fraction } => pill
-            .text_color(theme.muted)
+            .text_color(theme.accent_text)
+            .bg(theme.accent.opacity(0.10))
+            .border_1()
+            .border_color(theme.accent.opacity(0.35))
             .tooltip(tip(theme, "downloading the update", ""))
             .child(
                 div()
                     .w(px(PROGRESS_TRACK))
                     .h(px(3.0))
                     .rounded_full()
-                    .bg(theme.text.opacity(0.15))
+                    .overflow_hidden()
+                    .bg(theme.accent.opacity(0.25))
                     .child(
                         div()
                             // Never fully empty: a hairline of accent from the
@@ -454,20 +508,31 @@ fn update_badge(view: &BoardView, cx: &mut Context<BoardView>) -> Option<gpui::A
                             .bg(theme.accent),
                     ),
             )
-            .child(format!("{:.0}%", fraction * 100.0))
+            .child(
+                div()
+                    .font(crate::opened::mono())
+                    .text_size(px(10.5))
+                    .child(format!("{:.0}%", fraction * 100.0)),
+            )
             .into_any_element(),
 
         UpdateBadge::Ready { version } => pill
-            .text_color(theme.accent_text)
-            .bg(theme.accent.opacity(0.14))
-            .hover(|s| s.bg(theme.accent.opacity(0.22)))
-            .active(|s| s.bg(theme.accent.opacity(0.30)))
+            // The only filled state in the whole titlebar, and the only one of
+            // these four with a verb in it. Both for the same reason: this is
+            // the step where there is a finished download sitting on the disk
+            // and one press between it and being the app you are running.
+            .text_color(theme.ground)
+            .bg(theme.accent)
+            .hover(|s| s.bg(theme.accent.opacity(0.88)))
+            .active(|s| s.bg(theme.accent.opacity(0.78)))
+            .font_weight(gpui::FontWeight::MEDIUM)
             .tooltip(tip(
                 theme,
                 format!("mbrd {version} is ready"),
                 "click to save, install and restart",
             ))
-            .child("restart to update")
+            .child(icon(Icon::Restart, crate::icons::ICON_SM, theme.ground))
+            .child("Restart to update")
             .into_any_element(),
     })
 }

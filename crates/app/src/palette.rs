@@ -24,6 +24,7 @@
 
 use gpui::{div, prelude::*, px, Context, FontWeight, Modifiers, MouseButton, ScrollHandle};
 use mbrd_core::model::{Item, ItemType};
+use mbrd_core::tags;
 
 use crate::board_view::BoardView;
 use crate::command::Command;
@@ -38,10 +39,14 @@ use crate::icons::{icon, Icon};
 /// does: a cap exists to stop the list being longer than the answer, and with
 /// scrolling the only real cost is rows nobody looks at.
 ///
-/// The command list is under a hundred entries and is capped by its own size,
-/// so an empty query offers the whole table — which is the point of it. A board
-/// is not bounded that way, hence a number here at all.
-const SHOWN: usize = 100;
+/// **It has to stay clear of `Command::all()`**, which is what
+/// `an_empty_query_offers_every_command_rather_than_the_first_screenful` holds
+/// it to: an empty query offers the whole table, and that is the point of it —
+/// it is how somebody finds a command they did not know the name of. The table
+/// passed a hundred entries when tags, the tour, the inventory and the shrink
+/// landed, which is why this is no longer the hundred it was. A board is not
+/// bounded that way, which is why there is a number here at all.
+const SHOWN: usize = 250;
 
 /// The longest a query may be.
 ///
@@ -71,13 +76,27 @@ pub(crate) const HEADER_PAD_Y: f32 = 7.0;
 /// which is why this cuts the end rather than the middle.
 const TITLE_MAX: usize = 64;
 
-/// Which of the two lists is open.
+/// Which list is open.
+///
+/// Four now rather than the two the module note describes, and the last two
+/// are the reason tags have no text field anywhere in this app. A tag is a word
+/// you pick off a list far more often than one you invent — the second and
+/// third tag anybody puts on a board are almost always tags already on it — and
+/// this is already the surface for "type a few letters, choose from what
+/// matches". So the list is the tags, and typing a name nothing matches offers
+/// to make it. See [`Palette::coined`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Everything the app can be asked to do.
     Commands,
     /// Everything on the board.
     Search,
+    /// Every tag on the board, ticked against what is selected. Choosing one
+    /// puts it on the selection or takes it off.
+    Tag,
+    /// Every tag on the board, ticked against what is being filtered by.
+    /// Choosing one adds it to the filter or takes it out.
+    Filter,
 }
 
 impl Mode {
@@ -88,6 +107,11 @@ impl Mode {
         match self {
             Self::Commands => "what do you want to do\u{2026}",
             Self::Search => "find something on the board\u{2026}",
+            // The one placeholder here that teaches rather than prompts. The
+            // separator is the single thing about tags worth knowing, and this
+            // is where somebody is standing when it matters.
+            Self::Tag => "tag it, or type a new one\u{2026}",
+            Self::Filter => "show only what is tagged\u{2026}",
         }
     }
 
@@ -95,6 +119,11 @@ impl Mode {
         match self {
             Self::Commands => "no command by that name",
             Self::Search => "nothing on this board by that name",
+            // Never seen with anything typed — a query that matches no tag
+            // becomes the offer to make one, so this only stands on a board
+            // that has no tags at all and nothing typed yet.
+            Self::Tag => "no tags yet — type one",
+            Self::Filter => "nothing on this board is tagged",
         }
     }
 
@@ -106,6 +135,28 @@ impl Mode {
         match self {
             Self::Commands => "commands",
             Self::Search => "on this board",
+            Self::Tag => "tags",
+            Self::Filter => "showing",
+        }
+    }
+}
+
+impl Mode {
+    /// What the number at the right of the header counts.
+    ///
+    /// The chip on the left says which list this is; this says how big the
+    /// haystack is, which is the other half of "am I looking in the right
+    /// place". `None` for the command list, where the answer is always the
+    /// same number and therefore tells nobody anything.
+    fn tally(self, view: &BoardView, rows: usize) -> Option<String> {
+        match self {
+            Self::Commands => None,
+            Self::Search => Some(format!("{} on this board", rows)),
+            // What the choice will land on, not what the list holds: a tag
+            // row is an instruction aimed at the selection, and the size of
+            // the selection is the fact that changes what pressing it does.
+            Self::Tag => Some(cards(view.selection.len()) + " selected"),
+            Self::Filter => Some(format!("{} tagged", rows)),
         }
     }
 }
@@ -127,6 +178,16 @@ pub enum What {
     Does(Command),
     /// Somewhere to go, named by the item's id.
     Goes { id: String, title: String, kind: &'static str, mark: Icon },
+    /// A tag to put on the selection, or take off it.
+    ///
+    /// `on` is ticked only when **everything** taggable in the selection
+    /// carries it, which is what makes the tick mean "true of this selection"
+    /// rather than "true of one of them". A partly-tagged selection therefore
+    /// shows unticked, and choosing the row tags the rest — which is the way
+    /// round somebody means it.
+    Marks { tag: String, count: usize, on: bool, coined: bool },
+    /// A tag to add to the filter, or take out of it.
+    Filters { tag: String, count: usize, on: bool },
 }
 
 /// One candidate, with the text it is matched against already folded.
@@ -138,6 +199,18 @@ pub enum What {
 pub struct Row {
     pub what: What,
     hay: String,
+}
+
+impl Row {
+    /// Whether this row is the tag named. Answers `false` for every row that
+    /// is not a tag at all, which is what lets [`Palette::recoin`] ask the
+    /// question without caring which list it is looking at.
+    fn names(&self, tag: &str) -> bool {
+        match &self.what {
+            What::Marks { tag: t, .. } | What::Filters { tag: t, .. } => t == tag,
+            _ => false,
+        }
+    }
 }
 
 /// An open palette: which list, what has been typed, and where the highlight is.
@@ -161,6 +234,15 @@ pub struct Palette {
     /// scroll position the next keystroke moves.
     pub scroll: ScrollHandle,
     rows: Vec<Row>,
+    /// The offer to make a tag that does not exist yet, from whatever is in
+    /// the query. `None` in every mode but [`Mode::Tag`], and `None` there
+    /// whenever the query is empty or already names a tag the board has.
+    ///
+    /// Kept beside `rows` rather than in it because it is derived from the
+    /// *query*, and `rows` is the list the query is scored against — a
+    /// candidate that changed with every keystroke would have to be scored
+    /// against itself.
+    coined: Option<Row>,
     /// The rows the query currently earns, best first, already cut to
     /// [`SHOWN`]. Scored when the query *changes* rather than when a frame
     /// draws: painting is per-frame and typing is not, and fuzzy-scoring
@@ -175,48 +257,54 @@ impl Palette {
     /// the keyboard, so re-deriving the list per keystroke would be the same
     /// answer computed again.
     pub fn open(mode: Mode, view: &BoardView) -> Self {
-        let rows = match mode {
-            Mode::Commands => Command::all()
-                .into_iter()
-                .map(|command| Row {
-                    // The label and whatever else somebody might call it. See
-                    // `Command::keywords`, which exists because the board
-                    // switcher is named "Open board…" and gets hunted for as
-                    // "project".
-                    hay: format!("{} {}", command.label().to_lowercase(), command.keywords()),
-                    what: What::Does(command),
-                })
-                .collect(),
-            Mode::Search => view
-                .doc
-                .board
-                .items
-                .iter()
-                .filter(|item| item.kind.is_content())
-                .map(row_for)
-                .collect(),
-        };
         let mut open = Self {
             mode,
             query: Editor::new("", QUERY_MAX, false),
             cursor: 0,
             scroll: ScrollHandle::new(),
-            rows,
+            rows: rows_for(mode, view),
+            coined: None,
             found: Vec::new(),
         };
         open.rescore();
         open
     }
 
+    /// Take a fresh list, keeping the query and the highlight where they are.
+    ///
+    /// The tag lists are the only ones that need this, and they need it for a
+    /// reason the other two do not have: choosing a row **changes the board**
+    /// and the palette stays open, so the ticks it is drawing are about a
+    /// board one step older than the one on screen. Rows come in from outside
+    /// rather than being re-derived here because the caller is the view, and
+    /// the view cannot lend itself out while its own overlay is borrowed.
+    pub fn refill(&mut self, rows: Vec<Row>) {
+        self.rows = rows;
+        // The highlight is *not* reset. Somebody ticking three tags in a row
+        // is aiming at the same place each time, and a list that jumped back
+        // to the top under them would make the second tick land on the wrong
+        // one.
+        self.rescore();
+        self.cursor = self.cursor.min(self.matches().len().saturating_sub(1));
+    }
+
     /// The rows worth showing, best first. Reads the list [`rescore`] left;
     /// see `found` for why the scoring does not happen here.
+    ///
+    /// The coined row, where there is one, is always first: it is the answer
+    /// to what was just typed, and the rows under it are the ones that merely
+    /// resemble it.
     pub fn matches(&self) -> Vec<&Row> {
-        self.found.iter().map(|&i| &self.rows[i]).collect()
+        let mut out = Vec::with_capacity(self.found.len() + 1);
+        out.extend(self.coined.as_ref());
+        out.extend(self.found.iter().map(|&i| &self.rows[i]));
+        out
     }
 
     /// Score the rows against the query. Called wherever the query can change,
     /// which is `open`, `key` and `insert` — and nowhere per frame.
     fn rescore(&mut self) {
+        self.recoin();
         if self.query.text().is_empty() {
             self.found = (0..self.rows.len().min(SHOWN)).collect();
             return;
@@ -307,6 +395,28 @@ impl Palette {
         Reply::Held
     }
 
+    /// Work out whether what has been typed names a tag that does not exist
+    /// yet, and offer to make it if so. See [`Self::coined`].
+    ///
+    /// Cleaned rather than taken literally, so the row offers the tag that
+    /// would actually be stored — somebody typing "Warm Greys!" is shown "warm
+    /// greys", which is what they will get and what they will see in the list
+    /// next time.
+    fn recoin(&mut self) {
+        self.coined = None;
+        if self.mode != Mode::Tag {
+            return;
+        }
+        let tag = mbrd_core::tags::clean(self.query.text());
+        if tag.is_empty() || self.rows.iter().any(|row| row.names(&tag)) {
+            return;
+        }
+        self.coined = Some(Row {
+            hay: tag.clone(),
+            what: What::Marks { tag, count: 0, on: false, coined: true },
+        });
+    }
+
     /// Put text into the query, at the caret. For a paste.
     pub fn insert(&mut self, text: &str) {
         self.query.insert(text);
@@ -337,6 +447,65 @@ pub enum Reply {
     Paste,
 }
 
+/// Everything a mode lists, gathered off the board.
+///
+/// Free-standing rather than a method, because it is called twice from two
+/// sides: once by [`Palette::open`], which has the view and no palette, and
+/// once by the view after a tag has been ticked, which has the view and cannot
+/// lend it to the palette it is holding. See [`Palette::refill`].
+pub fn rows_for(mode: Mode, view: &BoardView) -> Vec<Row> {
+    let items = &view.doc.board.items;
+    match mode {
+        Mode::Commands => Command::all()
+            .into_iter()
+            .map(|command| Row {
+                // The label and whatever else somebody might call it. See
+                // `Command::keywords`, which exists because the board switcher
+                // is named "Open board…" and gets hunted for as "project".
+                hay: format!("{} {}", command.label().to_lowercase(), command.keywords()),
+                what: What::Does(command),
+            })
+            .collect(),
+        Mode::Search => items.iter().filter(|item| item.kind.is_content()).map(row_for).collect(),
+        Mode::Tag => {
+            // What the tick means: carried by *everything* taggable that is
+            // selected. See `What::Marks`.
+            let selected: Vec<&Item> = items
+                .iter()
+                .filter(|item| view.selection.contains(&item.id) && tags::taggable(item))
+                .collect();
+            tags::census(items)
+                .into_iter()
+                .map(|(tag, count)| Row {
+                    hay: tag.clone(),
+                    what: What::Marks {
+                        on: !selected.is_empty()
+                            && selected.iter().all(|item| tags::of(item).contains(&tag)),
+                        tag,
+                        count,
+                        coined: false,
+                    },
+                })
+                .collect()
+        }
+        Mode::Filter => tags::census(items)
+            .into_iter()
+            .map(|(tag, count)| Row {
+                hay: tag.clone(),
+                what: What::Filters { on: view.tag_filter.contains(&tag), tag, count },
+            })
+            .collect(),
+    }
+}
+
+/// How many cards wear a tag, spelled for the right-hand side of a row.
+fn cards(count: usize) -> String {
+    match count {
+        1 => "1 card".into(),
+        n => format!("{n} cards"),
+    }
+}
+
 /// One item, as a row.
 ///
 /// The title is what somebody would recognise the card by, which is not always
@@ -359,6 +528,12 @@ fn row_for(item: &Item) -> Row {
     for extra in [item.note_text(), item.url()].into_iter().flatten() {
         hay.push(' ');
         hay.push_str(&extra.to_lowercase());
+    }
+    // And its tags, which are the one part of a card somebody chose *in order
+    // to find it again*. Already lower case — see `mbrd_core::tags::clean`.
+    for tag in tags::of(item) {
+        hay.push(' ');
+        hay.push_str(&tag);
     }
     hay.push(' ');
     hay.push_str(kind);
@@ -505,6 +680,11 @@ pub fn render(
     let matches = palette.matches();
     palette.scroll.scroll_to_item(palette.cursor);
 
+    // Whether the footer has a second sentence to say. Collected as the rows
+    // are built rather than asked again afterwards: `Command::available` is
+    // the answer to a question about the whole board, and asking it twice per
+    // row per frame is twice the work for a fact already in hand.
+    let mut dimmed = false;
     let rows: Vec<_> = matches
         .iter()
         .enumerate()
@@ -514,20 +694,55 @@ pub fn render(
             // menu does with the same answer. See `What::Does`.
             let live = match &row.what {
                 What::Does(command) => command.available(view),
-                What::Goes { .. } => true,
+                What::Goes { .. } | What::Marks { .. } | What::Filters { .. } => true,
             };
+            dimmed |= !live;
             let (title, aside) = match &row.what {
                 What::Does(command) => (command.label().to_string(), command.hint().to_string()),
                 What::Goes { title, kind, .. } => (title.clone(), kind.to_string()),
+                // A tag that does not exist yet says so instead of saying how
+                // many cards wear it, which for a new one is always none —
+                // and "0 cards" beside a name reads as a tag that failed
+                // rather than one about to be made.
+                What::Marks { tag, coined: true, .. } => (tag.clone(), "new tag".into()),
+                What::Marks { tag, count, .. } | What::Filters { tag, count, .. } => {
+                    (tag.clone(), cards(*count))
+                }
             };
             // A setting that is on says so, so the row reads as a choice
             // already made rather than as an instruction; and a card says what
             // kind of card it is, which is the same question one step over.
             let leading = match &row.what {
-                What::Does(command) => {
-                    (command.ticked(view) == Some(true)).then_some((Icon::Check, theme.accent))
-                }
+                // Ticked where it names a state, and otherwise the picture the
+                // same command wears on a menu — one table, so the two lists
+                // cannot end up drawing the same command two different ways.
+                // See `Command::mark`.
+                What::Does(command) => Some(match command.ticked(view) == Some(true) {
+                    true => (Icon::Check, theme.accent),
+                    false => (
+                        command.mark(),
+                        match command {
+                            // The swatch, in the colour it stands for. The
+                            // menu draws these as a bare square of colour —
+                            // see `menu::row` — and this is the nearest a list
+                            // of icons in one gutter can get to the same
+                            // thing.
+                            Command::ConnColour(colour) => theme.rope_for(*colour),
+                            c if c.destructive() => theme.rope_danger,
+                            _ => theme.muted,
+                        },
+                    ),
+                }),
                 What::Goes { mark, .. } => Some((*mark, theme.muted)),
+                // Ticked exactly the way a setting is, and for the same
+                // reason: the list is a state to read as much as a set of
+                // instructions to follow. A tag being coined has nothing to
+                // tick — it is not on anything yet — and gets the mark every
+                // other tag row wears so the column does not go ragged.
+                What::Marks { on, .. } | What::Filters { on, .. } => Some(match on {
+                    true => (Icon::Check, theme.accent),
+                    false => (Icon::Tag, theme.muted),
+                }),
             };
             let what = row.what.clone();
             div()
@@ -691,7 +906,21 @@ pub fn render(
                             14.0,
                             true,
                             &theme,
-                        ))),
+                        )))
+                        // How big the haystack is, set in the numeric face so
+                        // it holds still as the query narrows it — the same
+                        // argument the status bar's readings make. See
+                        // [`Mode::tally`].
+                        .when_some(palette.mode.tally(view, matches.len()), |d, tally| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .font(crate::opened::mono())
+                                    .text_size(px(10.5))
+                                    .text_color(theme.tertiary)
+                                    .child(tally),
+                            )
+                        }),
                 )
                 .child(
                     div()
@@ -723,13 +952,40 @@ pub fn render(
                 // `switcher.rs` follows in its own footer.
                 .child(
                     div()
+                        .flex()
+                        .items_center()
+                        .gap(px(14.0))
                         .px(px(14.0))
                         .py(px(7.0))
                         .border_t_1()
                         .border_color(theme.chrome_edge)
                         .text_size(px(10.0))
                         .text_color(theme.muted)
-                        .child("\u{2191}\u{2193} move · enter run · esc close"),
+                        // Said only while there is a dimmed row on the screen
+                        // to be confused by. Dimming rather than hiding is a
+                        // deliberate choice — see `What::Does` — and the whole
+                        // of what it buys is that the row is *findable* when
+                        // it cannot run; a reader who has just found one and
+                        // pressed it needs the reason in the same glance, and
+                        // a reader who has not should not be told about a
+                        // state the list is not in.
+                        .when(dimmed, |d| {
+                            d.child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child("Dimmed rows exist but can't run right now"),
+                            )
+                        })
+                        .when(!dimmed, |d| d.child(div().flex_1()))
+                        .child(
+                            div()
+                                .flex_none()
+                                .font(crate::opened::mono())
+                                .text_size(px(10.0))
+                                .child("\u{2191}\u{2193} move · \u{23ce} run · esc close"),
+                        ),
                 ),
         )
 }
@@ -751,6 +1007,7 @@ mod tests {
             cursor: 0,
             scroll: ScrollHandle::new(),
             rows,
+            coined: None,
             found: Vec::new(),
         };
         p.rescore();
@@ -763,8 +1020,47 @@ mod tests {
             .map(|row| match &row.what {
                 What::Does(command) => command.label().to_string(),
                 What::Goes { title, .. } => title.clone(),
+                What::Marks { tag, .. } | What::Filters { tag, .. } => tag.clone(),
             })
             .collect()
+    }
+
+    /// Typing a tag the board does not have offers to make it, and the offer
+    /// is the first row — it is the answer to what was just typed, and
+    /// everything under it merely resembles it.
+    #[test]
+    fn a_tag_the_board_does_not_have_is_offered_rather_than_refused() {
+        let mut p = palette(vec![Row {
+            hay: "kitchen".into(),
+            what: What::Marks { tag: "kitchen".into(), count: 2, on: false, coined: false },
+        }]);
+        p.mode = Mode::Tag;
+        p.insert("kit");
+        assert_eq!(titles(&p), ["kit", "kitchen"], "the offer first, the near miss under it");
+
+        // And once it names one that exists, there is nothing to coin: the
+        // row already there is the answer.
+        p.insert("chen");
+        assert_eq!(titles(&p), ["kitchen"]);
+    }
+
+    /// What would be stored, not what was typed. Somebody who types "Warm
+    /// Greys!" is shown the tag they will actually get.
+    #[test]
+    fn the_offer_names_the_tag_that_would_be_stored() {
+        let mut p = palette(Vec::new());
+        p.mode = Mode::Tag;
+        p.insert("Warm Greys!");
+        assert_eq!(titles(&p), ["warm greys"]);
+    }
+
+    /// Nothing is coined anywhere else, or the command list would grow a row
+    /// for every letter typed at it.
+    #[test]
+    fn only_the_tag_list_offers_to_make_something_up() {
+        let mut p = palette(Vec::new());
+        p.insert("kitchen");
+        assert!(titles(&p).is_empty());
     }
 
     #[test]
@@ -838,6 +1134,7 @@ mod tests {
             cursor: 0,
             scroll: ScrollHandle::new(),
             rows,
+            coined: None,
             found: Vec::new(),
         };
         p.rescore();
@@ -865,6 +1162,7 @@ mod tests {
             cursor: 0,
             scroll: ScrollHandle::new(),
             rows,
+            coined: None,
             found: Vec::new(),
         };
         // A command with no key at all, reachable here and nowhere else by
@@ -887,6 +1185,7 @@ mod tests {
             cursor: 0,
             scroll: ScrollHandle::new(),
             rows,
+            coined: None,
             found: Vec::new(),
         };
         p.rescore();

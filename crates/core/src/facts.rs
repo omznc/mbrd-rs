@@ -62,6 +62,14 @@ pub fn of(item: &Item, asset: Option<&Asset>) -> Vec<Fact> {
     if let Some(url) = item.url() {
         out.push(Fact::said("Address", url.to_string()));
     }
+    // Beside the name rather than at the bottom with the measurements: a tag
+    // is something somebody *said* about the card, which is the same kind of
+    // fact as what it is called and a different kind from how many pixels it
+    // is. Absent when there are none, like every other row here.
+    let tags = crate::tags::of(item);
+    if !tags.is_empty() {
+        out.push(Fact::said("Tags", tags.join(", ")));
+    }
     if item.kind == ItemType::Swatch {
         let hex = item.meta.get("hex").and_then(serde_json::Value::as_str).unwrap_or(&item.name);
         out.push(Fact::counted("Hex", hex.to_uppercase()));

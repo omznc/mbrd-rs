@@ -358,8 +358,21 @@ impl Theme {
     }
 }
 
-/// How many tints a note cycles through. The format's number, not this app's.
+/// How many tints the `T` key cycles through.
+///
+/// The format's number, not this app's — `meta.tint` on a note is 1 to 4
+/// everywhere else that reads these files, and the key that walks the list
+/// stays inside that so a board tinted with the keyboard is a board any build
+/// draws the same. The picker offers [`SHADE_COUNT`]; see [`Theme::shade`].
 pub const NOTE_TINT_COUNT: u32 = 4;
+
+/// How many colours the picker offers, the pad's own four included.
+///
+/// Sixteen because it is the largest number that still reads as *a set of
+/// colours* in one glance rather than as a gradient somebody has to scan —
+/// two rows of eight, and every one of them distinguishable from its
+/// neighbours at the size of a card's corner.
+pub const SHADE_COUNT: u32 = 16;
 
 /// A theme file's `style` object, laid over a palette that is already whole.
 ///
@@ -528,8 +541,12 @@ impl Theme {
                 .and_then(serde_json::Value::as_str)
                 .and_then(from_hex)
                 .unwrap_or(self.swatch_fallback),
-            T::Note | T::Text | T::Sticker => match tint_of(item) {
-                Some(n) => self.note_tint(n),
+            // A fence takes a tint like anything else now. A group is the one
+            // thing on a board that stands for a batch of work rather than a
+            // file, so being able to colour it — "these are the rejects" — is
+            // worth more than it is on any single card.
+            T::Note | T::Text | T::Sticker | T::Fence => match tint_of(item) {
+                Some(n) => self.shade(n),
                 None => self.card_for(&item.kind),
             },
             _ => self.card_for(&item.kind),
@@ -557,14 +574,57 @@ impl Theme {
         }
     }
 
-    /// One of the four colours off the note pad, numbered from one.
+    /// One of the colours a card can be tinted, numbered from one.
     ///
-    /// The original's `--note-1..4`. Out of range wraps rather than falling
-    /// back, so a sticker's 1–8 lands on *some* colour here instead of on the
-    /// plain card — this build draws no sticker shapes, and a tinted rectangle
-    /// is a better placeholder than an untinted one.
-    pub fn note_tint(&self, n: u32) -> Hsla {
-        self.notes[(n.max(1) as usize - 1) % self.notes.len()]
+    /// **The first four are the theme's own note pad and nothing else.** They
+    /// are the original's `--note-1..4`, which is what `meta.tint` means in
+    /// the file format, so a board tinted 1–4 here is a board any build draws
+    /// identically. That compatibility is worth more than a tidy wheel, and it
+    /// is why the four are not regenerated to sit evenly among the twelve.
+    ///
+    /// The other twelve are *derived from the theme rather than written into
+    /// it*: a full turn of hue at the saturation and lightness the pad already
+    /// uses. A dark theme's twelve come out dark and muted and a light theme's
+    /// come out pale, without either theme file having to name a single one of
+    /// them — which is the whole point, since a theme is a short hand-written
+    /// file and twelve more keys in it would be twelve more ways to get a
+    /// board that draws wrong.
+    ///
+    /// A build that has never heard of a number wraps rather than falling back
+    /// to the plain card: a sticker's 1–8 and this build's 1–16 both land on
+    /// *some* colour, and a tinted rectangle is a better answer than an
+    /// untinted one.
+    pub fn shade(&self, n: u32) -> Hsla {
+        let at = (n.max(1) as usize - 1) % SHADE_COUNT as usize;
+        if let Some(pad) = self.notes.get(at) {
+            return *pad;
+        }
+        // Where on the wheel, and how far round. Half a step off the first pad
+        // colour so a generated shade never lands exactly on top of it.
+        let made = at - self.notes.len();
+        let of = SHADE_COUNT as usize - self.notes.len();
+        let turn = (made as f32 + 0.5) / of as f32;
+        let (s, l) = self.pad_weight();
+        Hsla { h: (self.notes[0].h + turn).fract(), s, l, a: 1.0 }
+    }
+
+    /// The saturation and lightness the theme's own note pad is mixed at.
+    ///
+    /// The mean of the four, which is what makes the generated twelve belong
+    /// to the same theme as them rather than merely sitting beside them.
+    fn pad_weight(&self) -> (f32, f32) {
+        let n = self.notes.len() as f32;
+        let s = self.notes.iter().map(|c| c.s).sum::<f32>() / n;
+        let l = self.notes.iter().map(|c| c.l).sum::<f32>() / n;
+        (s, l)
+    }
+
+    /// Every colour the picker offers, in the order it draws them.
+    ///
+    /// Built here rather than in the picker so that what a swatch shows and
+    /// what pressing it sets can only ever be the same list.
+    pub fn shades(&self) -> Vec<Hsla> {
+        (1..=SHADE_COUNT).map(|n| self.shade(n)).collect()
     }
 
     /// The tint for a card of this type.
@@ -668,24 +728,79 @@ mod tests {
     }
 
     #[test]
+    fn the_first_four_shades_are_the_formats_own_note_pad() {
+        // Load-bearing: `meta.tint` 1 to 4 means these four colours in every
+        // build that reads this format, and a board tinted with the `T` key
+        // must draw identically wherever it is opened.
+        let theme = Theme::default();
+        for (at, pad) in theme.notes.iter().enumerate() {
+            assert_eq!(theme.shade(at as u32 + 1), *pad);
+        }
+    }
+
+    #[test]
+    fn the_other_twelve_are_a_turn_of_hue_at_the_pads_own_weight() {
+        let theme = Theme::default();
+        let (s, l) = theme.pad_weight();
+        let made: Vec<Hsla> = (5..=SHADE_COUNT).map(|n| theme.shade(n)).collect();
+        assert_eq!(made.len(), 12);
+        for colour in &made {
+            assert!((colour.s - s).abs() < 1e-6, "off the pad's saturation");
+            assert!((colour.l - l).abs() < 1e-6, "off the pad's lightness");
+        }
+        // Evenly spaced, and all the way round: consecutive hues differ by a
+        // twelfth of a turn, wrapping included.
+        for pair in made.windows(2) {
+            let step = (pair[1].h - pair[0].h + 1.0).fract();
+            assert!((step - 1.0 / 12.0).abs() < 1e-5, "uneven at {step}");
+        }
+    }
+
+    #[test]
+    fn a_light_theme_generates_light_shades_and_a_dark_one_dark() {
+        // The whole reason these are derived rather than written down: the
+        // twelve belong to whichever theme is being worn, with nothing in the
+        // theme file having to say so.
+        let (_, dark) = Theme::dark().pad_weight();
+        let (_, light) = Theme::light().pad_weight();
+        assert!(dark < 0.5, "the dark pad is dark");
+        assert!(light > 0.5, "the light pad is not");
+        assert!(Theme::dark().shade(9).l < Theme::light().shade(9).l);
+    }
+
+    #[test]
+    fn every_shade_the_picker_offers_is_one_the_number_sets() {
+        // A swatch that showed one colour and set another would be the one
+        // bug this control cannot survive.
+        let theme = Theme::default();
+        let offered = theme.shades();
+        assert_eq!(offered.len(), SHADE_COUNT as usize);
+        for (at, colour) in offered.iter().enumerate() {
+            assert_eq!(*colour, theme.shade(at as u32 + 1));
+        }
+    }
+
+    #[test]
     fn a_note_wears_the_tint_it_was_torn_off_with() {
         let theme = Theme::default();
         let mut note = Item::new("n", ItemType::Note);
         assert_eq!(theme.colour_of(&note), theme.note, "no tint means the plain pad");
         for n in 1..=NOTE_TINT_COUNT {
             note.meta.insert("tint".into(), serde_json::json!(n));
-            assert_eq!(theme.colour_of(&note), theme.note_tint(n));
+            assert_eq!(theme.colour_of(&note), theme.shade(n));
         }
     }
 
     #[test]
     fn a_tint_from_a_build_with_more_of_them_still_lands_on_a_colour() {
-        // A sticker's range is 1 to 8 and this build has four notes' worth, so
-        // the number wraps rather than falling back to an untinted card.
+        // Sixteen here, so a sticker's 1 to 8 is inside the range and a number
+        // past it wraps rather than falling back to an untinted card.
         let theme = Theme::default();
         let mut sticker = Item::new("s", ItemType::Sticker);
         sticker.meta.insert("tint".into(), serde_json::json!(7));
-        assert_eq!(theme.colour_of(&sticker), theme.note_tint(3));
+        assert_eq!(theme.colour_of(&sticker), theme.shade(7));
+        sticker.meta.insert("tint".into(), serde_json::json!(SHADE_COUNT + 3));
+        assert_eq!(theme.colour_of(&sticker), theme.shade(3), "it wrapped");
         // And nonsense falls back rather than panicking on an index.
         sticker.meta.insert("tint".into(), serde_json::json!(0));
         assert_eq!(theme.colour_of(&sticker), theme.card_for(&ItemType::Sticker));

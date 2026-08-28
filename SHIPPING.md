@@ -71,6 +71,31 @@ actually missing.
 So "standalone builds" is mostly a Linux job, and "installers" is mostly a
 Windows and Linux job.
 
+### The media stack follows the same rule, and it is the reason it is native
+
+Every platform plays, and no platform ships a decoder. `main.rs` picks the
+backend by target — GStreamer on Linux, AVFoundation on macOS, the Media
+Foundation Media Engine on Windows — and each one is the media stack that
+machine already has.
+
+That was chosen against the alternative, which was GStreamer everywhere. It
+would have been one file instead of three, and it would have cost exactly what
+this document is about: roughly 100 MB of MSVC DLLs beside the `.exe`, which
+the installer could carry and the *portable single file* could not, so the two
+Windows artifacts would have stopped being the same program; and
+`GStreamer.framework` inside `mbrd.app/Contents/Frameworks` with an
+`install_name_tool` pass and a real signature, which the ad-hoc `codesign` the
+release does today would not survive.
+
+Two more backends is more code to be wrong in, and it buys back a
+single-file Windows build, an unchanged `.app`, and nothing new to install on
+either. `Stack` is the whole door and all three fit through it; `spill.rs` is
+the part they share.
+
+So the packaging cost lands on Linux alone — build-time `-dev` packages,
+runtime deps on the `.deb` and `.rpm`, and `linuxdeploy-plugin-gstreamer` for
+the AppImage — which is the same shape as everything else on this page.
+
 ---
 
 ## The artifact matrix

@@ -436,14 +436,40 @@ fn edge(ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32) -> f32 {
     (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
 }
 
-/// A mesh's vertices, rotated into the fixed view, and the low and high
-/// corner of the box that bounds them on screen.
-type Bounds = (Vec<[f32; 3]>, [f32; 2], [f32; 2]);
+/// A mesh's vertices rotated into a camera's view, and the box that bounds
+/// them on screen — the one pass over the vertex buffer that both [`aspect`]
+/// and [`rasterize_view`] need.
+///
+/// Handed back as a value rather than recomputed because drawing a mesh asks
+/// for the same rotation three times over otherwise: once to fit a canvas to
+/// the silhouette, and once more inside each tier that is then drawn on it.
+/// At a couple of hundred thousand vertices that is two whole passes and two
+/// allocations spent to arrive back at a `Vec` that was already in hand —
+/// which is affordable once for a still, and is not affordable per frame of a
+/// drag that is turning the camera.
+pub struct View {
+    /// Every vertex of the mesh, rotated, under the same indices the mesh's
+    /// own triangles already carry — so a triangle finds its corners here
+    /// exactly as it would in `mesh.vertices`.
+    rotated: Vec<[f32; 3]>,
+    min: [f32; 2],
+    max: [f32; 2],
+}
 
-/// The rotated vertices, and how far apart the furthest two are on each
-/// screen axis — the one pass over the mesh both [`aspect`] and [`rasterize`]
-/// need, done once rather than twice.
-fn rotated_bounds(mesh: &Mesh, yaw: f32, pitch: f32) -> Option<Bounds> {
+impl View {
+    /// How wide and how tall the silhouette is from here, in the mesh's own
+    /// units. [`aspect`] is this and nothing else.
+    pub fn aspect(&self) -> (f32, f32) {
+        (self.max[0] - self.min[0], self.max[1] - self.min[1])
+    }
+}
+
+/// A mesh rotated to `yaw`/`pitch` degrees, ready to be measured or drawn.
+///
+/// `None` for exactly the meshes [`rasterize`] declines — no triangles, more
+/// than [`TRIANGLE_MAX`] of them, or one so flat every vertex projects to the
+/// same point.
+pub fn view(mesh: &Mesh, yaw: f32, pitch: f32) -> Option<View> {
     if mesh.triangles.is_empty() || mesh.triangles.len() > TRIANGLE_MAX {
         return None;
     }
@@ -459,7 +485,7 @@ fn rotated_bounds(mesh: &Mesh, yaw: f32, pitch: f32) -> Option<Bounds> {
     if max[0] - min[0] <= 1e-6 && max[1] - min[1] <= 1e-6 {
         return None;
     }
-    Some((rotated, min, max))
+    Some(View { rotated, min, max })
 }
 
 /// How wide and how tall this mesh's silhouette is at this `yaw`/`pitch`, in
@@ -467,9 +493,12 @@ fn rotated_bounds(mesh: &Mesh, yaw: f32, pitch: f32) -> Option<Bounds> {
 /// [`rasterize`], the same way an SVG's own `viewBox` decides a canvas shape
 /// before `resvg::render` is asked to fill it. `None` for exactly the meshes
 /// [`rasterize`] would also decline.
+///
+/// A caller that is about to *draw* as well as measure wants [`view`] and to
+/// keep what it hands back: this throws the rotated vertices away, and they
+/// are the expensive half.
 pub fn aspect(mesh: &Mesh, yaw: f32, pitch: f32) -> Option<(f32, f32)> {
-    let (_, min, max) = rotated_bounds(mesh, yaw, pitch)?;
-    Some((max[0] - min[0], max[1] - min[1]))
+    Some(view(mesh, yaw, pitch)?.aspect())
 }
 
 /// A mesh, flat-shaded onto a `width` × `height` canvas, viewed from `yaw`/
@@ -481,10 +510,14 @@ pub fn aspect(mesh: &Mesh, yaw: f32, pitch: f32) -> Option<(f32, f32)> {
 /// to the same point — the same "say nothing rather than lie" choice
 /// `crate::preview` makes for a picture that will not open.
 ///
-/// Rendered at twice the asked-for resolution and boxed back down — see
-/// [`downsample`] — because a single sample per pixel draws a silhouette
-/// edge as a hard, aliased step, which reads as "pixelated" the moment a
-/// mesh card is any size worth looking at.
+/// Rendered at [`ANTIALIAS`] times the asked-for resolution and boxed back
+/// down — see [`downsample`] — because a single sample per pixel draws a
+/// silhouette edge as a hard, aliased step, which reads as "pixelated" the
+/// moment a mesh card is any size worth looking at.
+///
+/// Rotates the mesh itself, so a caller drawing the same camera more than
+/// once — two tiers of one picture, say — wants [`view`] and
+/// [`rasterize_view`], which let that pass be paid for once.
 #[allow(clippy::too_many_arguments)]
 pub fn rasterize(
     mesh: &Mesh,
@@ -496,29 +529,67 @@ pub fn rasterize(
     pan_x: f32,
     pan_y: f32,
 ) -> Option<Raster> {
-    if width == 0 || height == 0 {
-        return None;
-    }
-    const SS: u32 = 2;
-    let hi = raw_rasterize(mesh, width * SS, height * SS, yaw, pitch, zoom, pan_x, pan_y)?;
-    Some(downsample(&hi, width, height, SS))
+    let view = view(mesh, yaw, pitch)?;
+    rasterize_view(&view, mesh, width, height, zoom, pan_x, pan_y, ANTIALIAS)
 }
 
-/// [`rasterize`]'s own math, at whatever resolution it is asked to run at —
-/// split out so the antialiasing wrapper can render this twice as large on
-/// each axis without duplicating the projection or the raster loop.
+/// How many samples per pixel on each axis [`rasterize`] renders at. See
+/// [`rasterize_view`], which takes it as an argument instead.
+pub const ANTIALIAS: u32 = 2;
+
+/// [`rasterize`] against a [`View`] that has already been paid for, at a
+/// chosen supersampling factor.
+///
+/// `ss` is what [`rasterize`] fixes at [`ANTIALIAS`]: the canvas is drawn
+/// `ss` times larger on each axis and boxed back down, so `2` costs four
+/// times the pixels of `1` and buys a soft silhouette edge instead of a hard
+/// step. A mesh being turned under the pointer is worth `1` — an edge on a
+/// moving object is not read, and the still that lands when the drag ends is
+/// drawn at [`ANTIALIAS`] regardless. `0` is taken as `1`.
+///
+/// `None` if `view` was not built from `mesh`, which would otherwise index a
+/// vertex that is not there: the same "say nothing rather than lie" answer
+/// the rest of this module gives, rather than a panic on a mismatch a caller
+/// holding two meshes can make.
 #[allow(clippy::too_many_arguments)]
-fn raw_rasterize(
+pub fn rasterize_view(
+    view: &View,
     mesh: &Mesh,
     width: u32,
     height: u32,
-    yaw: f32,
-    pitch: f32,
     zoom: f32,
     pan_x: f32,
     pan_y: f32,
+    ss: u32,
 ) -> Option<Raster> {
-    let (rotated, min, max) = rotated_bounds(mesh, yaw, pitch)?;
+    if width == 0 || height == 0 || view.rotated.len() != mesh.vertices.len() {
+        return None;
+    }
+    let ss = ss.max(1);
+    let hi = raw_rasterize(view, mesh, width * ss, height * ss, zoom, pan_x, pan_y);
+    // At one sample per pixel the box filter is the identity — every output
+    // pixel has exactly one input, opaque where it was drawn on and clear
+    // where it was not — so skip a full pass over the buffer to arrive at the
+    // buffer.
+    if ss == 1 {
+        return Some(hi);
+    }
+    Some(downsample(&hi, width, height, ss))
+}
+
+/// [`rasterize_view`]'s own math, at whatever resolution it is asked to run
+/// at — split out so the antialiasing wrapper can render this larger on each
+/// axis without duplicating the projection or the raster loop.
+fn raw_rasterize(
+    view: &View,
+    mesh: &Mesh,
+    width: u32,
+    height: u32,
+    zoom: f32,
+    pan_x: f32,
+    pan_y: f32,
+) -> Raster {
+    let (rotated, min, max) = (&view.rotated, view.min, view.max);
     let (span_x, span_y) = (max[0] - min[0], max[1] - min[1]);
 
     // Contained rather than stretched, the same rule a picture is held to on
@@ -597,7 +668,7 @@ fn raw_rasterize(
         }
     }
 
-    Some(Raster { width, height, rgba })
+    Raster { width, height, rgba }
 }
 
 /// A `ss`×-higher-resolution raster, boxed down to `width` × `height` — a
@@ -853,6 +924,141 @@ mod tests {
             alphas.iter().any(|&a| a != 0 && a != 255),
             "no partially-covered edge pixel was found: {alphas:?}"
         );
+    }
+
+    #[test]
+    fn the_shared_view_path_draws_exactly_what_the_all_in_one_path_draws() {
+        // The whole safety net for rotating the vertices once and spending
+        // that on two tiers: taking the pass out from under `rasterize` is
+        // only allowed to be faster, never to be different. Byte-for-byte,
+        // because "close enough" on a rasteriser is how a silhouette quietly
+        // moves half a pixel.
+        for (yaw, pitch, zoom) in [(-35.0, -25.0, 1.0), (10.0, 80.0, 3.0), (200.0, -40.0, 0.2)] {
+            for (pan_x, pan_y) in [(0.0, 0.0), (0.6, -0.4)] {
+                let mesh = cube();
+                let whole = rasterize(&mesh, 64, 48, yaw, pitch, zoom, pan_x, pan_y).unwrap();
+                let view = view(&mesh, yaw, pitch).expect("a cube has an extent");
+                let shared =
+                    rasterize_view(&view, &mesh, 64, 48, zoom, pan_x, pan_y, ANTIALIAS).unwrap();
+                assert_eq!(
+                    whole.rgba, shared.rgba,
+                    "the two paths disagree at {yaw}/{pitch}/{zoom} panned {pan_x}/{pan_y}"
+                );
+                assert_eq!((shared.width, shared.height), (64, 48));
+            }
+        }
+    }
+
+    #[test]
+    fn one_sample_per_pixel_draws_the_same_cube_with_a_hard_edge() {
+        // What a mesh under the pointer is drawn at. It still has to be the
+        // cube — same canvas, same silhouette in the middle — and the only
+        // thing it gives up is the partial coverage at the boundary that
+        // `a_silhouette_edge_is_softened_rather_than_a_hard_step` asserts is
+        // there at `ANTIALIAS`.
+        let (yaw, pitch, zoom) = DEFAULT;
+        let mesh = cube();
+        let view = view(&mesh, yaw, pitch).expect("a cube has an extent");
+        let single = rasterize_view(&view, &mesh, 64, 64, zoom, 0.0, 0.0, 1).unwrap();
+        assert_eq!((single.width, single.height), (64, 64));
+        assert_eq!(single.rgba.len(), 64 * 64 * 4);
+
+        let alphas: std::collections::HashSet<u8> =
+            single.rgba.as_chunks::<4>().0.iter().map(|p| p[3]).collect();
+        assert_eq!(
+            alphas,
+            std::collections::HashSet::from([0, 255]),
+            "one sample per pixel is covered or it is not: {alphas:?}"
+        );
+        let alpha_at = |x: u32, y: u32| single.rgba[((y * 64 + x) * 4 + 3) as usize];
+        assert_eq!(alpha_at(32, 32), 255, "the centre of the canvas is still the cube");
+        assert_eq!(alpha_at(0, 0), 0, "a corner of the canvas is still background");
+
+        // Zero is not a resolution anybody meant, and it must not be a
+        // divide-by-nothing either.
+        assert!(rasterize_view(&view, &mesh, 64, 64, zoom, 0.0, 0.0, 0).is_some());
+    }
+
+    #[test]
+    fn a_view_of_one_mesh_will_not_be_drawn_onto_another() {
+        // `View` carries the rotated vertices and the triangles are read off
+        // the mesh, so a caller holding two meshes could index a vertex that
+        // is not there. A cube and its own STL round-trip are the same shape
+        // at 8 vertices and at 36 — exactly the mismatch that would panic.
+        let (yaw, pitch, zoom) = DEFAULT;
+        let welded = cube();
+        let unwelded = stl(&binary_stl(&welded)).expect("a well-formed binary STL");
+        assert_ne!(welded.vertices.len(), unwelded.vertices.len());
+
+        let view = view(&welded, yaw, pitch).expect("a cube has an extent");
+        assert!(rasterize_view(&view, &unwelded, 64, 64, zoom, 0.0, 0.0, ANTIALIAS).is_none());
+        assert!(rasterize_view(&view, &welded, 64, 64, zoom, 0.0, 0.0, ANTIALIAS).is_some());
+    }
+
+    /// A bumpy heightfield of roughly `(side - 1)² × 2` triangles — enough
+    /// geometry to time against, built rather than loaded so no fixture file
+    /// has to exist. Bumpy rather than flat on purpose: a plane's triangles
+    /// are all wound the same way and all shaded the same, which is neither
+    /// what a real mesh costs to cull nor what it costs to shade.
+    fn heightfield(side: u32) -> Mesh {
+        let n = side.max(2);
+        let mut vertices = Vec::with_capacity((n * n) as usize);
+        for y in 0..n {
+            for x in 0..n {
+                let fx = x as f32 / (n - 1) as f32 * 2.0 - 1.0;
+                let fy = y as f32 / (n - 1) as f32 * 2.0 - 1.0;
+                vertices.push([fx, fy, (fx * 3.0).sin() * (fy * 3.0).cos() * 0.35]);
+            }
+        }
+        let mut triangles = Vec::with_capacity(((n - 1) * (n - 1) * 2) as usize);
+        for y in 0..n - 1 {
+            for x in 0..n - 1 {
+                let a = y * n + x;
+                triangles.push([a, a + 1, a + n]);
+                triangles.push([a + 1, a + n + 1, a + n]);
+            }
+        }
+        Mesh { vertices, triangles }
+    }
+
+    #[test]
+    #[ignore = "a measurement rather than an assertion: cargo test -p mbrd-core --release -- --ignored --nocapture"]
+    fn what_one_frame_of_a_turning_mesh_costs() {
+        let (yaw, pitch, zoom) = DEFAULT;
+        const REPS: u32 = 5;
+
+        // An ordinary mesh, and one at the cap — the second is what decides
+        // whether this rasteriser is ever worth replacing with a GPU, since
+        // that is the size where a CPU one has the most to lose.
+        for side in [160, 317] {
+            let mesh = heightfield(side);
+
+            // What one mouse move used to cost: a measuring pass that threw
+            // its rotation away, then both tiers — each rotating the mesh
+            // again, each supersampled — of which the board showed one.
+            let before = std::time::Instant::now();
+            for _ in 0..REPS {
+                aspect(&mesh, yaw, pitch).unwrap();
+                rasterize(&mesh, 256, 256, yaw, pitch, zoom, 0.0, 0.0).unwrap();
+                rasterize(&mesh, 1024, 1024, yaw, pitch, zoom, 0.0, 0.0).unwrap();
+            }
+            let before = before.elapsed() / REPS;
+
+            // What it costs now: one rotation, the one tier that is on
+            // screen, one sample per pixel.
+            let after = std::time::Instant::now();
+            for _ in 0..REPS {
+                let view = view(&mesh, yaw, pitch).unwrap();
+                rasterize_view(&view, &mesh, 256, 256, zoom, 0.0, 0.0, 1).unwrap();
+            }
+            let after = after.elapsed() / REPS;
+
+            println!(
+                "{} triangles, per frame: {before:?} before, {after:?} after — {:.1}x",
+                mesh.triangles.len(),
+                before.as_secs_f64() / after.as_secs_f64().max(f64::EPSILON),
+            );
+        }
     }
 
     #[test]

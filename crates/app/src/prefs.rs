@@ -15,7 +15,7 @@
 //! read is the defaults, because the alternative is an app that will not start
 //! over a stray comma.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
@@ -91,6 +91,50 @@ pub enum Setting {
     Appearance,
 }
 
+/// What a board this app *makes* starts out as.
+///
+/// The awkward corner of this module, and worth naming rather than hiding.
+/// Everything else here is an Application preference in the sense the settings
+/// page means: it is about the person sitting at this computer, it never goes
+/// into a `.mbrd`, and undo has no opinion about it. These two are Board
+/// settings — they live in the file, they travel to whoever it is sent to, and
+/// undo can take them back.
+///
+/// So this is deliberately **not** a way of setting them. It is a way of
+/// setting what a *new* board is born with, which is a fact about this
+/// computer's habits rather than about any board: changing it leaves every
+/// board that already exists exactly as it was, and the welcome screen and the
+/// settings page both have to say so in those words. The moment this starts
+/// reaching into `self.doc` it has become a second implementation of the
+/// Canvas section, which is the one thing the settings page's own note forbids.
+///
+/// Only the two the welcome screen asks about. The rest of `BoardSettings` is
+/// left at its own defaults, because a preference nobody is offered is a
+/// preference nobody can have got wrong.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NewBoard {
+    pub snap: bool,
+    pub grid_step: f32,
+}
+
+impl Default for NewBoard {
+    /// The board format's own defaults, restated rather than invented: a
+    /// person who never opens the welcome screen must get exactly the board
+    /// they got before this struct existed.
+    fn default() -> Self {
+        let born = mbrd_core::BoardSettings::default();
+        Self { snap: born.snap, grid_step: born.grid_step }
+    }
+}
+
+impl NewBoard {
+    /// Stamp these onto a board that has just been made.
+    pub fn apply(self, settings: &mut mbrd_core::BoardSettings) {
+        settings.snap = self.snap;
+        settings.grid_step = self.grid_step;
+    }
+}
+
 /// What somebody has chosen.
 ///
 /// Not `Copy` any more, which it was until it carried two theme *names*. The
@@ -160,6 +204,36 @@ pub struct Prefs {
     /// chosen *two* themes, and an app that remembered only the current one
     /// would forget the other every sunset.
     pub theme_light: String,
+
+    /// Where a board this app makes is put, if somebody has said.
+    ///
+    /// `None` rather than the default path spelled out, and the difference is
+    /// not pedantry: a person who has never been asked has *not chosen*
+    /// `~/mbrd`, they have declined to have an opinion — so if the platform's
+    /// answer to "where is home" ever changes underneath them, `None` follows
+    /// it and a written-down path does not. It also means the settings file of
+    /// somebody who took the default carries no absolute path at all, which is
+    /// what makes it survivable to copy between machines.
+    ///
+    /// Read through [`Prefs::boards`] rather than directly, which is where the
+    /// fallback lives.
+    pub boards_dir: Option<PathBuf>,
+
+    /// Whether the first-run screen has been through.
+    ///
+    /// State by the letter of `dirs.rs`'s split — something the app noticed
+    /// rather than something anybody chose — and it lives here anyway, on
+    /// purpose. The welcome screen's entire job is to collect the rest of this
+    /// struct, and putting the flag that decides whether it runs in a
+    /// *different file* would mean somebody restoring their settings from a
+    /// backup gets all of their answers back and is asked all of the questions
+    /// again. The flag belongs with the answers it is about.
+    pub welcomed: bool,
+
+    /// What a board this app makes is born with. See [`NewBoard`], whose note
+    /// is about why these are here and not on the settings page's Canvas
+    /// section.
+    pub new_board: NewBoard,
 }
 
 impl Default for Prefs {
@@ -170,6 +244,9 @@ impl Default for Prefs {
             mode: Mode::Dark,
             theme: DEFAULT_DARK.into(),
             theme_light: DEFAULT_LIGHT.into(),
+            boards_dir: None,
+            welcomed: false,
+            new_board: NewBoard::default(),
         }
     }
 }
@@ -205,6 +282,40 @@ impl Prefs {
             Appearance::Light => self.theme_light = name.into(),
             Appearance::Dark => self.theme = name.into(),
         }
+    }
+
+    /// Where a board this app makes goes.
+    ///
+    /// The chosen one, or the platform's — see [`Prefs::boards_dir`] for why
+    /// the unchosen case is a `None` that falls through here rather than the
+    /// default path written into the file. `None` from this means there is no
+    /// home directory to put anything in, which is [`dirs::boards`]'s answer
+    /// and not a new failure.
+    pub fn boards(&self) -> Option<PathBuf> {
+        match &self.boards_dir {
+            Some(chosen) => Some(chosen.clone()),
+            None => dirs::boards(),
+        }
+    }
+
+    /// Remember where boards go, or go back to following the platform.
+    ///
+    /// A path equal to the platform's answer is stored as `None` rather than
+    /// as itself: somebody who browses to `~/mbrd` and picks it has chosen the
+    /// default, and writing it down as an absolute path would quietly opt them
+    /// out of ever tracking their home directory again.
+    ///
+    /// No caller yet. The control that will have one is the welcome screen's
+    /// "where do boards go" step, and this is deliberately written *before* it
+    /// rather than inside it: the rule above is about the stored value, not
+    /// about the dialog, and a settings page that later grows the same control
+    /// has to reach the same answer through the same door.
+    #[allow(dead_code)]
+    pub fn set_boards(&mut self, dir: Option<&Path>) {
+        self.boards_dir = match dir {
+            Some(dir) if Some(dir) != dirs::boards().as_deref() => Some(dir.to_path_buf()),
+            _ => None,
+        };
     }
 }
 
@@ -251,6 +362,29 @@ pub fn load() -> Prefs {
                 }
                 if let Some(name) = value.get("theme_light").and_then(Value::as_str) {
                     prefs.theme_light = name.to_string();
+                }
+                // An empty string is not a directory. It is what a field
+                // somebody cleared by hand leaves behind, and treating it as a
+                // path would put every new board at the filesystem root — the
+                // same rule `dirs::from_env` applies to an exported-but-empty
+                // variable, for the same reason.
+                if let Some(dir) =
+                    value.get("boards").and_then(Value::as_str).filter(|d| !d.is_empty())
+                {
+                    prefs.boards_dir = Some(PathBuf::from(dir));
+                }
+                if let Some(seen) = value.get("welcomed").and_then(Value::as_bool) {
+                    prefs.welcomed = seen;
+                }
+                if let Some(snap) = value.get("newBoardSnap").and_then(Value::as_bool) {
+                    prefs.new_board.snap = snap;
+                }
+                // Clamped to the same range the board format clamps its own
+                // grid step to — see `schema.rs`. A settings file carrying
+                // zero would otherwise mint boards whose snapping divides by
+                // it.
+                if let Some(step) = value.get("newBoardGridStep").and_then(Value::as_f64) {
+                    prefs.new_board.grid_step = (step as f32).clamp(1.0, 4096.0);
                 }
             }
         }
@@ -328,6 +462,21 @@ pub fn save(prefs: &Prefs) {
     out.insert("mode".into(), Value::String(prefs.mode.word().into()));
     out.insert("theme".into(), Value::String(prefs.theme.clone()));
     out.insert("theme_light".into(), Value::String(prefs.theme_light.clone()));
+    out.insert("welcomed".into(), Value::Bool(prefs.welcomed));
+    out.insert("newBoardSnap".into(), Value::Bool(prefs.new_board.snap));
+    out.insert("newBoardGridStep".into(), Value::from(f64::from(prefs.new_board.grid_step)));
+    // Removed rather than written as `null` or as the default path when
+    // nobody has chosen one. See `Prefs::boards_dir`: the absence of the key
+    // is what "I have no opinion, follow the platform" is spelled as, and a
+    // key holding the platform's current answer would freeze it.
+    match &prefs.boards_dir {
+        Some(dir) => {
+            out.insert("boards".into(), Value::String(dir.to_string_lossy().into_owned()));
+        }
+        None => {
+            out.remove("boards");
+        }
+    }
 
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);

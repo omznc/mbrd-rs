@@ -113,6 +113,9 @@ jobs:
       # is needed whether or not X11 is in use — the dependency is not
       # feature-gated upstream — and its absence surfaces as a link failure,
       # not a compile one. See the README.
+      #
+      # The GStreamer pair is the media stack `pipeline.rs` links against, and
+      # is the reason that module is compiled on Linux and nowhere else.
       - name: Install Linux build dependencies
         if: matrix.platform == 'ubuntu-22.04'
         run: |
@@ -123,7 +126,21 @@ jobs:
             libfontconfig-dev \
             libfreetype6-dev \
             libxcb1-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
             pkg-config
+
+      # Not for the build — these are `dlopen`ed at runtime and nothing links
+      # against them — but for the AppImage, which copies the plugins off this
+      # runner. `libav` is where H.264 and AAC come from, which is to say where
+      # a phone video comes from.
+      - name: Install the GStreamer plugins the AppImage will carry
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get install -y \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-libav
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -230,6 +247,17 @@ jobs:
           # unpacked rather than mounted. The one we produce is unaffected.
           ( cd /tmp && ./linuxdeploy --appimage-extract >/dev/null )
 
+          # `ldd` finds the GStreamer *libraries* on its own; it cannot find the
+          # plugins, which are `dlopen`ed and are where every decoder actually
+          # lives. This plugin copies them in and writes the environment that
+          # points the bundled registry at the copy rather than at the host's —
+          # without it the AppImage starts and then reports no decoder for
+          # everything, which is the worst of both answers.
+          curl -fsSLo /tmp/linuxdeploy-plugin-gstreamer \
+            https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gstreamer/master/linuxdeploy-plugin-gstreamer.sh
+          chmod +x /tmp/linuxdeploy-plugin-gstreamer
+          export PATH=/tmp:$PATH
+
           mkdir -p AppDir/usr/bin
           cp "target/${{ matrix.target }}/release/mbrd" AppDir/usr/bin/mbrd
 
@@ -238,9 +266,22 @@ jobs:
             --executable AppDir/usr/bin/mbrd \
             --desktop-file packaging/linux/mbrd.desktop \
             --icon-file packaging/icons/hicolor/256x256/apps/mbrd.png \
+            --plugin gstreamer \
             --output appimage
 
           mv mbrd*.AppImage "dist/mbrd_${VERSION}_${{ matrix.arch }}.AppImage"
+
+      # Prebuilt binaries rather than `cargo install`, which compiled both of
+      # these from source on every run — 2m25s of the v0.2.0 release spent
+      # building tools that produce two files in about ten seconds. The
+      # versions are pinned for the reason everything else on this path is:
+      # a release is a bad moment to find out what changed upstream. Bumping
+      # them is editing this line.
+      - name: Install the packaging tools
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb@3.7.0,cargo-generate-rpm@0.21.0
 
       # Native packages, for people who would rather their package manager
       # knew about this. Both set MBRD_PACKAGED, which is what stops the
@@ -251,8 +292,6 @@ jobs:
         env:
           MBRD_PACKAGED: "1"
         run: |
-          cargo install cargo-deb cargo-generate-rpm --locked
-
           # Both tools read `target/release`, not `target/<triple>/release`,
           # and the matrix builds into the latter. Rebuild rather than copy:
           # the marker above changes the binary, so this is a genuinely

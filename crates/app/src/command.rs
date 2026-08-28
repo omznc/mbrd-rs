@@ -23,6 +23,7 @@ use mbrd_core::model::{ConnColor, ConnDir, ConnStyle, ConnWeight};
 use mbrd_core::paper::PaperSize;
 
 use crate::board_view::BoardView;
+use crate::icons::Icon;
 
 /// One thing the app can be asked to do.
 ///
@@ -35,6 +36,17 @@ use crate::board_view::BoardView;
 pub enum Command {
     AddNote,
     AddSwatch,
+    /// Ask the system for files, and put what comes back on the board.
+    ///
+    /// The keyboard's half of a drop. Everything else on the `Add` list makes
+    /// a card out of nothing; this is the only row that goes and *fetches*
+    /// one, which is why it wears the ellipsis and the other two do not.
+    ///
+    /// Unkeyed on purpose. `Ctrl O` is the chord somebody would guess and it
+    /// is taken by the board switcher, where it means the same word about a
+    /// different noun — and a second file dialog on a near-miss of that chord
+    /// would be the worst of both.
+    AddFiles,
     Tint,
     BringToFront,
     SendToBack,
@@ -88,6 +100,16 @@ pub enum Command {
     /// two rows that only ever differ by which is ticked are one row that
     /// says which of the two it is not.
     ToggleUnits,
+    /// Say what one thing on the board really measures, and let `scale`
+    /// follow.
+    ///
+    /// The way in to the one board setting nothing else can reach honestly.
+    /// `scale` is world units per millimetre — a real number with a real
+    /// meaning — and nobody knows how many world units their photograph of a
+    /// doorway is, so a number field for it would be a field with no way to
+    /// fill it in. Drawing a line along the doorway and saying "820mm" is one.
+    /// See `BoardView::start_calibrating`, which is where the gesture lives.
+    Calibrate,
     OpenBoard,
     /// Everything the app can be asked to do, as a list you type at.
     ///
@@ -133,6 +155,15 @@ pub enum Command {
     /// can open it, and because the board's numbers — grid step, card gap,
     /// media fit — are choices a menu row cannot show.
     Settings,
+    /// Put the first-run screen back up.
+    ///
+    /// It runs itself once and then never again, which is right — and leaves
+    /// nobody a way back to it. Four questions worth asking on the first day
+    /// are worth being able to re-read on the hundredth, and the last of its
+    /// pages is the only place in the app that offers the demonstration board
+    /// and the tour side by side. Unkeyed on purpose: a shortcut for a screen
+    /// somebody sees once is a shortcut spent.
+    Welcome,
     /// Choose the palette the app is drawn in.
     ///
     /// A command of its own rather than only a row on the settings page,
@@ -168,6 +199,58 @@ pub enum Command {
     /// is the whole of the rule. Nothing measured may set it and nothing may
     /// infer it, which is what separates it from fence membership.
     ToggleLock,
+    /// Put a word on what is selected so it can be found again.
+    ///
+    /// Opens the tag list rather than a text field, and that is the whole
+    /// design of tags in this build: the second and third tag anybody puts on
+    /// a board are almost always tags already on it, so the common act is
+    /// *picking* one and the rare act is inventing one. A list you type at
+    /// does both — see `palette::Mode::Tag`, which offers to make whatever was
+    /// typed when nothing matches it.
+    Tag,
+    /// Narrow the board to what wears a tag — everything else fades.
+    ///
+    /// Fades rather than hides, for the reason `FADED` gives: a filter is a
+    /// way of finding something among everything else, and a board that
+    /// removed the rest would throw away where the answer sits.
+    Filter,
+    /// Put the filter down and show the whole board again.
+    ///
+    /// Its own command rather than a second press of [`Self::Filter`], because
+    /// a filter of three tags takes three presses to clear that way and the
+    /// one thing somebody wants at that point is out.
+    ShowEverything,
+    /// What this board is made of, and what it weighs.
+    ///
+    /// A report rather than a setting, which is why it is a page of its own
+    /// rather than a section of the settings page — see `stock.rs`. It exists
+    /// to answer the question nothing else in the app does: a `.mbrd` gets
+    /// heavy and there was nowhere that said which photograph was doing it.
+    Inventory,
+    /// Make this board smaller — which is the same page as [`Self::Inventory`],
+    /// deliberately.
+    ///
+    /// Two rows opening one surface, because the page *is* the promise the
+    /// shrink makes: it says what it would do, with the reason — this
+    /// photograph is 12 MB — sitting above the button. A second row is how
+    /// somebody who is looking for "compress" finds a page called Inventory.
+    /// See `stock.rs`, and `BoardView::squeeze_board` for the run itself.
+    Shrink,
+    /// Walk the board's saved route, a camera move per stop.
+    ///
+    /// The other half of a field that has round-tripped through this build
+    /// since the format was first read and that nothing consumed — see
+    /// `mbrd_core::tour`. One command for start *and* stop, like
+    /// [`Self::Inventory`]: a row that can only start is a row that stops
+    /// working the moment it has worked.
+    Tour,
+    /// Put what is selected on the route, or take it off.
+    ///
+    /// The only way to build a tour, which is why it is on the card's own menu
+    /// rather than under View with the walking of it: adding a stop is
+    /// something you do *to a card*, and walking is something you do to the
+    /// board.
+    TourStop,
     /// Whether this card's words keep their size as the board moves under
     /// them. **On unless somebody turns it off**, which is why it is named
     /// for the state it is normally in rather than for the change it makes.
@@ -281,6 +364,7 @@ impl Command {
         match self {
             Self::AddNote => "Add note",
             Self::AddSwatch => "Add color",
+            Self::AddFiles => "Add files…",
             Self::Tint => "Next tint",
             Self::BringToFront => "Bring to front",
             Self::SendToBack => "Send to back",
@@ -309,6 +393,9 @@ impl Command {
             Self::ToggleGuides => "Alignment guides",
             Self::ToggleHud => "Scale bar",
             Self::ToggleUnits => "Imperial units",
+            // The ellipsis every row that arms a gesture wears: this one does
+            // nothing on its own, it waits for a line to be drawn.
+            Self::Calibrate => "Set the scale\u{2026}",
             Self::OpenBoard => "Open board…",
             Self::Palette => "All commands…",
             Self::Search => "Find on board…",
@@ -316,11 +403,21 @@ impl Command {
             Self::ToggleUpdateChecks => "Look for new versions",
             Self::CheckForUpdates => "Check for updates…",
             Self::Settings => "Settings…",
+            Self::Welcome => "Welcome screen…",
             Self::SelectTheme => "Theme…",
             Self::Connect => "Connect",
             Self::AddFence => "Group",
             Self::Ungroup => "Ungroup",
             Self::ToggleLock => "Lock",
+            Self::Tag => "Tag\u{2026}",
+            Self::Filter => "Filter by tag\u{2026}",
+            Self::ShowEverything => "Show everything",
+            Self::Inventory => "Inventory\u{2026}",
+            Self::Shrink => "Make this board smaller\u{2026}",
+            Self::Tour => "Take the tour",
+            // Named for the state rather than for the change, like every other
+            // ticked row: the menu shows whether this card is on the route.
+            Self::TourStop => "On the tour",
             Self::DontScaleText => "Don't scale text",
             Self::FitText => "Dynamic size",
             Self::PlayPause => "Play / pause",
@@ -396,6 +493,115 @@ impl Command {
         }
     }
 
+    /// The picture for it, down the left of a menu row or a palette row.
+    ///
+    /// **A menu of nothing but words is read one line at a time.** A picture in
+    /// the gutter is what turns the twentieth visit into a glance: you stop
+    /// reading "Duplicate" and start finding the two overlapping squares. That
+    /// only works if the set is small and the pictures are reused — so `Ruler`
+    /// stands for all four rows about measuring and `Crosshair` for both about
+    /// putting the camera somewhere, rather than each row getting a drawing of
+    /// its own that nobody can tell from its neighbours.
+    ///
+    /// A few are pointedly the *same* picture as something else on screen and
+    /// that is the point of them: `Lock` wears the padlock a locked card wears,
+    /// `Tag` the mark a tagged card wears, and the tool commands wear their
+    /// tools. A row and the thing it makes should look alike.
+    pub fn mark(self) -> Icon {
+        match self {
+            Self::AddNote => Icon::Write,
+            Self::AddSwatch => Icon::Colour,
+            Self::AddFiles => Icon::Drop,
+            // The pad rather than a paintbrush: what this changes is which of
+            // the four colours the note is torn off, and the grid beside it on
+            // the same menu shows the pad itself.
+            Self::Tint => Icon::Swatch,
+            Self::BringToFront | Self::SendToBack => Icon::Cards,
+            Self::Open => Icon::OpenOut,
+            Self::Rename | Self::ConnLabel => Icon::Rename,
+            Self::Duplicate | Self::Copy => Icon::Copy,
+            Self::Cut => Icon::Scissors,
+            Self::Delete => Icon::Binned,
+            Self::SelectAll => Icon::SelectAll,
+            Self::ClearSelection | Self::Ungroup => Icon::SelectNone,
+            Self::Undo => Icon::Undo,
+            Self::Redo => Icon::Redo,
+            Self::Paste | Self::PasteRaw => Icon::Paste,
+            Self::Save => Icon::Save,
+            Self::NewBoard => Icon::NewBoard,
+            Self::OpenBoard => Icon::Folder,
+            // Both put the camera somewhere rather than changing the board, so
+            // both wear the mark for aiming it.
+            Self::Recentre | Self::FitBoard => Icon::Crosshair,
+            Self::ZoomIn => Icon::ZoomIn,
+            Self::ZoomOut => Icon::ZoomOut,
+            Self::ToggleGrid => Icon::SectionCanvas,
+            // The axes are the two rules through the origin, and the guides
+            // are rules between cards: the same idea at two scales, and the
+            // scale bar and the units are the same idea again.
+            Self::ToggleAxes
+            | Self::ToggleGuides
+            | Self::ToggleHud
+            | Self::ToggleUnits
+            | Self::Calibrate => Icon::Ruler,
+            Self::ToggleSnap => Icon::Magnet,
+            Self::ToggleWeb | Self::Connect => Icon::Connect,
+            Self::Palette => Icon::Commands,
+            Self::Search => Icon::Find,
+            Self::ToggleMotion => Icon::Sparkle,
+            Self::ToggleUpdateChecks | Self::CheckForUpdates => Icon::Restart,
+            Self::Settings => Icon::Settings,
+            Self::Welcome => Icon::Explore,
+            Self::SelectTheme => Icon::SectionAppearance,
+            Self::AddFence => Icon::Selected,
+            Self::ToggleLock => Icon::Locked,
+            Self::Tag => Icon::Tag,
+            Self::Filter => Icon::Filter,
+            Self::ShowEverything => Icon::Eye,
+            Self::Inventory => Icon::List,
+            Self::Shrink => Icon::Shrink,
+            Self::Tour => Icon::Tour,
+            // A pin rather than the route: this is one stop on it.
+            Self::TourStop => Icon::Pin,
+            Self::DontScaleText | Self::FitText => Icon::Text,
+            Self::PlayPause => Icon::Play,
+            Self::ToggleMute => Icon::Muted,
+            // Both are "put this somewhere else by hand", which is what the
+            // four arrows out of a point say.
+            Self::Position | Self::Separate => Icon::Move,
+            Self::Align(_) => Icon::Align,
+            Self::Distribute(_) => Icon::Distribute,
+            Self::Arrange(_) | Self::Rearrange | Self::RearrangeSelection => Icon::Board,
+            Self::Paper(_) | Self::ToggleLandscape => Icon::Paper,
+            Self::ConnDelete => Icon::Scissors,
+            // The five colours share the swatch, the four arrows share the
+            // arrow, and so on: within a submenu the picture is the same on
+            // every row, and it is the *label* that differs. That is not waste
+            // — the gutter is what keeps the labels lined up, and a submenu of
+            // five different pictures would read as five different errands.
+            Self::ConnColour(_) => Icon::Swatch,
+            Self::ConnArrow(_) => Icon::Travel,
+            Self::ConnStyleAs(_) => Icon::Connect,
+            Self::ConnWeightAs(_) => Icon::Weight,
+        }
+    }
+
+    /// Whether the row takes something away, and should be drawn as though it
+    /// does.
+    ///
+    /// The two that remove a thing from the board rather than change one:
+    /// binning cards, and cutting a rope. **Not** `Cut`, which is half of a
+    /// move and puts what it took on the clipboard — a red `Ctrl X` beside a
+    /// black `Ctrl C` would be a warning about the safest pair of keys in the
+    /// app. And not `Ungroup`, which keeps every card the group was holding.
+    ///
+    /// Colour is the whole of what this buys, and it buys it in the one place
+    /// it matters: the row at the bottom of a menu that somebody is about to
+    /// hit on the way past.
+    pub fn destructive(self) -> bool {
+        matches!(self, Self::Delete | Self::ConnDelete)
+    }
+
     /// The key that does it, spelled the way a menu should show it.
     ///
     /// `""` for a command no key reaches, and that is a real answer rather than
@@ -407,6 +613,9 @@ impl Command {
         match self {
             Self::AddNote => "N",
             Self::AddSwatch => "K",
+            // No key: see the variant's own note. `Ctrl O` is taken by the
+            // board switcher and this is not worth a letter of its own.
+            Self::AddFiles => "",
             Self::Tint => "T",
             Self::BringToFront => "]",
             Self::SendToBack => "[",
@@ -442,6 +651,9 @@ impl Command {
             Self::CheckForUpdates => "Ctrl U",
             // The spelling every application means settings by.
             Self::Settings => "Ctrl ,",
+            // No key. See the variant's own note: a shortcut for a screen
+            // somebody sees once is a shortcut spent.
+            Self::Welcome => "",
             Self::Connect => "J",
             Self::AddFence => "Ctrl G",
             Self::Ungroup => "Ctrl Shift G",
@@ -481,6 +693,22 @@ impl Command {
             // No key: the single letters worth spending are gone, same as
             // the rest of this switch's neighbours.
             Self::ToggleLandscape => "",
+            // The one letter left that reads as its own word, and the
+            // gesture it belongs to: a card in hand, a word onto it.
+            Self::Tag => "#",
+            // No key for either. A filter is set from a list you have to read
+            // anyway, and clearing it is one row down from where you set it.
+            Self::Filter | Self::ShowEverything => "",
+            // No key: a report is something you go and read once, not
+            // something you reach for mid-gesture.
+            Self::Inventory | Self::Shrink => "",
+            // No key: a board's scale is set once, on the boards that have one
+            // at all, and never again.
+            Self::Calibrate => "",
+            // No key for either. The letters worth spending are gone, and a
+            // tour is walked with the arrows once it has started — which is
+            // the only keyboard it needs. See `BoardView::step_tour`.
+            Self::Tour | Self::TourStop => "",
 
             Self::ConnLabel
             | Self::ConnDelete
@@ -517,6 +745,13 @@ impl Command {
             "g" if mods.secondary() && mods.shift => Self::Ungroup,
             "g" if mods.secondary() => Self::AddFence,
             "l" if plain => Self::ToggleLock,
+            // `#` is what a tag is written as everywhere, and the only mark
+            // left that reads as its own word. Spelled twice on purpose: a
+            // shifted digit reaches here as the character on some layouts and
+            // as the digit with Shift held on others, and a key that works on
+            // one keyboard is worse than no key at all.
+            "#" => Self::Tag,
+            "3" if mods.shift && !mods.secondary() && !mods.alt => Self::Tag,
             "]" if plain => Self::BringToFront,
             "[" if plain => Self::SendToBack,
             // The keyboard's half of the double-click. See `opened.rs`.
@@ -599,6 +834,7 @@ impl Command {
             Self::BringToFront
             | Self::SendToBack
             | Self::ToggleLock
+            | Self::Tag
             | Self::ClearSelection
             | Self::Open
             | Self::Rename
@@ -638,6 +874,23 @@ impl Command {
             // depending on how the binary was compiled is a menu that changes
             // shape for reasons nobody watching it can see.
             Self::CheckForUpdates => crate::update::possible(),
+            // Only where there is something to filter by. A list of no tags
+            // is a list that can only say "there are none", and the way
+            // somebody finds out tags exist is the row above it on the card
+            // menu rather than an empty one here.
+            Self::Filter => view.doc.board.items.iter().any(|i| !mbrd_core::tags::of(i).is_empty()),
+            // And only where one is standing, so a board nobody has filtered
+            // never offers to unfilter it.
+            Self::ShowEverything => !view.tag_filter.is_empty(),
+            // Only where there is a route to walk — or one already being
+            // walked, since this is also how it ends. A row that offered to
+            // tour an empty board would be a row whose only answer is "no".
+            Self::Tour => view.touring() || !mbrd_core::tour::stops(&view.doc.board).is_empty(),
+            Self::TourStop => view.tour_state().is_some(),
+            // Always, and on an empty board too: a scale is a property of the
+            // paper rather than of what is on it, and somebody setting one
+            // before they start is doing it in the right order.
+            Self::Calibrate => true,
             // Always. A palette you can only open when something is selected
             // is a palette you cannot use to find out what you could select.
             Self::Palette => true,
@@ -681,6 +934,10 @@ impl Command {
             Self::ConnStyleAs(style) => Some(view.rope_meta()?.style == style),
             Self::ConnWeightAs(weight) => Some(view.rope_meta()?.weight == weight),
             Self::ToggleLock => view.lock_state(),
+            Self::TourStop => view.tour_state(),
+            // Ticked while it is running, so the one row reads as the state it
+            // is in rather than as two instructions that look identical.
+            Self::Tour => Some(view.touring()),
             // Ticked for the card `positioning` names, not merely whenever
             // it is `Some` — a second mesh selected while another is still in
             // the mode must read as off.
@@ -696,6 +953,7 @@ impl Command {
         match self {
             Self::AddNote => view.add_note(cx),
             Self::AddSwatch => view.add_swatch(cx),
+            Self::AddFiles => view.pick_files(cx),
             Self::Tint => view.cycle_tint(cx),
             Self::BringToFront => view.raise_selection(true, cx),
             Self::SendToBack => view.raise_selection(false, cx),
@@ -731,11 +989,21 @@ impl Command {
             Self::Search => view.open_palette(crate::palette::Mode::Search, cx),
             Self::CheckForUpdates => view.update_step(cx),
             Self::Settings => view.open_settings(cx),
+            Self::Welcome => view.open_welcome(cx),
             Self::SelectTheme => view.open_theme_picker(cx),
             Self::Connect => view.connect_selection(cx),
             Self::AddFence => view.add_fence(cx),
             Self::Ungroup => view.ungroup(cx),
             Self::ToggleLock => view.toggle_lock(cx),
+            Self::Tag => view.open_palette(crate::palette::Mode::Tag, cx),
+            Self::Filter => view.open_palette(crate::palette::Mode::Filter, cx),
+            Self::ShowEverything => view.clear_filter(cx),
+            // The page, not the run. Everything this command promises about
+            // saying first is kept by opening the thing that says it.
+            Self::Inventory | Self::Shrink => view.open_stock(cx),
+            Self::Calibrate => view.start_calibrating(cx),
+            Self::Tour => view.take_tour(cx),
+            Self::TourStop => view.toggle_tour_stop(cx),
             Self::DontScaleText => view.toggle_text_scaling(cx),
             Self::FitText => view.toggle_fit_text(cx),
             Self::PlayPause => view.play_pause_selection(cx),
@@ -786,6 +1054,7 @@ impl Command {
             Self::ToggleMute => "video audio sound unmute silence",
             Self::Delete => "remove trash",
             Self::AddSwatch => "colour swatch",
+            Self::AddFiles => "import open picture photo browse folder upload",
             Self::Tint => "colour recolour",
             Self::AddFence => "group frame",
             Self::Connect => "rope line link join",
@@ -808,10 +1077,19 @@ impl Command {
             Self::ToggleUpdateChecks => "updates version automatic",
             Self::CheckForUpdates => "upgrade version new",
             Self::Settings => "preferences options configure grid step gap spacing media fit",
+            Self::Welcome => "first run setup onboarding getting started tour demo again",
             // Every word somebody reaches for when the screen is the wrong
             // brightness, which is when this gets typed.
             Self::SelectTheme => "colour color appearance dark light palette scheme contrast",
             Self::ToggleLock => "unlock freeze fix protect nail pin",
+            Self::Tag => "label keyword categorise categorize mark word",
+            Self::Filter => "tag narrow show only hide search categor",
+            Self::ShowEverything => "clear filter unfilter reset show all tag",
+            Self::Inventory => "size weight bytes heavy large files assets storage stock report",
+            Self::Shrink => "compress optimise optimize recompress reduce smaller lighter shrink",
+            Self::Calibrate => "scale calibrate ruler measure real size mm cm inches metres",
+            Self::Tour => "walk route present slideshow stops journey guide",
+            Self::TourStop => "route stop add present slideshow journey",
             Self::Position => "camera orbit rotate spin zoom mesh 3d turn",
             Self::DontScaleText => "font size zoom",
             Self::Save => "write disk",
@@ -845,6 +1123,7 @@ impl Command {
         let mut out = vec![
             Self::AddNote,
             Self::AddSwatch,
+            Self::AddFiles,
             Self::AddFence,
             Self::Ungroup,
             Self::Connect,
@@ -858,6 +1137,13 @@ impl Command {
             Self::Delete,
             Self::Tint,
             Self::ToggleLock,
+            Self::Tag,
+            Self::Filter,
+            Self::ShowEverything,
+            Self::Inventory,
+            Self::Shrink,
+            Self::Tour,
+            Self::TourStop,
             Self::DontScaleText,
             Self::FitText,
             Self::PlayPause,
@@ -888,11 +1174,13 @@ impl Command {
             Self::ToggleGuides,
             Self::ToggleHud,
             Self::ToggleUnits,
+            Self::Calibrate,
             Self::ToggleLandscape,
             Self::ToggleMotion,
             Self::ToggleUpdateChecks,
             Self::CheckForUpdates,
             Self::Settings,
+            Self::Welcome,
             Self::SelectTheme,
             Self::ConnLabel,
             Self::ConnDelete,
@@ -933,6 +1221,19 @@ pub enum Entry {
     /// A noun rather than a verb — "Add", "View", "Colour" — because a submenu
     /// is not something you do, it is where the doing is kept.
     More(&'static str, &'static [Entry]),
+    /// The colour picker: every shade the theme offers, as a grid.
+    ///
+    /// **A grid rather than sixteen rows, because a colour has no name.** A
+    /// list of "Colour 7, Colour 8, Colour 9" is a list nobody can use — the
+    /// whole of choosing a colour is looking at it, and sixteen rows each
+    /// carrying one small square would be a menu the height of the window that
+    /// still made you read to find the green one.
+    ///
+    /// It is the one entry that is not a row, and so the one the keyboard
+    /// steps past — see `menu::Menu::step`. That is a real limitation and an
+    /// accepted one: there is a key for cycling the pad's own four (`T`), and
+    /// the twelve past them are a thing you point at.
+    Shades,
 }
 
 impl Entry {
@@ -948,6 +1249,38 @@ impl Entry {
             Self::Rule => false,
             Self::Does(command) => command.available(view),
             Self::More(_, list) => list.iter().any(|e| e.available(view)),
+            // The same question `Command::Tint` answers, asked once: a grid of
+            // colours over a selection that cannot take one is sixteen
+            // controls that all do nothing.
+            Self::Shades => view.can_tint(),
+        }
+    }
+
+    /// The picture down the left of the row, where the row has one.
+    ///
+    /// A submenu is named by its noun rather than by a command, so its mark is
+    /// looked up from that noun — a small table rather than a third field on
+    /// the variant, because a third field would mean writing an icon beside
+    /// every one of the fourteen `More`s in this file and getting it wrong once.
+    /// A name with nothing here draws the plain caret and no picture, which is
+    /// the honest answer rather than a wrong one.
+    pub fn mark(self) -> Option<Icon> {
+        match self {
+            Self::Rule | Self::Shades => None,
+            Self::Does(command) => Some(command.mark()),
+            Self::More(name, _) => match name {
+                "Add" => Some(Icon::New),
+                "Layout" => Some(Icon::Align),
+                "View" => Some(Icon::Eye),
+                "Paper" => Some(Icon::Paper),
+                "Card" => Some(Icon::Cards),
+                "Arrange" => Some(Icon::Board),
+                "Arrow" => Some(Icon::Travel),
+                "Color" => Some(Icon::Swatch),
+                "Style" => Some(Icon::Connect),
+                "Weight" => Some(Icon::Weight),
+                _ => None,
+            },
         }
     }
 
@@ -1011,7 +1344,10 @@ impl Entry {
     /// and naming whichever happened to be first would be a readout of nothing.
     pub fn hint(self, view: &BoardView) -> &'static str {
         match self {
-            Self::Rule => "",
+            // Neither carries a key down its right-hand side: one is a line
+            // and the other is a grid of squares with nothing to put one
+            // beside. The key that cycles the pad is on the row below.
+            Self::Rule | Self::Shades => "",
             Self::Does(command) => command.hint(),
             Self::More(_, list) => {
                 let (mut on, mut chosen) = (0, "");
@@ -1028,7 +1364,7 @@ impl Entry {
                             // is not one choice and has no single answer.
                             None => return "",
                         },
-                        Self::More(..) => return "",
+                        Self::More(..) | Self::Shades => return "",
                     }
                 }
                 if on == 1 {
@@ -1046,7 +1382,11 @@ impl Entry {
 /// Three verbs that were three rows on every list; one row now, on all of
 /// them. Adding is a thing you do occasionally and read past constantly, which
 /// is exactly what a submenu is for.
-const ADD: [Entry; 2] = [Entry::Does(Command::AddNote), Entry::Does(Command::AddSwatch)];
+const ADD: [Entry; 3] = [
+    Entry::Does(Command::AddNote),
+    Entry::Does(Command::AddSwatch),
+    Entry::Does(Command::AddFiles),
+];
 
 /// Everything the one card in hand *is*, as opposed to everything you can do
 /// to it.
@@ -1061,7 +1401,10 @@ const ADD: [Entry; 2] = [Entry::Does(Command::AddNote), Entry::Does(Command::Add
 /// Depth is in here rather than on the face for the same reason it is behind
 /// `Arrange` on the many-cards list: which card is in front is a fact about
 /// the card, and neither list has room to spend two rows saying so.
-const CARD: [Entry; 9] = [
+const CARD: [Entry; 10] = [
+    // The picker first, and the key that cycles the pad right under it, so
+    // the row naming the key is beside the thing it is a shortcut for.
+    Entry::Shades,
     Entry::Does(Command::Tint),
     Entry::Does(Command::DontScaleText),
     Entry::Does(Command::FitText),
@@ -1097,7 +1440,7 @@ const PAPER: [Entry; 8] = [
 /// doc, "nothing here opens a third list off a second one". A `More` row
 /// inside `VIEW` would sit two lists deep and never open on hover or on
 /// Enter. `Paper` hangs off the same row `View` does instead.
-const VIEW: [Entry; 16] = [
+const VIEW: [Entry; 23] = [
     Entry::Does(Command::ToggleGrid),
     Entry::Does(Command::ToggleSnap),
     Entry::Does(Command::ToggleAxes),
@@ -1105,12 +1448,28 @@ const VIEW: [Entry; 16] = [
     Entry::Does(Command::ToggleGuides),
     Entry::Does(Command::ToggleHud),
     Entry::Does(Command::ToggleUnits),
+    // Under the two switches it is about: the bar, and what the bar counts in.
+    // A row that sets what those two *report* belongs with them rather than
+    // down among the journeys.
+    Entry::Does(Command::Calibrate),
     Entry::Does(Command::ToggleLandscape),
+    Entry::Rule,
+    // Which of the board is being *looked* at, which is the same kind of
+    // question as which of it is drawn — and neither is a change to the board,
+    // which is why both live here rather than on a card's own list.
+    Entry::Does(Command::Filter),
+    Entry::Does(Command::ShowEverything),
     Entry::Rule,
     Entry::Does(Command::FitBoard),
     Entry::Does(Command::Recentre),
     Entry::Does(Command::ZoomIn),
     Entry::Does(Command::ZoomOut),
+    // Two things you go and *do* with the board rather than switches you set
+    // on it, so they sit under the journeys above them and above the rule
+    // that divides the board from the application.
+    Entry::Does(Command::Tour),
+    Entry::Does(Command::Inventory),
+    Entry::Does(Command::Shrink),
     Entry::Rule,
     // Last, and behind their own rule. Everything above this is about the
     // board in front of you; these two are about the application, and they
@@ -1261,7 +1620,7 @@ pub const BOARD_MENU: [Entry; 12] = [
 /// choice the last time this list was too long, and a double-click being the
 /// gesture people try first is not a reason for the menu to stay silent about
 /// it.
-pub const CARD_MENU: [Entry; 23] = [
+pub const CARD_MENU: [Entry; 25] = [
     Entry::Does(Command::Open),
     Entry::Does(Command::Rename),
     Entry::Does(Command::Duplicate),
@@ -1277,6 +1636,13 @@ pub const CARD_MENU: [Entry; 23] = [
     // that changes what every other row can do — and because a locked card is
     // most often reached in order to unlock it.
     Entry::Does(Command::ToggleLock),
+    // On the face beside the lock, for the reason the lock is: both are ways
+    // of saying something *about* a card rather than doing something to it,
+    // and a tag buried in `Card` would be a tag nobody found.
+    Entry::Does(Command::Tag),
+    // And the same argument once more: being on the route is a fact about the
+    // card, and it is the only way a route gets built.
+    Entry::Does(Command::TourStop),
     // Mesh-only — see `Command::Position`'s own doc — and beside the lock
     // rather than buried in `Card`, for the same reason the lock is on the
     // face: it is a mode, not a fact about the card.
@@ -1328,7 +1694,7 @@ pub const ROPE_MENU: [Entry; 7] = [
 /// list — rename, tint, the note's own commands — is about one of them, and all
 /// of this is about the relationship between them, which does not exist when
 /// there is only one.
-pub const MANY_MENU: [Entry; 13] = [
+pub const MANY_MENU: [Entry; 15] = [
     Entry::Does(Command::Connect),
     Entry::Does(Command::AddFence),
     Entry::Does(Command::Ungroup),
@@ -1338,6 +1704,11 @@ pub const MANY_MENU: [Entry; 13] = [
     Entry::Does(Command::Copy),
     Entry::Does(Command::Delete),
     Entry::Does(Command::ToggleLock),
+    // Beside the lock rather than in a submenu, and this is the list it
+    // matters most on: tagging is something you do to *several* cards at
+    // once far more often than to one — and so is building a route.
+    Entry::Does(Command::Tag),
+    Entry::Does(Command::TourStop),
     Entry::Rule,
     // Depth is inside it now — see [`ARRANGE`].
     Entry::More("Arrange", &ARRANGE),
@@ -1393,6 +1764,7 @@ mod tests {
             match command {
                 Command::AddNote
                 | Command::AddSwatch
+                | Command::AddFiles
                 | Command::Tint
                 | Command::BringToFront
                 | Command::SendToBack
@@ -1421,6 +1793,7 @@ mod tests {
                 | Command::ToggleGuides
                 | Command::ToggleHud
                 | Command::ToggleUnits
+                | Command::Calibrate
                 | Command::ToggleMotion
                 | Command::ToggleUpdateChecks
                 | Command::OpenBoard
@@ -1429,10 +1802,18 @@ mod tests {
                 | Command::CheckForUpdates
                 | Command::SelectTheme
                 | Command::Settings
+                | Command::Welcome
                 | Command::Connect
                 | Command::AddFence
                 | Command::Ungroup
                 | Command::ToggleLock
+                | Command::Tag
+                | Command::Filter
+                | Command::ShowEverything
+                | Command::Inventory
+                | Command::Shrink
+                | Command::Tour
+                | Command::TourStop
                 | Command::DontScaleText
                 | Command::FitText
                 | Command::PlayPause
@@ -1456,12 +1837,12 @@ mod tests {
                 }
             }
         }
-        // 53 nullary, plus the eight that carry values mapped over their own
+        // 63 nullary, plus the eight that carry values mapped over their own
         // modules' lists: 8 arrangements, 8 paper sizes, 6 edges, 2 axes, 5
         // colours, 4 arrows, 3 styles, 3 weights.
         assert_eq!(
             Command::all().len(),
-            53 + 8 + 8 + 6 + 2 + 5 + 4 + 3 + 3,
+            63 + 8 + 8 + 6 + 2 + 5 + 4 + 3 + 3,
             "a command was added to the enum and not to Command::all",
         );
     }
@@ -1568,11 +1949,49 @@ mod tests {
         }
     }
 
+    /// The submenu marks are looked up by name, which is a table that can go
+    /// stale silently: rename a submenu and its picture quietly disappears,
+    /// leaving one row in the list with an empty gutter and no build error.
+    /// This is what makes that loud.
+    #[test]
+    fn every_submenu_has_a_picture() {
+        for list in all_lists() {
+            for entry in list {
+                let Entry::More(name, _) = entry else { continue };
+                assert!(
+                    entry.mark().is_some(),
+                    "the submenu named {name:?} has no icon in Entry::mark"
+                );
+            }
+        }
+    }
+
+    /// The two lists draw the same commands, and a command that looked like
+    /// one thing on a menu and another in the palette would be two commands as
+    /// far as anybody using them is concerned. One table is what stops that,
+    /// and this is what says the table answers for every command there is.
+    #[test]
+    fn every_command_has_a_picture() {
+        for command in Command::all() {
+            // `mark` is total, so this cannot fail to compile its way out of
+            // an unhandled variant — but it can be given a placeholder, and
+            // the check that matters is that no two *unrelated* commands were
+            // waved through with whatever was nearest.
+            let _ = command.mark();
+        }
+        // The one mark that must not be shared, because it is the only one
+        // carrying a warning: binning and cutting are red, and nothing else is.
+        let grave: Vec<Command> = Command::all().into_iter().filter(|c| c.destructive()).collect();
+        assert_eq!(grave, vec![Command::Delete, Command::ConnDelete], "the red rows moved");
+    }
+
     /// Every command on a list, submenus and all, in the order they are drawn.
     fn everything(list: &'static [Entry]) -> Vec<Command> {
         list.iter()
             .flat_map(|entry| match entry {
-                Entry::Rule => Vec::new(),
+                // Neither is a command: one is a line and the other is a
+                // block of colour that runs `BoardView::tint_as` directly.
+                Entry::Rule | Entry::Shades => Vec::new(),
                 Entry::Does(command) => vec![*command],
                 Entry::More(_, inner) => everything(inner),
             })

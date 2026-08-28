@@ -32,15 +32,36 @@ Either way SmartScreen calls it an unrecognised app the first time:
 - `.tar.gz` — the bare binary, for putting somewhere yourself.
 
 The bare binary and the packages are built against glibc 2.35, so anything from
-Ubuntu 22.04 or Fedora 36 onward will run them. They need a Vulkan driver and
-`libxkbcommon-x11`, both of which a desktop install normally already has:
+Ubuntu 22.04 or Fedora 36 onward will run them. They need a Vulkan driver,
+`libxkbcommon-x11` and GStreamer, all of which a desktop install normally
+already has:
 
 ```sh
-sudo dnf install libxkbcommon-x11    # Fedora
-sudo apt install libxkbcommon-x11-0  # Debian / Ubuntu
+sudo dnf install libxkbcommon-x11 gstreamer1 gstreamer1-plugins-base    # Fedora
+sudo apt install libxkbcommon-x11-0 libgstreamer1.0-0 \
+                 libgstreamer-plugins-base1.0-0                         # Debian
 ```
 
-The AppImage needs neither — that is the point of it.
+For sound and video you want the codecs too — `gstreamer1-plugins-good` and
+`gstreamer1-plugin-libav` on Fedora, `gstreamer1.0-plugins-good` and
+`gstreamer1.0-libav` on Debian. Without them mbrd runs and every board opens;
+only the play button says it has no decoder. The `.deb` and `.rpm` ask for
+these for you.
+
+The AppImage needs none of it — that is the point of it. It carries the
+codecs as well, so a clip plays there whatever the machine has.
+
+**Windows and macOS need nothing installed at all.** They play through the
+decoder the system already has — Media Foundation on Windows, AVFoundation on
+macOS — so there is no runtime to fetch, nothing beside the binary, and the
+Windows download stays the single portable `.exe` it always was. The list above
+is a Linux list because Linux is the platform whose media stack is a package
+rather than part of the OS.
+
+What differs between the three is which formats the machine can decode, and
+that was always going to be true: a codec you do not have is a codec you do not
+have. Everything else — every card, every board, the whole canvas — is the same
+program on all three.
 
 ## Updating
 

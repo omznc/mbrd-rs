@@ -68,6 +68,15 @@ pub const ICON_LG: f32 = 20.0;
 macro_rules! icons {
     ($($variant:ident => $file:literal,)*) => {
         /// One of the pictures. See the module note for where they come from.
+        ///
+        /// **A catalogue, not a call graph.** Dead code is allowed here on
+        /// purpose: this enum *is* the manifest of the SVGs compiled into the
+        /// binary, and an entry with no caller yet is an icon that arrived
+        /// before the screen that will draw it — which is the ordinary order
+        /// to do those two things in. Nothing rots unnoticed, because `ALL`
+        /// below walks every variant and the test walks `ALL`: a variant whose
+        /// file went missing fails the build whether anything draws it or not.
+        #[allow(dead_code)]
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub enum Icon {
             $($variant,)*
@@ -104,11 +113,22 @@ icons! {
     Close => "regular/x",
     New => "regular/plus",
     Check => "regular/check",
+    // The update badge's last state. A shape — a loop of arrow — rather than a
+    // picture of anything, so regular like the four above it, and the only
+    // mark in the titlebar that sits on a filled background.
+    Restart => "regular/arrow-clockwise",
 
     // The marks that say a thing opens onto more. Regular for the same reason
     // the five above are: a caret is a shape rather than a picture of one.
     CaretDown => "regular/caret-down",
     CaretRight => "regular/caret-right",
+    // The tour bar's other direction. Its only caller, which is why it is not
+    // beside a `CaretUp` that nothing asks for.
+    CaretLeft => "regular/caret-left",
+    // The inventory sheet's mark for a row that goes somewhere. A shape, and
+    // deliberately the plainest one available: it is repeated down a column of
+    // thirty rows and has to read as a hint rather than as decoration.
+    Travel => "regular/arrow-right",
     // The pair of carets every dropdown in the world wears, which is the whole
     // reason it is a different mark from `CaretDown`: one caret says "this
     // opens downwards" and two say "this is a value you can change to another
@@ -150,6 +170,18 @@ icons! {
     // The mark a locked card wears in its top corner. See `Command::ToggleLock`.
     Locked => "duotone/lock-simple",
 
+    // Tags: the word itself, and the filter that shows only what wears one.
+    // Two marks rather than one because they answer different questions — a
+    // tag row that is not on the selection wears the first, and the status bar
+    // wears the second whenever a filter is standing.
+    Tag => "duotone/tag",
+    Filter => "duotone/funnel",
+
+    // The status bar's count of what is in the bin. A bin rather than a cross,
+    // because what the number says is "these are still here", and a cross says
+    // the opposite. See `BoardView::bin_selection` for how long that lasts.
+    Binned => "duotone/trash",
+
     // What kind of thing a row in a list is.
     Image => "duotone/image",
     Video => "duotone/video",
@@ -160,7 +192,77 @@ icons! {
     Swatch => "duotone/swatches",
     Sticker => "duotone/sticker",
     Unknown => "duotone/question",
+    // A stored file no card points at. The dashed outline is the whole mark:
+    // it is the same file shape every other row wears, drawn as an outline of
+    // itself, which is what an orphan is.
+    Orphan => "duotone/file-dashed",
     Board => "duotone/squares-four",
+
+    // The four doors on the welcome screen's last page, and the three on an
+    // empty board. Pictures of things rather than shapes, so duotone like the
+    // rest of the table — the plus that is *only* a plus is `New`, above, and
+    // this is the one sitting on a card being offered.
+    NewBoard => "duotone/plus-square",
+
+    // The settings sidebar's six. A section is a place, and a place with a
+    // picture on it is one somebody finds again by shape rather than by
+    // reading six words every time — which is the whole of what they are for,
+    // since none of these is ever the only thing naming its row.
+    //
+    // `Board` and `Drop` already stand for two of the six (`Arranging` is a
+    // board's worth of cards, `Updates` is a thing coming down), and they are
+    // reused rather than duplicated under a second name: an icon means what it
+    // is a picture of, and two names for one picture is how a set drifts.
+    SectionCanvas => "duotone/grid-nine",
+    SectionMedia => "duotone/image-square",
+    SectionGeneral => "duotone/sliders",
+    SectionAppearance => "duotone/palette",
+    Folder => "duotone/folder-open",
+    Explore => "duotone/compass",
+    Tour => "duotone/path",
+    Write => "duotone/note-pencil",
+    Paste => "duotone/clipboard",
+    Drop => "duotone/download-simple",
+
+    // ---------------------------------------------------------------------
+    // The commands
+    // ---------------------------------------------------------------------
+    //
+    // One picture per thing a menu row or a palette row can do — see
+    // `Command::mark`. A menu of nothing but words is a menu read one line at
+    // a time; a menu with pictures down the left is one found by shape, which
+    // is what makes the twentieth visit faster than the first.
+    //
+    // Reused freely, and deliberately: `Ruler` stands for all four rows that
+    // are about measuring, `Crosshair` for both that are about putting the
+    // camera somewhere. Two pictures for one idea is how a set stops meaning
+    // anything.
+    OpenOut => "duotone/arrow-square-out",
+    Rename => "duotone/textbox",
+    Crop => "duotone/crop",
+    Copy => "duotone/copy",
+    Scissors => "duotone/scissors",
+    Colour => "duotone/drop-half",
+    Crosshair => "duotone/crosshair",
+    List => "duotone/list-bullets",
+    Undo => "duotone/arrow-u-up-left",
+    Redo => "duotone/arrow-u-up-right",
+    Save => "duotone/floppy-disk",
+    SelectAll => "duotone/selection-all",
+    SelectNone => "duotone/selection-slash",
+    ZoomIn => "duotone/magnifying-glass-plus",
+    ZoomOut => "duotone/magnifying-glass-minus",
+    Magnet => "duotone/magnet",
+    Ruler => "duotone/ruler",
+    Sparkle => "duotone/sparkle",
+    Eye => "duotone/eye",
+    Shrink => "duotone/arrows-in",
+    Pin => "duotone/map-pin",
+    Move => "duotone/arrows-out-cardinal",
+    Align => "duotone/align-left-simple",
+    Distribute => "duotone/arrows-out-line-horizontal",
+    Weight => "duotone/rows",
+    Paper => "duotone/file",
 }
 
 impl Icon {
