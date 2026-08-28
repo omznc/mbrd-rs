@@ -235,16 +235,8 @@ fn one(
     let scale = target as f32 / longest;
     let w = ((span_w * scale).round() as u32).max(1);
     let h = ((span_h * scale).round() as u32).max(1);
-    let raster = mbrd_core::mesh::rasterize_view(
-        view,
-        mesh,
-        w,
-        h,
-        zoom,
-        orbit.pan_x,
-        orbit.pan_y,
-        ss,
-    )?;
+    let raster =
+        mbrd_core::mesh::rasterize_view(view, mesh, w, h, zoom, orbit.pan_x, orbit.pan_y, ss)?;
     let mut rgba = RgbaImage::from_raw(w, h, raster.rgba)?;
     to_bgra(&mut rgba);
     Some(Arc::new(RenderImage::new(vec![Frame::new(rgba)])))
