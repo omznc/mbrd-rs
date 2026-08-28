@@ -120,6 +120,16 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
+          # `libgstreamer1.0-dev` depends on `libunwind-dev`, and the runner image
+          # ships LLVM's `libunwind-14-dev`, which declares `Breaks: libunwind-dev`.
+          # apt will not pick between the two: it reports "held broken packages" and
+          # installs *nothing*, so the whole step fails — and does it without a line
+          # of this repository having changed, which is why it is worth a comment
+          # rather than a one-liner. Nothing built here links against the LLVM copy,
+          # so that is the one to go. The argument is an apt regex and not a glob,
+          # and the digits are matched rather than spelled out because the number in
+          # that name tracks whichever LLVM the image happens to carry.
+          sudo apt-get remove -y '^libunwind-[0-9]+-dev$' || true
           sudo apt-get install -y \
             libxkbcommon-x11-dev \
             libwayland-dev \
