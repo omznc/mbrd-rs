@@ -322,7 +322,7 @@ pub fn frame_of(id: &str, view: &BoardView) -> Option<String> {
             item.asset.as_ref().and_then(ItemAsset::hash).map(str::to_string)
         }
         // A poster frame, which is the whole of what this build has behind a
-        // clip. Nothing here writes one — see `VIEWING.md` — but a board from
+        // clip. Nothing here writes one — but a board from
         // the original carries them.
         Preview::Video | Preview::Audio => {
             item.meta.get("cover").and_then(serde_json::Value::as_str).map(str::to_string)
@@ -1297,7 +1297,7 @@ fn diff_color(language: Option<&str>, row: &str, theme: &Theme) -> Option<gpui::
 ///
 /// Nothing is highlighted beyond [`diff_color`] — the first thing anybody
 /// needs from a source preview is to be able to say "line 40", and full
-/// syntax colour after that. See `VIEWING.md`.
+/// syntax colour after that.
 fn listed(text: &str, language: Option<&'static str>, theme: Theme) -> AnyElement {
     let rows: Vec<&str> = text.lines().collect();
     let width = rows.len().to_string().len();
@@ -1890,7 +1890,7 @@ fn mesh_picture(
 /// there is nothing behind the playhead in this build. Drawn as a panel rather
 /// than left blank because the rail beside it has the length, the artist and
 /// the size — all of which are real — and a blank middle would read as those
-/// being missing too. See `VIEWING.md` for what goes here.
+/// being missing too.
 fn reel(item: &Item, ready: &Ready, view: &BoardView, theme: Theme) -> AnyElement {
     if ready.picture.is_some() {
         return picture(ready, theme);

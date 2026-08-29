@@ -13,7 +13,7 @@
 //!
 //! ## What is trusted, and by what
 //!
-//! Nothing here is signed by Apple or Microsoft — see `SHIPPING.md` — so the
+//! Nothing here is signed by Apple or Microsoft — see `RELEASING.md` — so the
 //! ed25519 key compiled into this binary is the *entire* boundary between a
 //! release download and arbitrary code execution. That shapes the module:
 //!

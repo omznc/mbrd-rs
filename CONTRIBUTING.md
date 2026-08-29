@@ -1,8 +1,9 @@
 # Contributing
 
 Notes for anyone building, changing, or shipping mbrd. What the app *is* and
-how to drive it is in [`README.md`](README.md); the plan is in
-[`ROADMAP.md`](ROADMAP.md).
+how to drive it is in [`README.md`](README.md); what is left to build is in
+[the issues](https://github.com/omznc/mbrd-rs/issues), and what was deliberately
+left out is at the bottom of this file.
 
 ## Building
 
@@ -227,6 +228,57 @@ letter, a limit counts characters rather than bytes so a note in Greek holds as
 much as one in English, up and down keep the column they started from, and
 `Ctrl S` inside a note saves the board rather than typing an `s`.
 
+## Screenshots
+
+The pictures in `README.md` are **committed**, like the icons, and retaken by
+hand:
+
+```
+python3 scripts/screenshots.py
+```
+
+They are all of one board, `docs/screenshots/studio.mbrd`, which is committed
+beside them so that a retake is the same picture rather than a new one. The
+script runs the app in a nested Xwayland with no window manager on it, which is
+the only way to size a window exactly and capture an undecorated one from a
+Wayland session — [`docs/screenshots/README.md`](docs/screenshots/README.md) is
+the rest of it, including what the pictures on that board are and where they
+came from.
+
+Worth rerunning when the chrome changes: the toolbar, the info rail, the
+command list, the right-click menu and the Appearance panel are all in a shot,
+and a shot that no longer matches the app is worse than no shot.
+
+## What is deliberately not here
+
+Cut on purpose, not forgotten — so an issue asking for one of these should be
+closed with a pointer at this table rather than filed. Where the file format has
+a field for one of them, **the field still round-trips**: dropping data on load
+would break the format's promise even though we do nothing with it.
+
+| cut | why |
+| --- | --- |
+| Custom fonts (drop a font file on the board) | A moodboard tool that is also a font manager. `settings.fonts` still round-trips. |
+| Palettes, dynamic colour extraction, the pigment lab, appearance `vars`, style tiles | Recolouring the whole interface from the board's photographs is a lovely trick and not what anyone opens the app for. `settings.appearance` still round-trips. |
+| Whimsy (the path-style axis) | A setting for how curvy the connection lines are. |
+| Sound cues | An entire synthesis engine for interface feedback. |
+| Quality tiers (the three-step performance setting) | It exists because the browser could not be relied on. Native should just be fast; if it is not, that is a bug to fix rather than a setting to offer. |
+| Service worker, offline shell, QR / phone sharing, mobile web | Meaningless natively. |
+| The Mobile profile: the column packer, per-layout geometry, switching between profiles | No phone runs this build, so there is no device to switch it for. `layouts.mobile`, `settings.mobile`, `mobile_header` and `mobile_columns` still round-trip. |
+
+Sticky notes pinned to a host are cut too, and that one is worth the longer
+note because it **shipped twice** and was wrong both times. First as a
+measurement, where any note lying on a card was pinned to it and `meta.loose`
+was the opt-out: what everybody hit was two things that merely overlapped
+refusing to move apart, for a reason nothing on screen could explain. Then as a
+decision, `meta.sticky` off by default and set from the note's own menu, which
+fixed the surprise and left a feature nobody reached for — a menu row, a
+keystroke, a drop preview, a rule in every layout pass and a special case in
+every gesture that moves something, to buy a caption that travels with a
+photograph. A fence already does that, is visible, and is asked for the same way
+every other grouping is. `core/stick.rs` is gone; the keys it wrote ride through
+`meta` untouched.
+
 ## Cutting a release
 
 ```
@@ -254,4 +306,4 @@ run if it does not.
 The whole of it is in `RELEASING.md`, including the signing key and what
 happens if it is lost, why Windows cannot be cross-compiled from here, why the
 macOS artifact is a bundle rather than a binary, and what "unsigned" costs
-whoever you send it to. The design behind it is in `SHIPPING.md`.
+whoever you send it to. The design behind it is in `RELEASING.md`.

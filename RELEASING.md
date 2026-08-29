@@ -146,7 +146,7 @@ must be a copy somewhere that is not GitHub.
 
 ## What the updater does, and where it refuses
 
-`crates/app/src/update/` — the design is in `SHIPPING.md`. The parts worth
+`crates/app/src/update/`. The parts worth
 knowing when cutting a release:
 
 - The client asks one fixed URL, `releases/latest/download/latest.json`, which
@@ -263,8 +263,8 @@ What that means for a release:
   app and opens every board — only the play button says it cannot.
 - The Windows `.exe` and the macOS `.app` install nothing, bundle nothing and
   are still one file and one bundle. That is the whole reason those two
-  backends are native rather than a fourth copy of GStreamer; `SHIPPING.md`
-  has what the other choice would have cost.
+  backends are native rather than a fourth copy of GStreamer; **Why three
+  media backends** below has what the other choice would have cost.
 - Neither of those two can be built or type-checked on the Linux runner that
   builds them, so a media change is checked by the platform's own job or not at
   all. A tag is a bad place to find that out — see `CONTRIBUTING.md`.
@@ -311,6 +311,43 @@ accrues to a signing certificate over downloads, so a cheap certificate does not
 fix it immediately either.
 
 On **Linux** nobody asks.
+
+## What is settled, and why
+
+| question | answer |
+| --- | --- |
+| OS vendor code signing | **No.** Unsigned stays unsigned. Trust for updates comes from our own key, not Apple's or Microsoft's. |
+| How far the updater goes | **Full self-replacement.** Check, download, verify, swap, relaunch. |
+| Linux artifacts | **AppImage, `.deb`, `.rpm`**, alongside the tarball. |
+| Windows artifacts | **Portable `.exe`** plus an NSIS per-user installer. |
+
+The first two interact, which is the point of listing them together: **unsigned
+plus self-replacing means the updater's own signature is the entire security
+boundary.** There is no OS check behind it to catch a mistake, so a bug in the
+verification path is remote code execution on every machine that has the app.
+That is why the manifest and its key came before the download path, and why the
+swap refuses more often than it agrees — see **The signing key** above.
+
+### Why three media backends rather than GStreamer everywhere
+
+Every platform plays and no platform ships a decoder: `main.rs` picks the
+backend by target — GStreamer on Linux, AVFoundation on macOS, the Media
+Foundation Media Engine on Windows — and each one is the stack that machine
+already has.
+
+The alternative was GStreamer everywhere. One file instead of three, and it
+would have cost exactly what this document is about: roughly 100 MB of MSVC DLLs
+beside the `.exe`, which the installer could carry and the *portable single
+file* could not — so the two Windows artifacts would have stopped being the same
+program; and `GStreamer.framework` inside `mbrd.app/Contents/Frameworks` with an
+`install_name_tool` pass and a real signature, which the ad-hoc `codesign` this
+release does would not survive.
+
+Two more backends is more code to be wrong in, and it buys back a single-file
+Windows build, an unchanged `.app`, and nothing new to install on either.
+`Stack` is the whole door and all three fit through it; `spill.rs` is the part
+they share. So the packaging cost lands on Linux alone, which is the same shape
+as everything else here.
 
 ## What isn't automated
 

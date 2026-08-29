@@ -147,7 +147,8 @@ pub fn of(item: &Item, asset: Option<&Asset>) -> Preview {
 
         ItemType::Image | ItemType::Sticker => match asset {
             None => Preview::Nothing,
-            // Rasterised by `resvg`, in the crate that draws — see `VIEWING.md`.
+            // Rasterised by `resvg`, in the crate that draws: this module
+            // says what to try and never opens a decoder itself.
             // The four below are a different case entirely: real pictures,
             // correctly named, that no decoder in this tree can open.
             Some(_) if ext == "svg" => Preview::Vector,

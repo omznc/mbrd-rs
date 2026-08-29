@@ -224,7 +224,7 @@ jobs:
           # The updater's copy, tarred *after* the signature so the bundle it
           # installs is the one macOS will run. A `.dmg` would need `hdiutil
           # attach` and a mounted filesystem to read one directory out of; a
-          # tarball needs two crates and no subprocess. See SHIPPING.md.
+          # tarball needs two crates and no subprocess. See RELEASING.md.
           tar -czf "dist/mbrd_${VERSION}_${{ matrix.arch }}.app.tar.gz" \
             -C stage mbrd.app
 
@@ -373,7 +373,7 @@ jobs:
   # What the in-app updater reads, and the only thing standing between a
   # release download and arbitrary code execution on somebody's machine —
   # nothing here is signed by Apple or Microsoft, so this signature is the
-  # entire trust boundary. See SHIPPING.md.
+  # entire trust boundary. See RELEASING.md.
   #
   # Last, and its own job, because it hashes the artifacts the four build jobs
   # produced: it cannot run until all of them have finished, and it must not

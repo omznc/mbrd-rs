@@ -506,7 +506,7 @@ fn kind_of(ext: &str) -> ItemType {
         // draw — a permanently empty frame, which is worse than the named file
         // card every other unopenable format already gets. Reclassified rather
         // than dropped: the bytes are kept, so a build that grows a decoder can
-        // call them images again. See `VIEWING.md`.
+        // call them images again. See `preview::UNREADABLE`.
         _ => ItemType::Generic,
     }
 }

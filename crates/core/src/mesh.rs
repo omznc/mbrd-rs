@@ -1,12 +1,12 @@
 //! A mesh, rasterised to a still picture with no GPU anywhere near it.
 //!
-//! `ROADMAP.md`'s Phase 11 defers 3D on the grounds that GPUI has no 3D. That
-//! is true and it is the wrong constraint: a still of a mesh needs no GPU at
+//! The port's original call was to defer 3D on the grounds that GPUI has no 3D.
+//! That is true and it is the wrong constraint: a still of a mesh needs no GPU at
 //! all. Transform the vertices, cull the back faces, z-buffer, flat-shade the
 //! triangles into a flat RGBA buffer — a few hundred lines of arithmetic
 //! against a vertex buffer, which is to say exactly the kind of thing this
 //! crate is for, testable by rasterising a cube and asserting which pixels
-//! came out. See `VIEWING.md`'s "A mesh is a rasterisation problem".
+//! came out.
 //!
 //! ## What this will not do, said before anybody asks
 //!
@@ -713,7 +713,7 @@ fn downsample(hi: &Raster, width: u32, height: u32, ss: u32) -> Raster {
 mod tests {
     use super::*;
 
-    /// A unit cube centred on the origin — the fixture `VIEWING.md` itself
+    /// A unit cube centred on the origin — the fixture the rasteriser's plan
     /// names as the one to prove the rasteriser with. Twelve triangles, two
     /// per face, wound so each one's own cross product already points
     /// outward.

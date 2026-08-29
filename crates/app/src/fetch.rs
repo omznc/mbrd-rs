@@ -237,7 +237,7 @@ pub fn worth_fetching(ext: &str) -> bool {
         ext,
         // Pictures, including the ones this build cannot decode yet: they
         // arrive as named file cards, exactly as they do off the disk, and a
-        // build that grows a decoder gets them for free. See `VIEWING.md`.
+        // build that grows a decoder gets them for free.
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "ico" | "svg"
             | "avif" | "heic" | "heif" | "jxl"
             // Video.
