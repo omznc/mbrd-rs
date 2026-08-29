@@ -281,17 +281,26 @@ jobs:
 
           mv mbrd*.AppImage "dist/mbrd_${VERSION}_${{ matrix.arch }}.AppImage"
 
-      # Prebuilt binaries rather than `cargo install`, which compiled both of
-      # these from source on every run — 2m25s of the v0.2.0 release spent
-      # building tools that produce two files in about ten seconds. The
-      # versions are pinned for the reason everything else on this path is:
-      # a release is a bad moment to find out what changed upstream. Bumping
-      # them is editing this line.
+      # Built from source, and *not* fetched as a prebuilt binary, because the
+      # two constraints on this job point in opposite directions. The runner is
+      # pinned to 22.04 so the binary we ship starts on an old glibc; upstream
+      # builds its release binaries on something newer, and v0.4.0 died here on
+      # `cargo-deb: libc.so.6: version GLIBC_2.39 not found`. A prebuilt tool
+      # has to have been built against a glibc no newer than the floor this job
+      # exists to hold, and nothing guarantees that from one upstream release
+      # to the next.
+      #
+      # Compiling costs about two and a half minutes to produce two files in
+      # ten seconds, which is a real price and worth naming. It buys a step
+      # that cannot be broken by somebody else's choice of build machine. The
+      # versions stay pinned for the reason everything on this path is: a
+      # release is a bad moment to find out what changed upstream. `--locked`
+      # so each tool's own lockfile is used rather than resolved fresh.
       - name: Install the packaging tools
         if: runner.os == 'Linux'
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deb@3.7.0,cargo-generate-rpm@0.21.0
+        run: |
+          cargo install cargo-deb@3.7.0 --locked
+          cargo install cargo-generate-rpm@0.21.0 --locked
 
       # Native packages, for people who would rather their package manager
       # knew about this. Both set MBRD_PACKAGED, which is what stops the

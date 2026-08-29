@@ -140,7 +140,23 @@ jobs:
       # and a release build with fat LTO would treble the time it takes to
       # find out that a `sed` in a shell script has a typo in it.
       - name: Build
+        if: runner.os != 'Linux'
         run: cargo build -p mbrd --target ${{ matrix.target }}
+
+      # Linux builds into `target/release` under the release profile instead,
+      # and it has to: `cargo deb` and `cargo generate-rpm` read that exact
+      # path out of `crates/app/Cargo.toml`, and `cargo deb` refuses the `dev`
+      # profile outright. The three overrides take the fat LTO, the single
+      # codegen unit and the optimisation back off again, so this costs about
+      # what the debug build on the other two legs does. What is being proved
+      # here is the packaging, not the code generation.
+      - name: Build for packaging
+        if: runner.os == 'Linux'
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: "0"
+        run: cargo build --release -p mbrd
 
       - name: Assemble the macOS bundle
         if: runner.os == 'macOS'
@@ -166,6 +182,21 @@ jobs:
           mkdir -p /tmp/mime/packages
           cp packaging/linux/mbrd.xml /tmp/mime/packages/
           update-mime-database /tmp/mime
+
+      # The same two tools the release installs, installed the same way, and
+      # then actually run. This is the step that would have caught v0.4.0:
+      # the release fetched a *prebuilt* `cargo-deb` linked against a newer
+      # glibc than this deliberately-pinned runner has, and the first anybody
+      # knew of it was a tag with six of ten artifacts on it. Building both
+      # packages here means a tag is no longer where that is discovered.
+      - name: Build the deb and the rpm
+        if: runner.os == 'Linux'
+        run: |
+          cargo install cargo-deb@3.7.0 --locked
+          cargo install cargo-generate-rpm@0.21.0 --locked
+          cargo deb -p mbrd --no-build --output /tmp/mbrd.deb
+          cargo generate-rpm -p crates/app --output /tmp/mbrd.rpm
+          ls -lh /tmp/mbrd.deb /tmp/mbrd.rpm
 
       - name: Check the installer script
         if: runner.os == 'Windows'
