@@ -4766,19 +4766,22 @@ impl BoardView {
     /// the reason on the reel and the next `pump_media` reports it once. That
     /// is deliberately not done here, because the same failure would otherwise
     /// be announced twice on the frame it happens.
-    fn start_reel(&mut self, id: &str) -> bool {
+    fn start_reel(&mut self, id: &str) -> crate::pipeline::Opening {
+        use crate::pipeline::Opening;
         // Split, so the assets can be read while the stack is written to.
         let Self { doc, stack, .. } = self;
-        let Some(item) = doc.board.item(id) else { return false };
+        let Some(item) = doc.board.item(id) else { return Opening::Refused };
         let video = match item.kind {
             ItemType::Video => true,
             ItemType::Audio => false,
             // Everything else that plays is a picture that moves, and moves
-            // out of its own frames.
-            _ => return true,
+            // out of its own frames. Nothing to open, and nothing to wait for.
+            _ => return Opening::Ready,
         };
-        let Some(hash) = item.asset.as_ref().and_then(ItemAsset::hash) else { return false };
-        let Some(asset) = doc.assets.get(hash) else { return false };
+        let Some(hash) = item.asset.as_ref().and_then(ItemAsset::hash) else {
+            return Opening::Refused;
+        };
+        let Some(asset) = doc.assets.get(hash) else { return Opening::Refused };
         stack.open(id, hash, &asset.ext, &asset.bytes, video)
     }
 
@@ -4815,7 +4818,13 @@ impl BoardView {
                         // so that a file this machine cannot play leaves the
                         // card exactly as it was rather than running a
                         // scrubber across silence.
-                        if moves && self.start_reel(id) {
+                        // Anything but a refusal starts the playhead. A file
+                        // still being unpacked is not a reason to leave the
+                        // press unanswered — see `pump_media`, which holds
+                        // such a playhead at the start rather than letting the
+                        // clock run away with it, so the card reads as
+                        // "opening" rather than as a button that did nothing.
+                        if moves && self.start_reel(id) != crate::pipeline::Opening::Refused {
                             self.media.play(id, length, looping);
                         }
                     }
@@ -6073,18 +6082,32 @@ impl BoardView {
         }
     }
 
+    /// Close whichever theme picker is up, and hand back what it was.
+    ///
+    /// Two surfaces put the same `Picker` on screen — the settings page and
+    /// the welcome screen — for the reason `settings::picker_key` gives: one
+    /// picker rather than two is what keeps arrowing and Escape meaning the
+    /// same thing on both. The *panel* is shared as well, so the two handlers
+    /// its rows press have to be able to reach either one. Reaching only into
+    /// `Overlay::Settings` is what left every row of the welcome screen's
+    /// list, and the ground around it, pressing to nothing.
+    fn take_picker(&mut self) -> Option<crate::settings::Picker> {
+        match &mut self.overlay {
+            Overlay::Settings(page) => page.picking.take(),
+            Overlay::Welcome(screen) => screen.picking.take(),
+            _ => None,
+        }
+    }
+
     /// Keep the theme the picker is on.
     pub fn choose_theme(&mut self, name: String, cx: &mut Context<Self>) {
-        let Overlay::Settings(page) = &mut self.overlay else { return };
-        let Some(appearance) = page.picking.as_ref().map(|p| p.appearance) else { return };
-        page.picking = None;
-        self.set_theme(appearance, name, cx);
+        let Some(picker) = self.take_picker() else { return };
+        self.set_theme(picker.appearance, name, cx);
     }
 
     /// Put back whatever was chosen before the picker opened.
     pub fn cancel_theme_pick(&mut self, cx: &mut Context<Self>) {
-        let Overlay::Settings(page) = &mut self.overlay else { return };
-        let Some(picker) = page.picking.take() else { return };
+        let Some(picker) = self.take_picker() else { return };
         // The *choice* is restored through the ordinary setter, and the
         // palette on screen through `cancel_preview`. Both, and in that
         // order: the setter is what makes `retheme` agree with the prefs
@@ -8853,7 +8876,7 @@ impl BoardView {
         // card is a thumbnail — so what it means here is the page. Typing is
         // what the page is *for*: double-click the words once they are shown
         // and the session opens there, where there is room for it. See
-        // `opened::words` and `VIEWING.md`.
+        // `opened::words`.
         //
         // `F2` is still the key for typing on the board itself, unchanged, and
         // `Escape` is still the way back out of a group.
@@ -10650,7 +10673,15 @@ impl BoardView {
         // before it reaches a button. Idempotent, and a no-op for an
         // animation.
         for id in self.media.playing() {
-            self.start_reel(&id);
+            // A card whose file is still being laid out on disk keeps its
+            // playhead at the start rather than letting the wall clock run
+            // away with it — see `Media::sync`, and `crate::spill` for what it
+            // is waiting on. Without this the scrubber creeps forward for as
+            // long as the disk takes and then snaps back the moment the
+            // decoder answers, which reads as the clip having stuttered.
+            if self.start_reel(&id) == crate::pipeline::Opening::Waiting {
+                self.media.sync(&id, Duration::ZERO, None);
+            }
         }
 
         let mut moved = false;

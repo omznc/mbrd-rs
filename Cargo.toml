@@ -28,7 +28,7 @@ flate2 = "1"
 # video card that still could not use the GPU somebody has.
 #
 # The split is a shipping decision and it is argued in `main.rs`,
-# `pipeline.rs` and `SHIPPING.md`. Briefly: GStreamer is the best of the three
+# `pipeline.rs` and `RELEASING.md`. Briefly: GStreamer is the best of the three
 # and the only one that is a *system* dependency, which on Linux is free and on
 # the other two would cost Windows its single-file portable `.exe` and macOS a
 # bundled framework and a real signature. AVFoundation and Media Foundation are
@@ -51,6 +51,12 @@ objc2-av-foundation = { version = "0.3", default-features = false, features = [
     "AVPlayerItemOutput",
     "objc2-core-media",
     "objc2-core-video",
+    # `AVPlayerItem::presentationSize`, which is a `CGSize` and so is gated on
+    # Core Foundation. It is what lets the video output be asked for frames at
+    # the size they will be *drawn* rather than the size they were shot — see
+    # the note on `LONGEST_SIDE` in `pipeline_mac.rs`, which is about why a
+    # 4K frame must not reach the thread that draws.
+    "objc2-core-foundation",
 ] }
 # `objc2` on each of these is the interop half — the `Encode` and `Retained`
 # impls that let a `CMTime` cross a message send and a pixel buffer be held.
@@ -99,8 +105,8 @@ windows = { version = "0.62", features = [
     "Win32_System_Com",
 ] }
 # A PDF's page count and the text pulled out of it, with no rasteriser
-# anywhere behind it — that is a native dependency and, per `VIEWING.md`,
-# not the price of entry for reading what a PDF actually says.
+# anywhere behind it: a rasteriser is a native dependency, and that is not the
+# price of entry for reading what a PDF actually says.
 lopdf = "0.44"
 minisign-verify = "0.2"
 # The Markdown front end. `default-features = false` because the crate also
@@ -109,10 +115,10 @@ minisign-verify = "0.2"
 # every event, which is what lets a block remember which bytes of the note it
 # came from.
 pulldown-cmark = { version = "0.13", default-features = false }
-# The one dependency VIEWING.md calls the highest value per unit of work in
-# tranche 4: an SVG shown as a picture rather than as its own XML. Re-exports
-# `usvg` and `tiny_skia`, so nothing else here needs to depend on either
-# directly.
+# The highest value per unit of work in the whole preview list: an SVG shown
+# as a picture rather than as its own XML, and its markup still one Edit button
+# away. Re-exports `usvg` and `tiny_skia`, so nothing else here needs to depend
+# on either directly.
 resvg = "0.48"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

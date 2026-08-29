@@ -21,6 +21,43 @@
 //! being that close is not luck: both are describing the same object, one that
 //! HTML settled the shape of a long time ago.
 //!
+//! ## Everything Media Foundation happens on a thread of its own
+//!
+//! **This is the biggest difference between this backend and the other two, and
+//! it is not a preference.** Media Foundation does not support the
+//! single-threaded apartment: it does not marshal STA objects onto its work
+//! queues and does not maintain STA invariants, and its own components cannot
+//! run in one. Microsoft says so in as many words.
+//!
+//! gpui's main thread *is* an STA — it calls `OleInitialize` before any of this
+//! app's code runs, because that is what a window needs for drag and drop. So
+//! the thread that draws is the one thread in the process that must not own a
+//! Media Engine. This file used to own them all there: `MFStartup`,
+//! `CreateInstance`, every `Play` and every `TransferVideoFrame`, on the STA.
+//! That is a documented-unsupported configuration, and the shape of its failure
+//! is a hang — `IMFMediaEngine::Shutdown` blocks until the engine's worker
+//! threads stop, those threads want to call back into the apartment, and the
+//! apartment is inside `Shutdown` and no longer pumping messages.
+//!
+//! So there is a worker thread here that calls `CoInitializeEx` with
+//! `COINIT_MULTITHREADED`, and every COM object in this file is created on it,
+//! used on it and released on it. Nothing that is not plain data crosses back.
+//!
+//! ## Which makes the seam a snapshot rather than a call
+//!
+//! The other two backends answer `poll` by asking the decoder, on the spot, on
+//! the thread that draws. This one cannot, so it does not: [`Shared`] is a map
+//! the board writes what it *wants* into and the worker writes what it *found*
+//! into, and every method on [`Stack`] is a short lock over that map and
+//! nothing else. The board never waits for a decoder and the decoder never
+//! waits for a frame.
+//!
+//! That inverts one thing worth being explicit about. `play` and `pause` here
+//! do not start or stop anything; they record that the board would like the
+//! card started or stopped, and the worker makes it so within a tick. Since
+//! `BoardView::pump_media` already calls them on every frame for every playing
+//! card — idempotently, by design — the difference does not reach the board.
+//!
 //! ## Frame-server mode, and why there is no Direct3D in this file
 //!
 //! Given no playback window and no DXGI device manager, the Media Engine runs
@@ -33,21 +70,13 @@
 //! There is a real cost to admit: this is the software path, so a large clip is
 //! decoded on the CPU and copied once. It is bounded by [`LONGEST_SIDE`] — the
 //! engine letterboxes and scales into whatever rectangle it is given, so the
-//! scaling happens *inside* the engine rather than in our own loop.
-//!
-//! ## Polled, not called back
-//!
-//! The Media Engine requires a callback — `MFCreateMediaEngine` refuses without
-//! one — so there is a [`Notify`] here, and it does as little as it is allowed
-//! to: it sets one atomic. Everything else is asked from the board's frame
-//! loop, on the thread that draws, for the same reason the other two backends
-//! do it that way. Nothing on a Media Foundation worker thread ever touches a
-//! view it does not own.
+//! scaling happens *inside* the engine rather than in our own loop — and it now
+//! happens on the worker rather than on the thread that draws.
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui::RenderImage;
@@ -69,7 +98,7 @@ use windows::Win32::Media::MediaFoundation::{
     MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, MF_VERSION,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
 
 /// The longest edge a frame is transferred at.
@@ -80,10 +109,26 @@ use windows::Win32::System::Com::{
 /// same bargain `videoscale` gives the Linux backend.
 const LONGEST_SIDE: u32 = 1024;
 
+/// How long the worker waits between ticks while something is playing.
+///
+/// A display's frame, near enough. The board consumes at most one picture per
+/// drawn frame, so a worker running faster than this would decode frames for
+/// nobody; one running much slower would be a video that stutters against a
+/// board that does not.
+const TICK: Duration = Duration::from_millis(16);
+
+/// And while nothing is.
+///
+/// A board of photographs still has this thread on it — it is started by the
+/// first card that plays and lives as long as the window — so the resting cost
+/// has to be near enough nothing. Ten wakeups a second is what it costs to
+/// notice a press within a frame or two of it happening.
+const REST: Duration = Duration::from_millis(100);
+
 /// What one frame of the clock says about a card that is playing.
 ///
-/// The other two backends' twin. Kept in step by the fact that `board_view.rs`
-/// reads every field of it — see `BoardView::pump_media`.
+/// The other two backends' twin. Kept in step by the fact that
+/// `board_view.rs` reads every field of it — see `BoardView::pump_media`.
 #[derive(Debug, Clone, Default)]
 pub struct Beat {
     /// Where the playhead really is, according to the decoder rather than to a
@@ -99,17 +144,450 @@ pub struct Beat {
     pub trouble: Option<String>,
 }
 
+/// What asking for a card's decoder found.
+///
+/// Three answers rather than a `bool`, because the two halves of "no" mean
+/// opposite things to the frame loop. A card whose file is still being laid
+/// out on disk is one to ask about again on the next frame; a card this
+/// machine cannot play is one to leave alone forever. See `crate::spill`,
+/// which is where the middle answer comes from, and `BoardView::pump_media`,
+/// which is what does the asking again.
+///
+/// On this backend `Waiting` covers one more case than it does on the other
+/// two: the file may be laid out and the *engine* not built yet, because
+/// building it is the worker's job and the worker runs on its own clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Opening {
+    /// There is a decoder for this card now.
+    Ready,
+    /// The file is still being unpacked, or the worker has not built the
+    /// engine yet. Ask again.
+    Waiting,
+    /// There will not be one. The card has been told why, and `poll` will
+    /// hand that sentence over once.
+    Refused,
+}
+
+// ---------------------------------------------------------------------------
+// What crosses between the board and the worker
+// ---------------------------------------------------------------------------
+
+/// What the board would like a card to be doing.
+///
+/// Written by the board, read by the worker, and *only* ever a wish: nothing
+/// in here is a call, so nothing in here can block the thread that draws. The
+/// worker brings the engine into line with it on its next tick.
+#[derive(Debug, Clone, Copy)]
+struct Want {
+    playing: bool,
+    looping: bool,
+    volume: f32,
+    muted: bool,
+    /// Where the board dragged the playhead to. Taken by the worker rather
+    /// than read, so a seek happens once and is not re-applied every tick —
+    /// which would be a scrubber that could not be let go of.
+    seek: Option<Duration>,
+}
+
+impl Default for Want {
+    fn default() -> Self {
+        // Full volume rather than silence, so a card whose loudness nobody has
+        // set is audible. `BoardView::pump_media` overwrites this on the first
+        // frame anyway; the default is what one tick before that sounds like.
+        Self { playing: false, looping: false, volume: 1.0, muted: false, seek: None }
+    }
+}
+
+/// What the worker found out about a card.
+///
+/// Written by the worker, drained by the board. `ended` and `fresh` are
+/// *accumulated* rather than sampled: the worker may tick twice between two of
+/// the board's frames, and an end that happened on the first of them must not
+/// be lost because the second one did not also end.
+#[derive(Debug, Default, Clone)]
+struct News {
+    at: Duration,
+    length: Option<Duration>,
+    ended: bool,
+    fresh: bool,
+    /// Set once by the worker. `told` is what stops it being said every frame
+    /// — the same contract the other two backends' `Reel::told` holds.
+    trouble: Option<String>,
+    told: bool,
+    picture: Option<Arc<RenderImage>>,
+    /// Whether the worker has an engine for this card yet.
+    live: bool,
+}
+
+/// One card, as both sides see it.
+#[derive(Debug, Clone)]
+struct Card {
+    /// The file, already laid out on disk by [`crate::spill`]. Read once, by
+    /// the worker, when it builds the engine.
+    source: PathBuf,
+    video: bool,
+    want: Want,
+    news: News,
+    /// Since when this card has been standing still, for [`Stack::trim`].
+    /// Board-side: it is the board that knows what it asked for.
+    rested: Option<Instant>,
+}
+
+/// The whole of what the two threads share.
+#[derive(Debug, Default)]
+struct Shared {
+    /// `None` until the worker has tried to bring Media Foundation up;
+    /// `Some(false)` on a machine where it would not — Windows N without the
+    /// Media Feature Pack is the real case, and it is somebody's actual
+    /// computer.
+    up: Option<bool>,
+    /// Every card the board has asked for. **This map is the contract**: an id
+    /// in here is a card the worker should have an engine for, and an id that
+    /// leaves it is a card the worker should tear down. The worker keeps its
+    /// engines in a map of its own and reconciles against this one, which is
+    /// what makes "the board deleted a card" and "the board trimmed a card"
+    /// one case instead of two.
+    cards: HashMap<String, Card>,
+}
+
+// ---------------------------------------------------------------------------
+// The board's side
+// ---------------------------------------------------------------------------
+
+/// Every engine there is, seen from the thread that draws.
+///
+/// Holds no COM object of any kind, deliberately — see the module note. What it
+/// holds is a handle on the worker and a lock over what the two of them say to
+/// each other.
+pub struct Stack {
+    shared: Arc<Mutex<Shared>>,
+    /// Cleared on the way out, which is how the worker learns to stop.
+    running: Arc<AtomicBool>,
+    /// `false` until the first card asks to play. Starting a media stack scans
+    /// codecs and stands a thread up, and a board of photographs should not
+    /// pay for either.
+    started: bool,
+    spill: Option<crate::spill::Spill>,
+}
+
+impl Default for Stack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Stack {
+    pub fn new() -> Self {
+        Self {
+            shared: Arc::default(),
+            running: Arc::new(AtomicBool::new(true)),
+            started: false,
+            spill: None,
+        }
+    }
+
+    /// Stand the worker up, once.
+    ///
+    /// Answers whether there is a thread to talk to, which is not the same
+    /// question as whether Media Foundation came up on it — that one is the
+    /// worker's to answer and arrives later, in `Shared::up`. A machine with no
+    /// media stack therefore reports `Waiting` for a tick or two before it
+    /// reports the refusal, which is right: "we do not know yet" is the honest
+    /// answer until the thread has been round once.
+    fn start(&mut self) -> bool {
+        if self.started {
+            return true;
+        }
+        self.started = true;
+        self.spill = Some(crate::spill::Spill::open());
+
+        let shared = self.shared.clone();
+        let running = self.running.clone();
+        std::thread::Builder::new()
+            .name("mbrd-media".into())
+            .spawn(move || work(&shared, &running))
+            .is_ok()
+    }
+
+    /// Make sure there is an engine for this card, and say how far off one is.
+    ///
+    /// Idempotent, and cheap on every frame after the first: this is a lock, a
+    /// map lookup and — on the frame a clip is first pressed — an `is_file`.
+    /// `bytes` is only *copied* on the frame that starts the spill.
+    pub fn open(&mut self, id: &str, hash: &str, ext: &str, bytes: &[u8], video: bool) -> Opening {
+        if !self.start() {
+            self.refuse(id, "the media thread would not start");
+            return Opening::Refused;
+        }
+
+        // Looked at before the spill is asked, so a card that already has an
+        // engine costs nothing at all.
+        {
+            let Ok(shared) = self.shared.lock() else {
+                return Opening::Refused;
+            };
+            if shared.up == Some(false) {
+                drop(shared);
+                self.refuse(id, "no media stack on this machine");
+                return Opening::Refused;
+            }
+            if let Some(card) = shared.cards.get(id) {
+                return match (&card.news.trouble, card.news.live) {
+                    (Some(_), _) => Opening::Refused,
+                    (None, true) => Opening::Ready,
+                    (None, false) => Opening::Waiting,
+                };
+            }
+        }
+
+        let laid = match self.spill.as_ref() {
+            Some(spill) => spill.lay_out(hash, ext, bytes),
+            None => crate::spill::Laid::Nowhere("nowhere to unpack this file".into()),
+        };
+        let source = match laid {
+            crate::spill::Laid::Ready(path) => path,
+            // Still being written, on a thread. Not a failure and not a card
+            // yet — and deliberately not recorded, because a refusal is what
+            // stops a card ever being tried again.
+            crate::spill::Laid::Working => return Opening::Waiting,
+            crate::spill::Laid::Nowhere(why) => {
+                self.refuse(id, &why);
+                return Opening::Refused;
+            }
+        };
+
+        let Ok(mut shared) = self.shared.lock() else {
+            return Opening::Refused;
+        };
+        shared.cards.insert(
+            id.to_string(),
+            Card {
+                source,
+                video,
+                want: Want::default(),
+                news: News::default(),
+                // Built paused, so `rested` starts stamped: a card opened and
+                // then never played is trimmable like any other.
+                rested: Some(Instant::now()),
+            },
+        );
+        // The engine is the worker's to build, and it has not been round since
+        // this was inserted.
+        Opening::Waiting
+    }
+
+    /// Record a failure against a card that never became one.
+    ///
+    /// A card rather than a map of its own, unlike the other two backends: here
+    /// there is no COM object to stand in the struct's shape either way, so a
+    /// refusal is just a card the worker will never find anything to do with —
+    /// it has no `source` worth reading and its `trouble` is already set, which
+    /// is the one thing `tick` checks before building anything.
+    fn refuse(&mut self, id: &str, why: &str) {
+        let Ok(mut shared) = self.shared.lock() else { return };
+        let card = shared.cards.entry(id.to_string()).or_insert_with(|| Card {
+            source: PathBuf::new(),
+            video: false,
+            want: Want::default(),
+            news: News::default(),
+            rested: Some(Instant::now()),
+        });
+        if card.news.trouble.is_none() {
+            card.news.trouble = Some(why.to_string());
+        }
+    }
+
+    /// Change what the board wants of one card.
+    ///
+    /// Every setter goes through here, because every one of them is the same
+    /// three lines and because a setter that took the lock differently from its
+    /// neighbours would be the one that held it too long.
+    fn wish(&mut self, id: &str, change: impl FnOnce(&mut Card)) {
+        let Ok(mut shared) = self.shared.lock() else { return };
+        if let Some(card) = shared.cards.get_mut(id) {
+            if card.news.trouble.is_none() {
+                change(card);
+            }
+        }
+    }
+
+    /// Start, or carry on.
+    ///
+    /// Called every frame for every playing card rather than at the press — see
+    /// `BoardView::pump_media`. Recording that a card should be playing when it
+    /// already should be is a write of a `true` over a `true`, which is what
+    /// makes "the decoder follows the playhead" affordable as a rule.
+    pub fn play(&mut self, id: &str) {
+        self.wish(id, |card| {
+            card.rested = None;
+            card.want.playing = true;
+        });
+    }
+
+    pub fn pause(&mut self, id: &str) {
+        self.wish(id, |card| {
+            // Stamped once and not on every frame it stays paused, so the stamp
+            // says when it stopped rather than when it was last asked.
+            card.rested.get_or_insert_with(Instant::now);
+            card.want.playing = false;
+        });
+    }
+
+    /// Move the playhead. `at` is from the start.
+    pub fn seek(&mut self, id: &str, at: Duration) {
+        self.wish(id, |card| card.want.seek = Some(at));
+    }
+
+    /// How loud, `0.0..=1.0`, and whether it is silenced.
+    pub fn set_loudness(&mut self, id: &str, level: f32, muted: bool) {
+        self.wish(id, |card| {
+            card.want.volume = level.clamp(0.0, 1.0);
+            card.want.muted = muted;
+        });
+    }
+
+    /// One frame of the clock for one card: what the worker has found since the
+    /// last time this was asked.
+    ///
+    /// `looping` is taken rather than remembered because it is board state and
+    /// can change under a playing card. It is recorded on the way past, which
+    /// is the one write this method does.
+    pub fn poll(&mut self, id: &str, looping: bool) -> Option<Beat> {
+        let mut shared = self.shared.lock().ok()?;
+        let card = shared.cards.get_mut(id)?;
+        card.want.looping = looping;
+
+        if let Some(why) = &card.news.trouble {
+            // Once. A card that says "no decoder for this" every frame would
+            // hold the status bar for as long as it is on screen.
+            if card.news.told {
+                return None;
+            }
+            card.news.told = true;
+            return Some(Beat { trouble: Some(why.clone()), ..Beat::default() });
+        }
+
+        Some(Beat {
+            at: card.news.at,
+            length: card.news.length,
+            // Taken, not read: these are things that *happened*, and a happening
+            // reported twice is a loop that restarts twice.
+            ended: std::mem::take(&mut card.news.ended),
+            fresh: std::mem::take(&mut card.news.fresh),
+            trouble: None,
+        })
+    }
+
+    /// The newest picture for a card, for the painter.
+    pub fn picture(&self, id: &str) -> Option<Arc<RenderImage>> {
+        self.shared.lock().ok()?.cards.get(id)?.news.picture.clone()
+    }
+
+    /// Which cards have something standing, so the frame loop knows what to
+    /// poll without walking the board. Includes the ones that failed to open,
+    /// which is how their one message gets out.
+    pub fn open_reels(&self) -> Vec<String> {
+        match self.shared.lock() {
+            Ok(shared) => shared.cards.keys().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Tear one down — the card was deleted, stopped, or trimmed.
+    ///
+    /// Taking it out of the map is the whole of it. The engine belongs to the
+    /// worker, which shuts down anything it holds that the map no longer names
+    /// — on its own thread, where a blocking `Shutdown` costs nobody a frame.
+    /// That is the point of the reconciliation: this call cannot hang.
+    pub fn forget(&mut self, id: &str) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.cards.remove(id);
+        }
+    }
+
+    /// Everything, for a board being closed.
+    pub fn forget_all(&mut self) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.cards.clear();
+        }
+    }
+
+    /// Drop the cards that have been standing still longest, down to `keep`.
+    /// See `pipeline::Stack::trim`, which holds the argument.
+    pub fn trim(&mut self, keep: usize) {
+        let Ok(mut shared) = self.shared.lock() else { return };
+        let mut resting: Vec<(String, Instant)> = shared
+            .cards
+            .iter()
+            .filter_map(|(id, card)| card.rested.map(|at| (id.clone(), at)))
+            .collect();
+        if resting.len() <= keep {
+            return;
+        }
+        resting.sort_by_key(|(_, at)| *at);
+        let over = resting.len() - keep;
+        for (id, _) in resting.into_iter().take(over) {
+            shared.cards.remove(&id);
+        }
+    }
+}
+
+impl Drop for Stack {
+    fn drop(&mut self) {
+        // Emptied first, so that the last thing the worker does before it
+        // notices it is finished is shut every engine down — see `work`, which
+        // reconciles before it checks whether to carry on.
+        self.forget_all();
+        self.running.store(false, Ordering::Relaxed);
+        // **Not joined**, and that is the whole reason this thread exists.
+        // Joining would put the thread that draws back inside the blocking
+        // `Shutdown` and `MFShutdown` calls this file was rewritten to get it
+        // out of — at the one moment, a window closing, when the operating
+        // system is already watching for an application that has stopped
+        // answering. The worker holds nothing the process needs on the way
+        // out: its engines are its own and its last act is to release them.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The worker's side
+// ---------------------------------------------------------------------------
+
+/// One card's engine. Never leaves the worker thread.
+struct Reel {
+    engine: IMFMediaEngine,
+    signals: Arc<Signals>,
+    /// Where frames are transferred to, made once the engine knows how big the
+    /// video is. `None` for sound, and `None` for a video whose first frame has
+    /// not arrived yet — the native size is not known until it has.
+    bitmap: Option<(IWICBitmap, u32, u32)>,
+    /// Whether this card has pictures at all.
+    video: bool,
+    /// The presentation time of the frame already copied.
+    ///
+    /// `OnVideoStreamTick` answers `S_FALSE` when there is nothing new, and the
+    /// Rust binding folds `S_FALSE` into `Ok` — it is a success code — so the
+    /// honest test for "a new frame" is that the time moved. That is also the
+    /// more robust one: a repeated timestamp is the same picture whatever the
+    /// return code said.
+    shown: Option<i64>,
+    length: Option<Duration>,
+    /// Set once, then never asked again — the card carries the sentence back to
+    /// the board, and this is what stops the worker touching a dead engine.
+    broken: bool,
+}
+
 /// What the engine's callback thread is allowed to say.
 ///
-/// One atomic and nothing else. The callback runs on a Media Foundation worker
-/// thread and the board is not on it, so what crosses is a flag rather than a
-/// decision — see the module note.
+/// One atomic and nothing else. The callback runs on a Media Foundation work
+/// queue and neither the board nor the worker is on it, so what crosses is a
+/// flag rather than a decision.
 ///
 /// Only the failure is here. *Ended* is not, even though there is an event for
-/// it, because `IsEnded` answers the same question from the frame loop and is
-/// the only one of the two that stays right across a seek and a loop — an event
-/// flag would have to be un-set by hand in three places, and the third one is
-/// always the one that gets forgotten.
+/// it, because `IsEnded` answers the same question from the worker's own tick
+/// and is the only one of the two that stays right across a seek and a loop —
+/// an event flag would have to be un-set by hand in three places, and the third
+/// one is always the one that gets forgotten.
 #[derive(Default)]
 struct Signals {
     failed: AtomicBool,
@@ -131,329 +609,232 @@ impl IMFMediaEngineNotify_Impl for Notify_Impl {
     }
 }
 
-/// One card's engine.
-struct Reel {
-    engine: IMFMediaEngine,
-    signals: Arc<Signals>,
-    /// Where frames are transferred to, made once the engine knows how big the
-    /// video is. `None` for sound, and `None` for a video whose first frame has
-    /// not arrived yet — the native size is not known until it has.
-    bitmap: Option<(IWICBitmap, u32, u32)>,
-    /// Whether this card has pictures at all.
-    video: bool,
-    /// The presentation time of the frame already copied.
-    ///
-    /// `OnVideoStreamTick` answers `S_FALSE` when there is nothing new, and the
-    /// Rust binding folds `S_FALSE` into `Ok` — it is a success code — so the
-    /// honest test for "a new frame" is that the time moved. That is also the
-    /// more robust one: a repeated timestamp is the same picture whatever the
-    /// return code said.
-    shown: Option<i64>,
-    /// The newest frame, kept so the painter has something to draw on every
-    /// frame rather than only on the ones a new picture arrived in.
-    picture: Option<Arc<RenderImage>>,
+/// Everything a tick found out about one card, on its way back to the board.
+#[derive(Default)]
+struct Found {
+    at: Duration,
     length: Option<Duration>,
-    /// Set once, then reported once.
-    broken: Option<String>,
-    told: bool,
-    /// Since when this reel has been standing still, for [`Stack::trim`].
-    rested: Option<Instant>,
+    ended: bool,
+    picture: Option<Arc<RenderImage>>,
+    trouble: Option<String>,
+    live: bool,
 }
 
-/// Every engine there is, and the one-time setup behind them.
-pub struct Stack {
-    /// `None` until somebody asks for the first time; `Some(false)` on a
-    /// machine whose Media Foundation would not start, which is a state rather
-    /// than a crash.
-    started: Option<bool>,
-    spill: Option<crate::spill::Spill>,
-    factory: Option<IMFMediaEngineClassFactory>,
-    imaging: Option<IWICImagingFactory>,
-    reels: HashMap<String, Reel>,
-    /// Cards that never became a reel at all, and the reason. Reported once by
-    /// `poll` and then dropped, which is the same contract `Reel::told` holds.
-    broken: HashMap<String, String>,
-}
+/// The worker.
+///
+/// Owns the apartment, the two factories and every engine. Runs until the
+/// `Stack` that started it goes away.
+fn work(shared: &Arc<Mutex<Shared>>, running: &Arc<AtomicBool>) {
+    // The whole reason this thread exists — see the module note. Paired with a
+    // `CoUninitialize` at the very end, and that pairing is real here, unlike
+    // the main thread's: this apartment is one this code entered.
+    let entered = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
 
-impl Default for Stack {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Stack {
-    pub fn new() -> Self {
-        Self {
-            started: None,
-            spill: None,
-            factory: None,
-            imaging: None,
-            reels: HashMap::new(),
-            broken: HashMap::new(),
-        }
-    }
-
-    /// Bring Media Foundation up, once, and answer whether there is anything to
-    /// play with.
-    ///
-    /// Lazy rather than at startup: a board of photographs never touches this,
-    /// and `MFStartup` loads a good deal of machinery that a board of
-    /// photographs would then be paying for.
-    ///
-    /// A machine where this fails answers `false` for the rest of the session
-    /// and every card says so in words — the soft failure the other two
-    /// backends promise, promised here too. Windows N without the Media Feature
-    /// Pack is the real case, and it is somebody's actual computer.
-    fn start(&mut self) -> bool {
-        if let Some(known) = self.started {
-            return known;
-        }
-        self.started = Some(false);
-
-        // Ignored on purpose, and never paired with `CoUninitialize`. gpui has
-        // already initialised COM on this thread for its window and its file
-        // dialogs, so this returns `S_FALSE` — or `RPC_E_CHANGED_MODE` if it
-        // chose the other apartment, which is equally fine: the thread is
-        // initialised either way, and *undoing* an initialisation this code did
-        // not perform is the one thing that would actually break something.
-        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-
-        if unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.is_err() {
-            return false;
-        }
-        let factory: IMFMediaEngineClassFactory = match unsafe {
+    let up = entered && unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.is_ok();
+    let factory: Option<IMFMediaEngineClassFactory> = up
+        .then(|| unsafe {
             CoCreateInstance(&CLSID_MFMediaEngineClassFactory, None, CLSCTX_INPROC_SERVER)
-        } {
-            Ok(factory) => factory,
-            Err(_) => return false,
-        };
-        let imaging: IWICImagingFactory =
-            match unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }
-            {
-                Ok(imaging) => imaging,
-                Err(_) => return false,
-            };
+        })
+        .and_then(Result::ok);
+    let imaging: Option<IWICImagingFactory> = up
+        .then(|| unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) })
+        .and_then(Result::ok);
 
-        self.factory = Some(factory);
-        self.imaging = Some(imaging);
-        self.spill = Some(crate::spill::Spill::open());
-        self.started = Some(true);
-        true
+    let (Some(factory), Some(imaging)) = (factory, imaging) else {
+        if let Ok(mut lock) = shared.lock() {
+            lock.up = Some(false);
+        }
+        // Nothing to run, but the apartment and possibly Media Foundation are
+        // up and have to come back down in the right order.
+        if up {
+            let _ = unsafe { MFShutdown() };
+        }
+        if entered {
+            unsafe { CoUninitialize() };
+        }
+        return;
+    };
+    if let Ok(mut lock) = shared.lock() {
+        lock.up = Some(true);
     }
 
-    /// Make sure there is an engine for this card, and answer whether there is
-    /// one now.
-    ///
-    /// Idempotent, and cheap on every frame after the first.
-    pub fn open(&mut self, id: &str, hash: &str, ext: &str, bytes: &[u8], video: bool) -> bool {
-        if self.reels.contains_key(id) {
-            return self.reels[id].broken.is_none();
+    let mut reels: HashMap<String, Reel> = HashMap::new();
+    loop {
+        let busy = tick(&mut reels, shared, &factory, &imaging);
+        // Checked *after* a tick rather than before, so the last thing this
+        // thread does is the reconciliation that shuts every engine down — the
+        // board empties the map and clears the flag in that order, and this
+        // reads them in the same one.
+        if !running.load(Ordering::Relaxed) {
+            break;
         }
-        if !self.start() {
-            self.fail(id, "no media stack on this machine".into());
-            return false;
-        }
-        let Some(path) = self.spill.as_ref().and_then(|spill| spill.lay_out(hash, ext, bytes))
-        else {
-            self.fail(id, "nowhere to unpack this file".into());
-            return false;
-        };
-        let Some(factory) = self.factory.clone() else {
-            self.fail(id, "no media stack on this machine".into());
-            return false;
-        };
-        match build(&factory, &path, video) {
-            Ok(reel) => {
-                self.reels.insert(id.to_string(), reel);
-                true
+        std::thread::sleep(if busy { TICK } else { REST });
+    }
+
+    // Every engine down before Media Foundation is, and Media Foundation down
+    // before the apartment is. Shutting either out from under a live object is
+    // how a process comes to crash on the way out.
+    for (_, reel) in reels.drain() {
+        let _ = unsafe { reel.engine.Shutdown() };
+    }
+    let _ = unsafe { MFShutdown() };
+    unsafe { CoUninitialize() };
+}
+
+/// One pass over every card, and whether anything is playing.
+///
+/// The lock is taken twice and held across neither the frame copy nor any COM
+/// call, which is the rule this whole design exists to keep: the thread that
+/// draws asks this map questions on every frame, and a lock held across a
+/// `TransferVideoFrame` would be that thread waiting on a decoder again.
+fn tick(
+    reels: &mut HashMap<String, Reel>,
+    shared: &Arc<Mutex<Shared>>,
+    factory: &IMFMediaEngineClassFactory,
+    imaging: &IWICImagingFactory,
+) -> bool {
+    // ---- 1. What the board wants, as of now.
+    let mut asked: Vec<(String, PathBuf, bool, Want)> = Vec::new();
+    {
+        let Ok(mut lock) = shared.lock() else { return false };
+        for (id, card) in lock.cards.iter_mut() {
+            if card.news.trouble.is_some() {
+                continue;
             }
-            Err(why) => {
-                self.fail(id, why);
-                false
+            // Taken here so a seek is applied once. See `Want::seek`.
+            let want = Want { seek: card.want.seek.take(), ..card.want };
+            asked.push((id.clone(), card.source.clone(), card.video, want));
+        }
+    }
+
+    // ---- 2. Anything the board has stopped naming is the worker's to release.
+    let named: HashSet<&str> = asked.iter().map(|(id, ..)| id.as_str()).collect();
+    let gone: Vec<String> =
+        reels.keys().filter(|id| !named.contains(id.as_str())).cloned().collect();
+    for id in gone {
+        if let Some(reel) = reels.remove(&id) {
+            // `Shutdown` first and then dropped. An engine released while
+            // playing takes its audio endpoint with it whenever COM notices;
+            // shutting it down first is what makes the sound end when the card
+            // does. It blocks, and on this thread that is nobody's problem.
+            let _ = unsafe { reel.engine.Shutdown() };
+        }
+    }
+
+    // ---- 3. Everything that is still here, brought up to date.
+    let mut news: Vec<(String, Found)> = Vec::new();
+    let mut busy = false;
+    for (id, source, video, want) in asked {
+        if !reels.contains_key(&id) {
+            match build(factory, &source, video) {
+                Ok(reel) => {
+                    reels.insert(id.clone(), reel);
+                }
+                Err(why) => {
+                    news.push((id, Found { trouble: Some(why), ..Found::default() }));
+                    continue;
+                }
+            }
+        }
+        let Some(reel) = reels.get_mut(&id) else { continue };
+        busy |= want.playing;
+        news.push((id, drive(reel, want, imaging)));
+    }
+
+    // ---- 4. And what was found, handed back.
+    let Ok(mut lock) = shared.lock() else { return busy };
+    for (id, found) in news {
+        let Some(card) = lock.cards.get_mut(&id) else { continue };
+        card.news.live = found.live;
+        card.news.at = found.at;
+        if found.length.is_some() {
+            card.news.length = found.length;
+        }
+        // Or-ed rather than assigned: the board may not have looked since the
+        // last tick, and an end that happened then is still an end.
+        card.news.ended |= found.ended;
+        if let Some(picture) = found.picture {
+            card.news.picture = Some(picture);
+            card.news.fresh = true;
+        }
+        if card.news.trouble.is_none() {
+            card.news.trouble = found.trouble;
+        }
+    }
+    busy
+}
+
+/// One engine, brought into line with what the board wants, and asked where it
+/// has got to.
+fn drive(reel: &mut Reel, want: Want, imaging: &IWICImagingFactory) -> Found {
+    if reel.broken {
+        return Found::default();
+    }
+    // The failure first, because what it has to say outranks whatever position
+    // the engine would otherwise report.
+    if reel.signals.failed.swap(false, Ordering::Relaxed) {
+        let why = said(&reel.engine);
+        reel.broken = true;
+        let _ = unsafe { reel.engine.Shutdown() };
+        return Found { trouble: Some(why), ..Found::default() };
+    }
+
+    let mut found = Found { live: true, ..Found::default() };
+
+    unsafe {
+        let _ = reel.engine.SetLoop(want.looping);
+        let _ = reel.engine.SetVolume(f64::from(want.volume));
+        let _ = reel.engine.SetMuted(want.muted);
+        if let Some(at) = want.seek {
+            let _ = reel.engine.SetCurrentTime(at.as_secs_f64());
+        }
+        // `Play` on an engine that is already playing is a no-op, and so is
+        // `Pause` on one that is already paused — which is what lets this be
+        // said on every tick rather than only on the ticks it changed.
+        match want.playing {
+            true => {
+                let _ = reel.engine.Play();
+            }
+            false => {
+                let _ = reel.engine.Pause();
             }
         }
     }
 
-    fn fail(&mut self, id: &str, why: String) {
-        self.broken.insert(id.to_string(), why);
+    // Not known until the engine has read the file's metadata, and `NaN` until
+    // then — which is why this is asked for until it answers rather than once.
+    // A live stream answers infinity and is left with no length at all, because
+    // a scrubber across a stream is a scrubber across nothing.
+    if reel.length.is_none() {
+        let seconds = unsafe { reel.engine.GetDuration() };
+        if seconds.is_finite() && seconds > 0.0 {
+            reel.length = Some(Duration::from_secs_f64(seconds));
+        }
+    }
+    found.length = reel.length;
+
+    let at = unsafe { reel.engine.GetCurrentTime() };
+    found.at = match at.is_finite() && at > 0.0 {
+        true => Duration::from_secs_f64(at),
+        false => Duration::ZERO,
+    };
+
+    if reel.video {
+        found.picture = take_frame(reel, imaging);
     }
 
-    /// Start, or carry on.
-    ///
-    /// Called every frame for every playing card rather than at the press — see
-    /// `BoardView::pump_media`. `Play` on an engine that is already playing is a
-    /// no-op, which is what makes "the decoder follows the playhead" affordable
-    /// as a rule.
-    pub fn play(&mut self, id: &str) {
-        let Some(reel) = self.reels.get_mut(id).filter(|reel| reel.broken.is_none()) else {
-            return;
-        };
-        reel.rested = None;
-        let _ = unsafe { reel.engine.Play() };
-    }
-
-    pub fn pause(&mut self, id: &str) {
-        let Some(reel) = self.reels.get_mut(id).filter(|reel| reel.broken.is_none()) else {
-            return;
-        };
-        // Stamped once and not on every frame it stays paused, so the stamp
-        // says when it stopped rather than when it was last asked.
-        reel.rested.get_or_insert_with(Instant::now);
+    // Asked, not remembered — see `Signals`. The engine has already been told
+    // whether to loop, so a looping clip never reads as ended and the gapless
+    // restart happens inside it rather than here.
+    if unsafe { reel.engine.IsEnded() }.as_bool() {
+        found.ended = true;
+        // Held at the end rather than reset. A clip that snapped back to its
+        // first frame the instant it finished would be one you could never see
+        // the end of.
         let _ = unsafe { reel.engine.Pause() };
     }
 
-    /// Move the playhead. `at` is from the start.
-    pub fn seek(&mut self, id: &str, at: Duration) {
-        let Some(reel) = self.reels.get(id).filter(|reel| reel.broken.is_none()) else { return };
-        let _ = unsafe { reel.engine.SetCurrentTime(at.as_secs_f64()) };
-    }
-
-    /// How loud, `0.0..=1.0`, and whether it is silenced. Both are the
-    /// engine's own properties.
-    pub fn set_loudness(&mut self, id: &str, level: f32, muted: bool) {
-        let Some(reel) = self.reels.get(id).filter(|reel| reel.broken.is_none()) else { return };
-        unsafe {
-            let _ = reel.engine.SetVolume(level.clamp(0.0, 1.0) as f64);
-            let _ = reel.engine.SetMuted(muted);
-        }
-    }
-
-    /// One frame of the clock for one card: ask what went wrong, take the
-    /// newest picture, and read where the playhead really is.
-    ///
-    /// `looping` is taken rather than remembered because it is board state and
-    /// can change under a playing card. Here it is handed straight to the
-    /// engine, which loops without a gap — the one place this backend gets to
-    /// do less work than the other two rather than more.
-    pub fn poll(&mut self, id: &str, looping: bool) -> Option<Beat> {
-        // Split, so a reel can be written to while the imaging factory beside
-        // it is read.
-        let Self { imaging, reels, broken, .. } = self;
-        if let Some(why) = broken.remove(id) {
-            return Some(Beat { trouble: Some(why), ..Beat::default() });
-        }
-
-        let reel = reels.get_mut(id)?;
-        if let Some(why) = &reel.broken {
-            // Once. A card that says "no decoder for this" every frame would
-            // hold the status bar for as long as it is on screen.
-            if reel.told {
-                return None;
-            }
-            reel.told = true;
-            return Some(Beat { trouble: Some(why.clone()), ..Beat::default() });
-        }
-
-        // The failure first, because what it has to say outranks whatever
-        // position the engine would otherwise report.
-        if reel.signals.failed.swap(false, Ordering::Relaxed) {
-            let why = said(&reel.engine);
-            reel.broken = Some(why.clone());
-            reel.told = true;
-            let _ = unsafe { reel.engine.Shutdown() };
-            return Some(Beat { trouble: Some(why), ..Beat::default() });
-        }
-
-        let mut beat = Beat::default();
-        let _ = unsafe { reel.engine.SetLoop(looping) };
-
-        // Not known until the engine has read the file's metadata, and `NaN`
-        // until then — which is why this is asked for until it answers rather
-        // than once. A live stream answers infinity and is left with no length
-        // at all, because a scrubber across a stream is a scrubber across
-        // nothing.
-        if reel.length.is_none() {
-            let seconds = unsafe { reel.engine.GetDuration() };
-            if seconds.is_finite() && seconds > 0.0 {
-                reel.length = Some(Duration::from_secs_f64(seconds));
-            }
-        }
-        beat.length = reel.length;
-
-        let at = unsafe { reel.engine.GetCurrentTime() };
-        beat.at = match at.is_finite() && at > 0.0 {
-            true => Duration::from_secs_f64(at),
-            false => Duration::ZERO,
-        };
-
-        if let (true, Some(imaging)) = (reel.video, imaging.as_ref()) {
-            beat.fresh = take_frame(reel, imaging);
-        }
-
-        // Asked, not remembered — see `Signals`. The engine has already been
-        // told whether to loop, so a looping clip never reads as ended and the
-        // gapless restart happens inside it rather than here.
-        if unsafe { reel.engine.IsEnded() }.as_bool() {
-            beat.ended = true;
-            // Held at the end rather than reset. A clip that snapped back to
-            // its first frame the instant it finished would be one you could
-            // never see the end of.
-            let _ = unsafe { reel.engine.Pause() };
-        }
-
-        Some(beat)
-    }
-
-    /// The newest picture for a card, for the painter.
-    pub fn picture(&self, id: &str) -> Option<Arc<RenderImage>> {
-        self.reels.get(id)?.picture.clone()
-    }
-
-    /// Which cards have something standing, so the frame loop knows what to
-    /// poll without walking the board. Includes the ones that failed to open,
-    /// which is how their one message gets out.
-    pub fn open_reels(&self) -> Vec<String> {
-        self.reels.keys().chain(self.broken.keys()).cloned().collect()
-    }
-
-    /// Tear one down — the card was deleted, stopped, or trimmed.
-    ///
-    /// `Shutdown` first and then dropped. An engine released while playing
-    /// takes its audio endpoint with it whenever COM notices; shutting it down
-    /// first is what makes the sound end when the card does.
-    pub fn forget(&mut self, id: &str) {
-        self.broken.remove(id);
-        if let Some(reel) = self.reels.remove(id) {
-            let _ = unsafe { reel.engine.Shutdown() };
-        }
-    }
-
-    /// Everything, for a board being closed.
-    pub fn forget_all(&mut self) {
-        for id in self.open_reels() {
-            self.forget(&id);
-        }
-    }
-
-    /// Drop the reels that have been standing still longest, down to `keep`.
-    /// See `pipeline::Stack::trim`, which holds the argument.
-    pub fn trim(&mut self, keep: usize) {
-        let mut resting: Vec<(String, Instant)> = self
-            .reels
-            .iter()
-            .filter_map(|(id, reel)| reel.rested.map(|at| (id.clone(), at)))
-            .collect();
-        if resting.len() <= keep {
-            return;
-        }
-        resting.sort_by_key(|(_, at)| *at);
-        let over = resting.len() - keep;
-        for (id, _) in resting.into_iter().take(over) {
-            self.forget(&id);
-        }
-    }
-}
-
-impl Drop for Stack {
-    fn drop(&mut self) {
-        self.forget_all();
-        // Only where it was started, and after every engine is down: shutting
-        // Media Foundation down under a live object is how a process comes to
-        // crash on the way out.
-        if self.started == Some(true) {
-            let _ = unsafe { MFShutdown() };
-        }
-    }
+    found
 }
 
 /// Build a Media Engine for one file.
@@ -490,75 +871,54 @@ fn build(factory: &IMFMediaEngineClassFactory, path: &Path, video: bool) -> Resu
 
     unsafe {
         // Loading is what `SetSource` starts; playing is the board's decision
-        // and arrives later, through `Stack::play`.
+        // and arrives later, through `Want::playing`.
         let _ = engine.SetAutoPlay(false);
         engine
             .SetSource(&BSTR::from(text))
             .map_err(|_| "nothing on this machine can open that file".to_string())?;
     }
 
-    Ok(Reel {
-        engine,
-        signals,
-        bitmap: None,
-        video,
-        shown: None,
-        picture: None,
-        length: None,
-        broken: None,
-        told: false,
-        // Built paused, so `rested` starts stamped: an engine opened and then
-        // never played is trimmable like any other.
-        rested: Some(Instant::now()),
-    })
+    Ok(Reel { engine, signals, bitmap: None, video, shown: None, length: None, broken: false })
 }
 
-/// Take the current frame, if it is one we have not already taken, and answer
-/// whether the card has something new to draw.
-fn take_frame(reel: &mut Reel, imaging: &IWICImagingFactory) -> bool {
+/// Take the current frame, if it is one we have not already taken.
+fn take_frame(reel: &mut Reel, imaging: &IWICImagingFactory) -> Option<Arc<RenderImage>> {
     // `S_FALSE` means "nothing new" and folds into `Ok` here, so the timestamp
     // is what decides — see `Reel::shown`.
-    let Ok(pts) = (unsafe { reel.engine.OnVideoStreamTick() }) else { return false };
+    let pts = (unsafe { reel.engine.OnVideoStreamTick() }).ok()?;
     if pts < 0 || Some(pts) == reel.shown {
-        return false;
+        return None;
     }
 
     // The size is not known until the engine has decoded far enough to know it,
     // which is why the bitmap is made here rather than in `build`.
     if reel.bitmap.is_none() {
         let (mut wide, mut high) = (0u32, 0u32);
-        let asked = unsafe {
+        unsafe {
             reel.engine.GetNativeVideoSize(Some(&mut wide as *mut u32), Some(&mut high as *mut u32))
-        };
-        if asked.is_err() {
-            return false;
         }
-        let Some((wide, high)) = fit_inside(wide, high) else { return false };
-        let Ok(bitmap) = (unsafe {
+        .ok()?;
+        let (wide, high) = fit_inside(wide, high)?;
+        let bitmap = unsafe {
             imaging.CreateBitmap(wide, high, &GUID_WICPixelFormat32bppBGRA, WICBitmapCacheOnDemand)
-        }) else {
-            return false;
-        };
+        }
+        .ok()?;
         reel.bitmap = Some((bitmap, wide, high));
     }
-    let Some((bitmap, wide, high)) = &reel.bitmap else { return false };
+    let (bitmap, wide, high) = reel.bitmap.as_ref()?;
     let (wide, high) = (*wide, *high);
 
     // The rectangle is the whole bitmap, and the bitmap keeps the video's own
     // shape — so the engine's letterboxing has nothing to letterbox and the
     // border colour never shows. That is why it is passed as null.
     let into = RECT { left: 0, top: 0, right: wide as i32, bottom: high as i32 };
-    if unsafe { reel.engine.TransferVideoFrame(bitmap, None, &into, None) }.is_err() {
-        return false;
-    }
+    unsafe { reel.engine.TransferVideoFrame(bitmap, None, &into, None) }.ok()?;
 
     let picture = read_bitmap(bitmap, wide, high);
     if picture.is_some() {
-        reel.picture = picture;
         reel.shown = Some(pts);
-        return true;
     }
-    false
+    picture
 }
 
 /// A locked WIC bitmap, as a picture the canvas can draw.
@@ -606,7 +966,7 @@ fn read_bitmap(bitmap: &IWICBitmap, wide: u32, high: u32) -> Option<Arc<RenderIm
 ///
 /// `None` for a video with no size yet, which is what the engine reports before
 /// it has read far enough in — and is a "not yet" rather than a failure, so the
-/// caller tries again on the next frame.
+/// caller tries again on the next tick.
 fn fit_inside(wide: u32, high: u32) -> Option<(u32, u32)> {
     if wide == 0 || high == 0 {
         return None;
@@ -650,8 +1010,8 @@ fn said(engine: &IMFMediaEngine) -> String {
 mod tests {
     use super::*;
 
-    /// The one piece of arithmetic in this file, and the one thing in it that
-    /// can be tested without a Windows machine in the room.
+    /// The one piece of arithmetic in this file, and one of the few things in
+    /// it that can be tested without a Windows machine in the room.
     #[test]
     fn a_frame_is_brought_inside_the_ceiling_with_its_shape_intact() {
         assert_eq!(fit_inside(1920, 1080), Some((1024, 576)));
@@ -669,5 +1029,91 @@ mod tests {
         assert_eq!(fit_inside(1920, 0), None);
         let (wide, high) = fit_inside(8000, 1).unwrap();
         assert!(wide >= 1 && high >= 1);
+    }
+
+    /// The board's half of the seam is plain data, so what it does with a
+    /// worker that has not been round yet can be checked anywhere.
+    ///
+    /// The important line is the last one. `ended` and `fresh` are things that
+    /// *happened*, and a `poll` that read them instead of taking them would
+    /// report the same end on every frame — which on a looping card is a clip
+    /// that restarts sixty times a second.
+    #[test]
+    fn a_happening_is_reported_once_and_a_position_every_time() {
+        let mut stack = Stack::new();
+        stack.plant(
+            "card",
+            News {
+                at: Duration::from_secs(3),
+                ended: true,
+                fresh: true,
+                live: true,
+                ..News::default()
+            },
+        );
+
+        let first = stack.poll("card", false).expect("a card the board knows about");
+        assert_eq!(first.at, Duration::from_secs(3));
+        assert!(first.ended && first.fresh);
+
+        let second = stack.poll("card", false).expect("still there");
+        assert_eq!(second.at, Duration::from_secs(3), "the position is where it is, every time");
+        assert!(!second.ended && !second.fresh, "a happening is not reported twice");
+    }
+
+    /// Trouble is said once and then the card goes quiet, so a file with no
+    /// decoder does not hold the status bar for as long as it is on screen.
+    #[test]
+    fn a_refusal_is_said_once() {
+        let mut stack = Stack::new();
+        stack.refuse("card", "no decoder for that");
+
+        let first = stack.poll("card", false).expect("a card with something to say");
+        assert_eq!(first.trouble.as_deref(), Some("no decoder for that"));
+        assert!(stack.poll("card", false).is_none(), "and nothing after it");
+    }
+
+    /// Forgetting is a removal and not a call, which is what makes it unable to
+    /// block the thread that draws — the engine is the worker's to release.
+    #[test]
+    fn forgetting_a_card_takes_it_out_of_the_map_and_does_not_wait_for_anything() {
+        let mut stack = Stack::new();
+        stack.refuse("card", "whatever");
+        assert_eq!(stack.open_reels(), vec!["card".to_string()]);
+        stack.forget("card");
+        assert!(stack.open_reels().is_empty());
+    }
+
+    /// The trim keeps the ones that stopped most recently.
+    #[test]
+    fn trimming_drops_the_ones_that_have_been_still_longest() {
+        let mut stack = Stack::new();
+        for (id, ago) in [("old", 300u64), ("middle", 200), ("new", 100)] {
+            stack.plant(id, News { live: true, ..News::default() });
+            stack.wish(id, |card| {
+                card.rested = Instant::now().checked_sub(Duration::from_secs(ago));
+            });
+        }
+        stack.trim(1);
+        assert_eq!(stack.open_reels(), vec!["new".to_string()]);
+    }
+
+    impl Stack {
+        /// A card in the map as though the worker had put it there, for the
+        /// tests above — the worker itself needs a Windows machine, and the
+        /// board's half of the contract does not.
+        fn plant(&mut self, id: &str, news: News) {
+            let Ok(mut shared) = self.shared.lock() else { return };
+            shared.cards.insert(
+                id.to_string(),
+                Card {
+                    source: PathBuf::from("nowhere"),
+                    video: true,
+                    want: Want::default(),
+                    news,
+                    rested: None,
+                },
+            );
+        }
     }
 }

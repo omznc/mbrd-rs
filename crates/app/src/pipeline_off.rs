@@ -41,6 +41,19 @@ pub struct Beat {
     pub trouble: Option<String>,
 }
 
+/// What asking for a card's decoder found. The real one's twin — see
+/// [`crate::pipeline`], which is where the three answers are argued.
+///
+/// This backend only ever gives one of them, and that is the point: there is
+/// no decoder here and there is never going to be one, so a card is refused
+/// rather than left waiting for a file that nothing would open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Opening {
+    Ready,
+    Waiting,
+    Refused,
+}
+
 /// Every reel there is, which here is none of them.
 ///
 /// What it does keep is the cards somebody has pressed and not yet been
@@ -57,11 +70,18 @@ impl Stack {
         Self::default()
     }
 
-    /// Always `false`, so no playhead ever starts. The card is remembered so
+    /// Always refused, so no playhead ever starts. The card is remembered so
     /// that the next frame can say why, once.
-    pub fn open(&mut self, id: &str, _hash: &str, _ext: &str, _bytes: &[u8], _video: bool) -> bool {
+    pub fn open(
+        &mut self,
+        id: &str,
+        _hash: &str,
+        _ext: &str,
+        _bytes: &[u8],
+        _video: bool,
+    ) -> Opening {
         self.owed.insert(id.to_string());
-        false
+        Opening::Refused
     }
 
     pub fn play(&mut self, _id: &str) {}

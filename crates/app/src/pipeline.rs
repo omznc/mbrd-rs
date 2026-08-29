@@ -47,7 +47,7 @@
 //! AVFoundation, `pipeline_win.rs` against the Media Foundation Media Engine,
 //! `pipeline_off.rs` on anything exotic. Satisfying GStreamer on those two
 //! would have meant shipping the runtime inside the installer, and both of them
-//! already have a decoder in the operating system — `SHIPPING.md` has the
+//! already have a decoder in the operating system — `RELEASING.md` has the
 //! arithmetic.
 //!
 //! All four are the same [`Stack`] and the same [`Beat`], and nothing in
@@ -76,6 +76,25 @@ use image::{Frame, RgbaImage};
 /// `videoscale` can hand it to whatever the machine has, rather than in our own
 /// code a frame at a time.
 const LONGEST_SIDE: i32 = 1024;
+
+/// What asking for a card's decoder found.
+///
+/// Three answers rather than a `bool`, because the two halves of "no" mean
+/// opposite things to the frame loop. A card whose file is still being laid
+/// out on disk is one to ask about again on the next frame; a card this
+/// machine cannot play is one to leave alone forever. See `crate::spill`,
+/// which is where the middle answer comes from, and `BoardView::pump_media`,
+/// which is what does the asking again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Opening {
+    /// There is a decoder for this card now.
+    Ready,
+    /// The file is still being unpacked. Ask again.
+    Waiting,
+    /// There will not be one. The card has been told why, and `poll` will
+    /// hand that sentence over once.
+    Refused,
+}
 
 /// What one frame of the clock says about a card that is playing.
 #[derive(Debug, Clone, Default)]
@@ -163,33 +182,46 @@ impl Stack {
         up
     }
 
-    /// Make sure there is a pipeline for this card, and answer whether there
-    /// is one now.
+    /// Make sure there is a pipeline for this card, and say how far off one is.
     ///
     /// Idempotent, and cheap on every frame after the first: a card that
-    /// already has a reel returns immediately. `bytes` is only read the first
-    /// time a given hash is spilled.
-    pub fn open(&mut self, id: &str, hash: &str, ext: &str, bytes: &[u8], video: bool) -> bool {
+    /// already has a reel returns immediately. `bytes` is only *copied* on the
+    /// frame that starts the spill — see [`crate::spill`], which is also where
+    /// the third answer comes from.
+    pub fn open(&mut self, id: &str, hash: &str, ext: &str, bytes: &[u8], video: bool) -> Opening {
         if self.reels.contains_key(id) {
-            return self.reels[id].broken.is_none();
+            return match self.reels[id].broken.is_none() {
+                true => Opening::Ready,
+                false => Opening::Refused,
+            };
         }
         if !self.start() {
             self.fail(id, "no media stack on this machine".into());
-            return false;
+            return Opening::Refused;
         }
-        let Some(path) = self.spill.as_ref().and_then(|spill| spill.lay_out(hash, ext, bytes))
-        else {
-            self.fail(id, "nowhere to unpack this file".into());
-            return false;
+        let laid = match self.spill.as_ref() {
+            Some(spill) => spill.lay_out(hash, ext, bytes),
+            None => crate::spill::Laid::Nowhere("nowhere to unpack this file".into()),
+        };
+        let path = match laid {
+            crate::spill::Laid::Ready(path) => path,
+            // Still being written, on a thread. Not a failure and not a reel
+            // yet — and deliberately *not* recorded against the card, because
+            // `fail` is what stops a card ever being tried again.
+            crate::spill::Laid::Working => return Opening::Waiting,
+            crate::spill::Laid::Nowhere(why) => {
+                self.fail(id, why);
+                return Opening::Refused;
+            }
         };
         match build(&path, video) {
             Ok(reel) => {
                 self.reels.insert(id.to_string(), reel);
-                true
+                Opening::Ready
             }
             Err(why) => {
                 self.fail(id, why);
-                false
+                Opening::Refused
             }
         }
     }

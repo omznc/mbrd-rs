@@ -64,20 +64,56 @@ use objc2_av_foundation::{
 };
 use objc2_core_media::{CMTime, CMTimeFlags};
 use objc2_core_video::{
-    kCVPixelBufferPixelFormatTypeKey, kCVPixelFormatType_32BGRA, CVPixelBuffer,
-    CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight,
-    CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
-    CVPixelBufferUnlockBaseAddress,
+    kCVPixelBufferHeightKey, kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey,
+    kCVPixelFormatType_32BGRA, CVPixelBuffer, CVPixelBufferGetBaseAddress,
+    CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight, CVPixelBufferGetWidth,
+    CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
 };
 use objc2_foundation::{NSDictionary, NSNumber, NSString, NSURL};
 
-/// The longest edge a frame is copied at.
+/// The longest edge a frame reaches the board at.
 ///
-/// A 4K frame is thirty-three megabytes to be drawn at a twentieth of its size,
-/// and unlike the Linux backend there is no scaler in the graph to ask — so the
-/// **decoder** is asked, through the pixel buffer attributes, and anything still
-/// larger is dropped down on the way out. See [`shrink_to`].
+/// A 4K frame is thirty-three megabytes to be drawn at a twentieth of its size.
+/// This is asked for **twice**, and both halves matter.
+///
+/// The decoder is asked first, through the video output's pixel buffer
+/// attributes — see [`resize_output`]. That is the half that was missing: the
+/// attributes used to name only the pixel format, so every frame of a 4K clip
+/// was decoded at full size and then reduced by hand on the thread that draws,
+/// which is the one thread that cannot afford thirty-three megabytes sixty
+/// times a second.
+///
+/// It cannot be asked at the moment the output is built, because nothing is
+/// known about the file then — an `AVPlayerItem` that has not loaded reports
+/// `CGSizeZero`, and a size guessed before the aspect ratio is known is a
+/// picture stretched. So the output starts unsized and is swapped for a sized
+/// one the first frame the item can answer.
+///
+/// [`shrink_to`] is the second half and stays regardless: it is what makes the
+/// first frames — the ones that arrive before the swap — and any frame from a
+/// decoder that declined the hint still land at a sane size. It reads the
+/// buffer's own width and stride rather than assuming either, so the two halves
+/// cannot disagree about what arrived.
 const LONGEST_SIDE: usize = 1024;
+
+/// What asking for a card's decoder found.
+///
+/// Three answers rather than a `bool`, because the two halves of "no" mean
+/// opposite things to the frame loop. A card whose file is still being laid
+/// out on disk is one to ask about again on the next frame; a card this
+/// machine cannot play is one to leave alone forever. See `crate::spill`,
+/// which is where the middle answer comes from, and `BoardView::pump_media`,
+/// which is what does the asking again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Opening {
+    /// There is a decoder for this card now.
+    Ready,
+    /// The file is still being unpacked. Ask again.
+    Waiting,
+    /// There will not be one. The card has been told why, and `poll` will
+    /// hand that sentence over once.
+    Refused,
+}
 
 /// What one frame of the clock says about a card that is playing.
 ///
@@ -115,6 +151,14 @@ struct Reel {
     told: bool,
     /// Since when this reel has been standing still, for [`Stack::trim`].
     rested: Option<Instant>,
+    /// Whether the video output has been asked for frames at the size they
+    /// will be drawn.
+    ///
+    /// `true` from the start on a card with no pictures, which has no output
+    /// to size, and on a clip already small enough to be worth leaving alone.
+    /// See [`LONGEST_SIDE`], which is about why this cannot be settled when
+    /// the reel is built.
+    sized: bool,
     /// Whether we have asked it to play.
     ///
     /// This is what tells "it finished" from "somebody paused it".
@@ -169,35 +213,49 @@ impl Stack {
         up
     }
 
-    /// Make sure there is a player for this card, and answer whether there is
-    /// one now.
+    /// Make sure there is a player for this card, and say how far off one is.
     ///
-    /// Idempotent, and cheap on every frame after the first.
-    pub fn open(&mut self, id: &str, hash: &str, ext: &str, bytes: &[u8], video: bool) -> bool {
+    /// Idempotent, and cheap on every frame after the first. `bytes` is only
+    /// *copied* on the frame that starts the spill — see [`crate::spill`],
+    /// which is also where the third answer comes from.
+    pub fn open(&mut self, id: &str, hash: &str, ext: &str, bytes: &[u8], video: bool) -> Opening {
         if self.reels.contains_key(id) {
-            return self.reels[id].broken.is_none();
+            return match self.reels[id].broken.is_none() {
+                true => Opening::Ready,
+                false => Opening::Refused,
+            };
         }
         if !self.start() {
             self.fail(id, "media can only be opened from the main thread".into());
-            return false;
+            return Opening::Refused;
         }
         let Some(mtm) = MainThreadMarker::new() else {
             self.fail(id, "media can only be opened from the main thread".into());
-            return false;
+            return Opening::Refused;
         };
-        let Some(path) = self.spill.as_ref().and_then(|spill| spill.lay_out(hash, ext, bytes))
-        else {
-            self.fail(id, "nowhere to unpack this file".into());
-            return false;
+        let laid = match self.spill.as_ref() {
+            Some(spill) => spill.lay_out(hash, ext, bytes),
+            None => crate::spill::Laid::Nowhere("nowhere to unpack this file".into()),
+        };
+        let path = match laid {
+            crate::spill::Laid::Ready(path) => path,
+            // Still being written, on a thread. Not a failure and not a reel
+            // yet — and deliberately *not* recorded against the card, because
+            // `fail` is what stops a card ever being tried again.
+            crate::spill::Laid::Working => return Opening::Waiting,
+            crate::spill::Laid::Nowhere(why) => {
+                self.fail(id, why);
+                return Opening::Refused;
+            }
         };
         match build(&path, video, mtm) {
             Ok(reel) => {
                 self.reels.insert(id.to_string(), reel);
-                true
+                Opening::Ready
             }
             Err(why) => {
                 self.fail(id, why);
-                false
+                Opening::Refused
             }
         }
     }
@@ -312,6 +370,14 @@ impl Stack {
         let now = unsafe { reel.player.currentTime() };
         beat.at = to_duration(now).unwrap_or_default();
 
+        // Before the frame is taken, so that the swap happens on a frame that
+        // was going to ask the output a question anyway. Once — see
+        // [`LONGEST_SIDE`] on why this cannot be settled when the reel is
+        // built, and `resize_output` on why it cannot stretch anything.
+        if !reel.sized {
+            reel.sized = resize_output(reel);
+        }
+
         if let Some(output) = &reel.output {
             // The playhead's own time rather than a host clock: this runs once
             // per drawn frame, and what the board wants is the newest picture
@@ -423,30 +489,14 @@ fn build(path: &Path, video: bool, mtm: MainThreadMarker) -> Result<Reel, String
     // state that can change while it plays — see `poll`.
     unsafe { player.setActionAtItemEnd(AVPlayerActionAtItemEnd::Pause) };
 
-    let output = match video {
-        false => None,
-        true => {
-            // The key is a `CFString` and the dictionary wants an `NSString`.
-            // The two are the same object — Core Foundation and Foundation
-            // strings are toll-free bridged, which is a guarantee of the
-            // platform rather than a coincidence — so this is a cast and not a
-            // conversion.
-            let key = unsafe { kCVPixelBufferPixelFormatTypeKey };
-            let key: &NSString = unsafe { &*(key as *const _ as *const NSString) };
-            let format = NSNumber::numberWithUnsignedInt(kCVPixelFormatType_32BGRA);
-            let value: &objc2::runtime::AnyObject = format.as_ref();
-            let attributes = NSDictionary::from_slices(&[key], &[value]);
-
-            let output = unsafe {
-                AVPlayerItemVideoOutput::initWithPixelBufferAttributes(
-                    AVPlayerItemVideoOutput::alloc(),
-                    Some(&attributes),
-                )
-            };
-            unsafe { item.addOutput(&output) };
-            Some(output)
-        }
-    };
+    let output = video.then(|| {
+        // Unsized, because nothing is known about the file yet — see
+        // [`LONGEST_SIDE`]. `poll` swaps it for a sized one the first frame
+        // the item can say how big it is.
+        let output = video_output(None);
+        unsafe { item.addOutput(&output) };
+        output
+    });
 
     Ok(Reel {
         player,
@@ -459,8 +509,117 @@ fn build(path: &Path, video: bool, mtm: MainThreadMarker) -> Result<Reel, String
         // Built paused, so `rested` starts stamped: a player opened and then
         // never played is trimmable like any other.
         rested: Some(Instant::now()),
+        // Nothing to size on a card that is only sound.
+        sized: !video,
         wanted: false,
     })
+}
+
+/// A Core Video attribute key as the Foundation string it already is.
+///
+/// The keys are `CFString`s and the dictionary wants `NSString`s. The two are
+/// the same object — Core Foundation and Foundation strings are toll-free
+/// bridged, which is a guarantee of the platform rather than a coincidence —
+/// so this is a cast and not a conversion. Taken as a pointer so this file does
+/// not have to name `CFString`, which would be a whole dependency for one
+/// signature.
+fn bridged(key: *const std::ffi::c_void) -> &'static NSString {
+    // SAFETY: toll-free bridging, and every caller passes one of Core Video's
+    // own `&'static CFString` constants — so the pointer is non-null, aligned
+    // and lives for the program.
+    unsafe { &*(key.cast::<NSString>()) }
+}
+
+/// One video output, asking for BGRA and — once anybody knows what to ask for —
+/// for a particular size.
+///
+/// BGRA because that is the order `RenderImage` reads an `RgbaImage`'s bytes
+/// in, so the copy out of the pixel buffer is a copy and nothing else. The
+/// alternative is what the decoder prefers on this platform, which is a
+/// biplanar YUV that would need converting by hand.
+fn video_output(fit: Option<(u32, u32)>) -> Retained<AVPlayerItemVideoOutput> {
+    let format = NSNumber::numberWithUnsignedInt(kCVPixelFormatType_32BGRA);
+    let mut keys: Vec<&NSString> = vec![bridged(
+        unsafe { kCVPixelBufferPixelFormatTypeKey } as *const _ as *const std::ffi::c_void
+    )];
+    let mut values: Vec<&objc2::runtime::AnyObject> = vec![format.as_ref()];
+
+    // Bound outside the `if`, so they outlive the borrows in `values`.
+    let width;
+    let height;
+    if let Some((w, h)) = fit {
+        width = NSNumber::numberWithUnsignedInt(w);
+        height = NSNumber::numberWithUnsignedInt(h);
+        keys.push(
+            bridged(unsafe { kCVPixelBufferWidthKey } as *const _ as *const std::ffi::c_void),
+        );
+        keys.push(bridged(
+            unsafe { kCVPixelBufferHeightKey } as *const _ as *const std::ffi::c_void
+        ));
+        values.push(width.as_ref());
+        values.push(height.as_ref());
+    }
+
+    let attributes = NSDictionary::from_slices(&keys, &values);
+    unsafe {
+        AVPlayerItemVideoOutput::initWithPixelBufferAttributes(
+            AVPlayerItemVideoOutput::alloc(),
+            Some(&attributes),
+        )
+    }
+}
+
+/// Ask the decoder for frames the size they will actually be drawn, once the
+/// item knows how big they are.
+///
+/// Returns whether the question has been settled — either because the output
+/// was swapped, or because there was nothing worth swapping it for. A `false`
+/// means the item still has not loaded and it is worth asking again next
+/// frame.
+///
+/// **The size comes from the item rather than from us**, which is what makes
+/// this safe to do at all: `LONGEST_SIDE` is applied to the longer edge and
+/// the other edge follows the source's own aspect ratio, so a decoder that
+/// honours the request scales the picture and a decoder that scales to exactly
+/// the rectangle it was handed produces the same picture either way. There is
+/// no arrangement of these two numbers that stretches anything.
+fn resize_output(reel: &mut Reel) -> bool {
+    let Some(output) = reel.output.as_ref() else { return true };
+    let size = unsafe { reel.item.presentationSize() };
+    let (w, h) = (size.width, size.height);
+    // `CGSizeZero` until the underlying resource has loaded, and for some
+    // containers for a few frames after playback starts. Not an answer.
+    if !(w.is_finite() && h.is_finite()) || w < 1.0 || h < 1.0 {
+        return false;
+    }
+    let Some(fit) = fit_within(w, h) else {
+        // Already smaller than anything we would ask for. Settled, and the
+        // output it was built with is the right one.
+        return true;
+    };
+
+    let sized = video_output(Some(fit));
+    unsafe {
+        reel.item.removeOutput(output);
+        reel.item.addOutput(&sized);
+    }
+    reel.output = Some(sized);
+    true
+}
+
+/// The rectangle to ask the decoder for, or `None` for a clip already small
+/// enough that asking would only cost a swap.
+///
+/// Even on both axes, because a chroma-subsampled source scaled to an odd width
+/// is a scaler being asked for something it is going to round anyway.
+fn fit_within(w: f64, h: f64) -> Option<(u32, u32)> {
+    let longest = w.max(h);
+    if longest <= LONGEST_SIDE as f64 {
+        return None;
+    }
+    let scale = LONGEST_SIDE as f64 / longest;
+    let even = |side: f64| ((side * scale).round() as u32).max(2) & !1;
+    Some((even(w), even(h)))
 }
 
 /// One decoded frame, as a picture the canvas can draw.
