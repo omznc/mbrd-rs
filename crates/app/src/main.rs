@@ -35,6 +35,11 @@ mod icons;
 mod images;
 mod import;
 mod live;
+// The three things macOS expects of an application that this app was not
+// doing, all of them about the window coming back — see the module note.
+// Nothing in it is compiled anywhere else.
+#[cfg(target_os = "macos")]
+mod mac;
 mod markdown;
 mod menu;
 mod mesh_cache;
@@ -86,9 +91,10 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui::{
-    point, px, size, App, AppContext as _, Application, Bounds, Size, TitlebarOptions, Window,
-    WindowAppearance, WindowBounds, WindowDecorations, WindowOptions,
+    point, px, size, App, AppContext as _, Application, Bounds, Entity, Size, TitlebarOptions,
+    Window, WindowAppearance, WindowBounds, WindowDecorations, WindowOptions,
 };
+use mbrd_core::Document;
 
 use board_view::BoardView;
 use themes::Appearance;
@@ -126,6 +132,13 @@ const MIN_SIZE: Size<gpui::Pixels> = Size { width: px(640.0), height: px(420.0) 
 const OPENED_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
 
 fn main() {
+    // Before the platform is built, though it would work at any point after
+    // the binary loaded: gpui registers its application delegate in a `#[ctor]`
+    // and this replaces one method on it. See `mac::teach_the_dock_icon`, which
+    // is the whole of why clicking a minimised mbrd in the Dock did nothing.
+    #[cfg(target_os = "macos")]
+    mac::teach_the_dock_icon();
+
     let path = std::env::args().nth(1).map(PathBuf::from);
 
     // The window always opens on the demonstration board, whatever was asked
@@ -202,118 +215,23 @@ fn main() {
         });
     }
 
+    // A Dock click that arrives when there is no window left.
+    //
+    // Registered on the `Application` because that is where gpui takes it, and
+    // before `run` because the event can reach an application that has not
+    // finished launching. This is the *closed* case; a window that is merely
+    // minimised never reaches here — see `mac::teach_the_dock_icon`, which is
+    // the other half and is about a bug rather than about a missing handler.
+    #[cfg(target_os = "macos")]
+    mac::reopen(&app, reopen_window);
+
     app.run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
-        let window = cx
-            .open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    window_min_size: Some(MIN_SIZE),
-                    // Ask for client-side decorations rather than leaving it to
-                    // the default, which is `Server`.
-                    //
-                    // The reason is that `Server` is not a question the compositor
-                    // reliably answers. gpui sets the state to `Server` optimistically
-                    // and only corrects it if an `xdg-decoration` Configure event
-                    // arrives saying otherwise — so a compositor that implements the
-                    // protocol and a compositor that has never heard of it are
-                    // *indistinguishable* from inside the app. Both report `Server`.
-                    //
-                    // GNOME's mutter is the second kind, and has been for its whole
-                    // life: it does not implement `xdg-decoration` at all, on the
-                    // position that clients should draw their own. So asking for
-                    // `Server` there means asking for a titlebar nobody draws, and
-                    // the window arrives with no way to move, resize or close it.
-                    //
-                    // Asking for `Client` is answerable: we draw the titlebar in
-                    // `titlebar.rs`, and a compositor that insists on decorating
-                    // anyway sends a Configure that flips us back to `Server`, at
-                    // which point that module keeps its bar and leaves the three
-                    // window buttons to the compositor that claimed them.
-                    window_decorations: Some(WindowDecorations::Client),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some(title.into()),
-                        // The same request, spelled the way macOS and Windows
-                        // take it: hide the system caption, we are drawing our
-                        // own. `titlebar.rs` says why this app insists on that
-                        // rather than wearing three different sets of chrome on
-                        // three desks.
-                        appears_transparent: true,
-                        // macOS hides the *bar* and keeps the traffic lights,
-                        // which are real buttons it draws over ours — so they
-                        // have to be told where our bar is. Centred in its
-                        // height, and `titlebar::LEFT_INSET` is the matching
-                        // half of this: the room left for them before anything
-                        // of ours starts. Ignored everywhere else.
-                        traffic_light_position: Some(point(px(12.0), px(11.0))),
-                    }),
-                    ..Default::default()
-                },
-                // Always the demo, and always with no path — see the note on
-                // `doc` above. Whatever `argv` or the Finder actually meant is
-                // opened a few lines down, through `dropped`, once there is a
-                // window and a `warn()` for it to fail into.
-                |_window, cx| cx.new(|cx| BoardView::new(doc, None, cx)),
-            )
-            .expect("could not open a window");
+        // The menu bar, which on this platform is also the entire keyboard: an
+        // application with no menu has no Cmd Q. See `mac::menus`.
+        #[cfg(target_os = "macos")]
+        mac::menus(cx);
 
-        // The board goes to disk before the window goes away.
-        //
-        // The autosave timer is at most a second from having done this itself
-        // — see `BoardView::arm_autosave` — and this is that second. Without
-        // it, closing the window straight after typing something is the one
-        // way left in this app to lose work, which is exactly what removing
-        // the unsaved-work indicator promised could not happen.
-        //
-        // Registered here rather than in the view because the hook needs a
-        // `Window`, and this is where there is one. It covers the compositor's
-        // own close — the system titlebar on macOS, a `Super Q`, a right-click
-        // on the taskbar; the button *this app* draws calls `flush` itself,
-        // because `remove_window` does not come back through here.
-        //
-        // `flush` answers whether the write can be trusted, and a `false` here
-        // turns the close back rather than letting it through — a full disk or
-        // a vanished mount is not something to lose a board over in silence.
-        // The refusal only happens once: `BoardView::flush` remembers it was
-        // already said, so a second attempt at closing is let through, because
-        // by then the warning has been read and staying open would just be
-        // trapping somebody behind a message they already have.
-        let _ = window.update(cx, |view, window, cx| {
-            // Through the `view` this closure was handed rather than through
-            // `cx.entity().update(…)`: the entity is already borrowed for the
-            // length of this block, and asking gpui for it a second time is a
-            // panic rather than a borrow error. Before the shadowing `let`
-            // below, for the same reason.
-            view.desktop_appearance(appearance(window), cx);
-
-            let view = cx.entity();
-            window.on_window_should_close(cx, move |_window, cx| {
-                view.update(cx, |view, cx| view.flush(cx))
-            });
-
-            // What the desktop looks like, now and whenever it changes.
-            //
-            // Here rather than in the view for the same reason the hook above
-            // is: it needs a `Window`, and this is where there is one. The
-            // seeding matters as much as the observation — on Linux the
-            // appearance arrives from the XDG desktop portal over D-Bus, so a
-            // window that only listened would sit on the placeholder until the
-            // desktop next changed its mind, which on most desks is never.
-            //
-            // Whether any of this is *acted* on is `BoardView::retheme`'s
-            // decision, not this one's: somebody who has pinned the app dark
-            // has said the desktop does not get a vote, and this still tracks
-            // it so that switching to `System` later is instant.
-            let observed = cx.entity();
-            window
-                .observe_window_appearance(move |window, cx| {
-                    let looks = appearance(window);
-                    observed.update(cx, |view, cx| view.desktop_appearance(looks, cx));
-                })
-                .detach();
-        });
-
-        let Ok(view) = window.entity(cx) else { return };
+        let Some(view) = open_window(cx, doc, title) else { return };
 
         // Whatever `dropped` already holds — `argv`'s path, or a Finder open
         // that AppKit delivered before this closure ran. `open_board` is the
@@ -352,11 +270,28 @@ fn main() {
         // tick that finds nothing does an `Option` check and *does not*
         // repaint — so the ordinary cost of this is a wakeup twice a second
         // and nothing else.
+        //
+        // **Weakly**, which matters more than it looks. Held strongly this
+        // loop could never end: the only thing that breaks it is `update`
+        // failing, `update` only fails once the entity is gone, and the loop
+        // was the thing keeping it. So a closed window left this timer running
+        // for the life of the process with the whole board — every photograph,
+        // every clip — still in memory behind it. On this platform closing the
+        // window does not end the application, which is exactly the case that
+        // made that a leak rather than a technicality.
         if cfg!(target_os = "macos") {
+            let watching = view.downgrade();
             cx.spawn(async move |cx| loop {
                 cx.background_executor().timer(OPENED_EVERY).await;
+                // Checked every tick and not only when something was dropped,
+                // because a Dock icon that is never dropped on is the case
+                // this timer would otherwise outlive by the life of the
+                // process.
+                if watching.upgrade().is_none() {
+                    break;
+                }
                 let Some(path) = dropped.borrow_mut().take() else { continue };
-                if view.update(cx, |view, cx| view.open_board(&path, cx)).is_err() {
+                if watching.update(cx, |view, cx| view.open_board(&path, cx)).is_err() {
                     // The window has gone. Nothing left to open boards into.
                     break;
                 }
@@ -366,6 +301,147 @@ fn main() {
 
         cx.activate(true);
     });
+}
+
+/// Open the window, with everything that needs one hung off it.
+///
+/// Split out of [`main`] because it is wanted twice: once at launch, and once
+/// more when somebody clicks the Dock icon of an mbrd whose window they closed
+/// — see `mac::reopen`. Before that second caller existed this was all inline,
+/// which is why it reads as a sequence rather than as a constructor.
+fn open_window(cx: &mut App, doc: Document, title: String) -> Option<Entity<BoardView>> {
+    let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
+    let window = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(MIN_SIZE),
+                // Ask for client-side decorations rather than leaving it to
+                // the default, which is `Server`.
+                //
+                // The reason is that `Server` is not a question the compositor
+                // reliably answers. gpui sets the state to `Server` optimistically
+                // and only corrects it if an `xdg-decoration` Configure event
+                // arrives saying otherwise — so a compositor that implements the
+                // protocol and a compositor that has never heard of it are
+                // *indistinguishable* from inside the app. Both report `Server`.
+                //
+                // GNOME's mutter is the second kind, and has been for its whole
+                // life: it does not implement `xdg-decoration` at all, on the
+                // position that clients should draw their own. So asking for
+                // `Server` there means asking for a titlebar nobody draws, and
+                // the window arrives with no way to move, resize or close it.
+                //
+                // Asking for `Client` is answerable: we draw the titlebar in
+                // `titlebar.rs`, and a compositor that insists on decorating
+                // anyway sends a Configure that flips us back to `Server`, at
+                // which point that module keeps its bar and leaves the three
+                // window buttons to the compositor that claimed them.
+                window_decorations: Some(WindowDecorations::Client),
+                titlebar: Some(TitlebarOptions {
+                    title: Some(title.into()),
+                    // The same request, spelled the way macOS and Windows
+                    // take it: hide the system caption, we are drawing our
+                    // own. `titlebar.rs` says why this app insists on that
+                    // rather than wearing three different sets of chrome on
+                    // three desks.
+                    appears_transparent: true,
+                    // macOS hides the *bar* and keeps the traffic lights,
+                    // which are real buttons it draws over ours — so they
+                    // have to be told where our bar is. Centred in its
+                    // height, and `titlebar::LEFT_INSET` is the matching
+                    // half of this: the room left for them before anything
+                    // of ours starts. Ignored everywhere else.
+                    traffic_light_position: Some(point(px(12.0), px(11.0))),
+                }),
+                ..Default::default()
+            },
+            // Always the demo, and always with no path — see the note on
+            // `doc` in `main`. Whatever `argv` or the Finder actually meant is
+            // opened by the caller, once there is a window and a `warn()` for
+            // it to fail into.
+            |_window, cx| cx.new(|cx| BoardView::new(doc, None, cx)),
+        )
+        .ok()?;
+
+    // The board goes to disk before the window goes away.
+    //
+    // The autosave timer is at most a second from having done this itself
+    // — see `BoardView::arm_autosave` — and this is that second. Without
+    // it, closing the window straight after typing something is the one
+    // way left in this app to lose work, which is exactly what removing
+    // the unsaved-work indicator promised could not happen.
+    //
+    // Registered here rather than in the view because the hook needs a
+    // `Window`, and this is where there is one. It covers the compositor's
+    // own close — the system titlebar on macOS, a `Super Q`, a right-click
+    // on the taskbar; the button *this app* draws calls `flush` itself,
+    // because `remove_window` does not come back through here.
+    //
+    // `flush` answers whether the write can be trusted, and a `false` here
+    // turns the close back rather than letting it through — a full disk or
+    // a vanished mount is not something to lose a board over in silence.
+    // The refusal only happens once: `BoardView::flush` remembers it was
+    // already said, so a second attempt at closing is let through, because
+    // by then the warning has been read and staying open would just be
+    // trapping somebody behind a message they already have.
+    let _ = window.update(cx, |view, window, cx| {
+        // Through the `view` this closure was handed rather than through
+        // `cx.entity().update(…)`: the entity is already borrowed for the
+        // length of this block, and asking gpui for it a second time is a
+        // panic rather than a borrow error. Before the shadowing `let`
+        // below, for the same reason.
+        view.desktop_appearance(appearance(window), cx);
+
+        let view = cx.entity();
+        window.on_window_should_close(cx, move |_window, cx| {
+            view.update(cx, |view, cx| view.flush(cx))
+        });
+
+        // What the desktop looks like, now and whenever it changes.
+        //
+        // Here rather than in the view for the same reason the hook above
+        // is: it needs a `Window`, and this is where there is one. The
+        // seeding matters as much as the observation — on Linux the
+        // appearance arrives from the XDG desktop portal over D-Bus, so a
+        // window that only listened would sit on the placeholder until the
+        // desktop next changed its mind, which on most desks is never.
+        //
+        // Whether any of this is *acted* on is `BoardView::retheme`'s
+        // decision, not this one's: somebody who has pinned the app dark
+        // has said the desktop does not get a vote, and this still tracks
+        // it so that switching to `System` later is instant.
+        let observed = cx.entity();
+        window
+            .observe_window_appearance(move |window, cx| {
+                let looks = appearance(window);
+                observed.update(cx, |view, cx| view.desktop_appearance(looks, cx));
+            })
+            .detach();
+    });
+
+    window.entity(cx).ok()
+}
+
+/// A window for an application that has none, on the board somebody was last
+/// looking at.
+///
+/// What a Dock click gets after the window was closed. The most recent board
+/// rather than the demonstration one, because closing a window is not the same
+/// as finishing with the board that was in it — and it goes through
+/// `open_board` for the reason every other route does: a board that has since
+/// been moved or deleted leaves the window standing with a line saying so,
+/// rather than refusing to open one.
+///
+/// The welcome screen is deliberately not shown here. It is a first-run
+/// question, and somebody who has closed a window and clicked the icon has
+/// plainly run this before.
+#[cfg(target_os = "macos")]
+fn reopen_window(cx: &mut App) {
+    let Some(view) = open_window(cx, demo::board(), "mbrd".to_string()) else { return };
+    if let Some(board) = recent::load().into_iter().next() {
+        view.update(cx, |view, cx| view.open_board(&board, cx));
+    }
 }
 
 /// The path inside a `file://` URL, if that is what it is.
