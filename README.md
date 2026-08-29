@@ -5,9 +5,16 @@ Pan, zoom, drop images, notes and
 connections onto a board with no edges, and it all lives in a single `.mbrd`
 file that travels. Native, built on [GPUI](https://gpui.rs/).
 
-There is no save button and no unsaved-work dot, because there is no state in
-which your work is only in memory: every change is on disk a second later, every
-change can be taken back, and the undo history survives the file.
+[![A board](docs/screenshots/board-dark.png)](docs/screenshots/board-dark.png)
+
+| Everything, as a list you type at | A card, on the whole window | What applies to what you pressed |
+|---|---|---|
+| [![Commands](docs/screenshots/palette-dark.png)](docs/screenshots/palette-dark.png) | [![Opened](docs/screenshots/opened-dark.png)](docs/screenshots/opened-dark.png) | [![Menu](docs/screenshots/menu-dark.png)](docs/screenshots/menu-dark.png) |
+
+The board in those is [`studio.mbrd`](docs/screenshots/studio.mbrd), which is
+in the repository — open it and you are looking at the screenshots. The rest
+of them are in [`docs/screenshots`](docs/screenshots), which also says how they
+are retaken.
 
 ## Run it
 
@@ -27,6 +34,10 @@ Building from source on Linux needs a handful of system packages — see
 whether to follow your desktop or pin one. Drop a `.json` in your themes
 folder for your own; [`THEMES.md`](THEMES.md) is every colour there is and
 what it draws.
+
+| The same board, light | Where that is chosen |
+|---|---|
+| [![Light](docs/screenshots/board-light.png)](docs/screenshots/board-light.png) | [![Appearance](docs/screenshots/settings-light.png)](docs/screenshots/settings-light.png) |
 
 ## Controls
 
@@ -96,8 +107,9 @@ The short version: no input method for composing keyboards, no rich text beyond
 Markdown, no sticker shapes, no playlist for a board's audio, and rotation
 round-trips but is not drawn. Sound and video play on all three platforms,
 through the decoder the machine already has, so which formats work is the
-machine's answer rather than mbrd's. [`ROADMAP.md`](ROADMAP.md) has the plan,
-what has been cut, and why.
+machine's answer rather than mbrd's. [The issues](https://github.com/omznc/mbrd-rs/issues)
+are what is left to build; [`CONTRIBUTING.md`](CONTRIBUTING.md) has what was cut
+on purpose, and why.
 
 ## Contributing
 

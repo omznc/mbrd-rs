@@ -1,2 +1,5 @@
 /target
 *.mbrd
+# ...except the one the README's screenshots are taken of, which is committed
+# so that a retake is the same picture rather than a new one.
+!docs/screenshots/studio.mbrd
