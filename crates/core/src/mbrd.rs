@@ -227,31 +227,55 @@ pub fn read_watched<R: Read + Seek>(
     // writing them, and it is the one place in this reader where a sidecar wins
     // over the record it was derived from.
     //
-    // **A note with no asset that has grown past `NOTE_MAX` is promoted, not
-    // clipped.** A typed note's only copy of its words used to be `meta.text`
-    // itself, so a person who opened the `.md` by hand and kept writing had
-    // everything past the 512th character silently dropped on the next open —
-    // the one case this format's "legible archive" promise was actually a trap.
-    // The fix mirrors what already happens to a dropped `.md` file: the full
-    // text becomes an asset, keyed by its own hash like any other embedded
-    // bytes, and `meta.text` steps down to being the derived head it already is
-    // for every asset-backed note. This runs once — the moment it does, the
-    // note has an asset, and every path above and below this one already knows
-    // to prefer it (see `opened::words_of` in the app crate).
+    // **Every note is a Markdown file, and the sidecar is that file.** A note
+    // whose words fit the head lives in `meta.text` alone; one that has
+    // outgrown it keeps the full text as an asset, keyed by its own hash like
+    // any other embedded bytes, with `meta.text` stepped down to the derived
+    // head it already is for every asset-backed note. This loop is where both
+    // halves of that promise are kept against a hand-edited sidecar:
+    //
+    // - A note with **no asset** that has grown past `NOTE_MAX` is promoted,
+    //   not clipped. Its only copy used to be `meta.text` itself, so a person
+    //   who opened the `.md` by hand and kept writing had everything past the
+    //   512th character silently dropped on the next open — the one case this
+    //   format's "legible archive" promise was actually a trap.
+    //
+    // - A note **with a textual asset** whose sidecar no longer matches it has
+    //   been edited by hand, and the edit wins: the sidecar's text becomes a
+    //   new asset and the item points at it. Guarded against sidecars a
+    //   pre-0.4 build wrote, which carried only the head — a sidecar equal to
+    //   the asset's own head is indistinguishable from an untouched one and
+    //   must not shear a long note down to its first 512 characters.
+    //
+    // Every path above and below this one already prefers the asset where
+    // there is one (see `opened::words_of` in the app crate).
     for item in &mut board.items {
         if item.kind != ItemType::Note {
             continue;
         }
         let Some(raw) = notes.get(&item.id) else { continue };
         let text = raw.trim_end_matches('\n');
-        if item.asset.is_none() && text.chars().count() > NOTE_MAX {
+        let rewrite = match item.asset.as_ref().and_then(ItemAsset::hash) {
+            Some(hash) => match assets.get(hash) {
+                Some(asset) if crate::preview::readable_text(&asset.bytes) => {
+                    let whole = String::from_utf8_lossy(&asset.bytes);
+                    let whole = whole.trim_end_matches('\n');
+                    let head: String = whole.chars().take(NOTE_MAX).collect();
+                    (text != whole && text != head.trim_end_matches('\n'))
+                        .then(|| (asset.ext.clone(), asset.label.clone()))
+                }
+                // An asset that is not words — a retyped image card, or bytes
+                // the archive lost — is not what the sidecar was derived from,
+                // so the sidecar stays what it always was for such a note: the
+                // head, and nothing more.
+                _ => None,
+            },
+            None => (text.chars().count() > NOTE_MAX).then(|| ("md".into(), String::new())),
+        };
+        if let Some((ext, label)) = rewrite {
             let bytes = text.as_bytes().to_vec();
             let hash = hash_bytes(&bytes);
-            assets.entry(hash.clone()).or_insert(Asset {
-                bytes,
-                ext: "md".into(),
-                label: String::new(),
-            });
+            assets.entry(hash.clone()).or_insert(Asset { bytes, ext, label });
             item.asset = Some(ItemAsset::Embedded { hash, family: None });
         }
         let head: String = text.chars().take(NOTE_MAX).collect();
@@ -432,17 +456,29 @@ pub fn write<W: Write + Seek>(writer: W, doc: &Document, now: &str) -> Result<()
         zip.write_all(&asset.bytes)?;
     }
 
-    // The convenience copies. A note whose id is not filename-safe simply does
-    // not get one: its text is still in `board.json`, so nothing is lost but
-    // the convenience.
+    // The note as a file: each note's words, whole, as Markdown. For a note
+    // that outgrew its head this is a copy of the asset — the *unabridged*
+    // text, not the `meta.text` head, or "the `.md` outranks `board.json`"
+    // would hand a person a truncated file and honor their edit to it. A note
+    // whose id is not filename-safe simply does not get one: its words are
+    // still in `board.json` or under `assets/`, so nothing is lost but the
+    // legibility.
     for item in &doc.board.items {
         if item.kind != ItemType::Note {
             continue;
         }
-        let Some(text) = item.note_text() else { continue };
+        let Some(head) = item.note_text() else { continue };
         if !filename_safe(&item.id) {
             continue;
         }
+        let whole = item
+            .asset
+            .as_ref()
+            .and_then(ItemAsset::hash)
+            .and_then(|hash| doc.assets.get(hash))
+            .filter(|asset| crate::preview::readable_text(&asset.bytes))
+            .map(|asset| String::from_utf8_lossy(&asset.bytes).into_owned());
+        let text = whole.as_deref().unwrap_or(head).trim_end_matches('\n');
         let slug = slugify(text.lines().next().unwrap_or_default());
         zip.start_file(format!("notes/{slug}--{}.md", item.id), deflated)?;
         zip.write_all(text.as_bytes())?;
@@ -709,13 +745,10 @@ mod tests {
         assert_eq!(&bytes[38..38 + MIME_TYPE.len()], MIME_TYPE.as_bytes());
     }
 
-    #[test]
-    fn a_hand_edited_note_outranks_board_json() {
-        // The whole point of writing the sidecars: unzip, edit, rezip, and the
-        // board opens with your words.
-        let doc = doc_with_a_photo_and_a_note();
-        let packed = to_bytes(&doc, "now").unwrap();
-
+    /// The archive with every `notes/` entry rewritten to `text` — the
+    /// hand-edit these tests are about, done the way a person does it: unzip,
+    /// write over the file, rezip.
+    fn with_sidecars_rewritten(packed: Vec<u8>, text: &str) -> Vec<u8> {
         let mut zip = ZipArchive::new(Cursor::new(packed)).unwrap();
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
         for i in 0..zip.len() {
@@ -730,12 +763,21 @@ mod tests {
         for (name, body) in entries {
             out.start_file(&name, SimpleFileOptions::default()).unwrap();
             if name.starts_with("notes/") {
-                out.write_all(b"# get the big one after all\n").unwrap();
+                out.write_all(text.as_bytes()).unwrap();
             } else {
                 out.write_all(&body).unwrap();
             }
         }
-        let rezipped = out.finish().unwrap().into_inner();
+        out.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn a_hand_edited_note_outranks_board_json() {
+        // The whole point of writing the sidecars: unzip, edit, rezip, and the
+        // board opens with your words.
+        let doc = doc_with_a_photo_and_a_note();
+        let packed = to_bytes(&doc, "now").unwrap();
+        let rezipped = with_sidecars_rewritten(packed, "# get the big one after all\n");
 
         let back = read(Cursor::new(rezipped)).unwrap();
         let note = back.board.item("p81m4x").unwrap();
@@ -750,27 +792,8 @@ mod tests {
         let doc = doc_with_a_photo_and_a_note();
         let packed = to_bytes(&doc, "now").unwrap();
 
-        let mut zip = ZipArchive::new(Cursor::new(packed)).unwrap();
-        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
-        for i in 0..zip.len() {
-            let mut e = zip.by_index(i).unwrap();
-            let name = e.name().to_string();
-            let mut b = Vec::new();
-            e.read_to_end(&mut b).unwrap();
-            entries.push((name, b));
-        }
-
         let long = "x".repeat(NOTE_MAX * 3);
-        let mut out = ZipWriter::new(Cursor::new(Vec::new()));
-        for (name, body) in entries {
-            out.start_file(&name, SimpleFileOptions::default()).unwrap();
-            if name.starts_with("notes/") {
-                out.write_all(long.as_bytes()).unwrap();
-            } else {
-                out.write_all(&body).unwrap();
-            }
-        }
-        let rezipped = out.finish().unwrap().into_inner();
+        let rezipped = with_sidecars_rewritten(packed, &long);
 
         let back = read(Cursor::new(rezipped)).unwrap();
         let note = back.board.item("p81m4x").unwrap();
@@ -783,6 +806,96 @@ mod tests {
         let asset = back.assets.get(hash).expect("the asset's bytes are in the archive");
         assert_eq!(asset.bytes, long.as_bytes());
         assert_eq!(asset.ext, "md");
+    }
+
+    /// A note whose words outgrew the head: the full text as its own asset,
+    /// `meta.text` holding only the first `NOTE_MAX` characters.
+    fn doc_with_a_grown_note() -> (Document, String) {
+        let text = format!("# groceries\n\n{}", "get the big one. ".repeat(64));
+        let text = text.trim_end().to_string();
+        let bytes = text.as_bytes().to_vec();
+        let hash = hash_bytes(&bytes);
+
+        let mut board = Board { title: "Kitchen".into(), ..Board::default() };
+        let mut note = Item::new("p81m4x", ItemType::Note);
+        note.name = "groceries".into();
+        note.meta
+            .insert("text".into(), Value::String(text.chars().take(NOTE_MAX).collect::<String>()));
+        note.asset = Some(ItemAsset::Embedded { hash: hash.clone(), family: None });
+        board.items.push(note);
+
+        let mut assets = HashMap::new();
+        assets.insert(hash, Asset { bytes, ext: "md".into(), label: "groceries".into() });
+
+        let doc = Document {
+            manifest: Manifest::default(),
+            board: BoardState::new(board),
+            assets,
+            waveforms: HashMap::new(),
+        };
+        (doc, text)
+    }
+
+    #[test]
+    fn an_asset_backed_notes_sidecar_carries_the_whole_text_not_the_head() {
+        // "Every note is a Markdown file" is this entry. A sidecar that held
+        // only the head would hand a person a truncated file, honor their
+        // edit to it, and call the result their note.
+        let (doc, text) = doc_with_a_grown_note();
+        let packed = to_bytes(&doc, "now").unwrap();
+
+        let mut zip = ZipArchive::new(Cursor::new(packed)).unwrap();
+        let mut sidecar = None;
+        for i in 0..zip.len() {
+            let mut e = zip.by_index(i).unwrap();
+            if e.name().starts_with("notes/") {
+                let mut b = Vec::new();
+                e.read_to_end(&mut b).unwrap();
+                sidecar = Some(String::from_utf8(b).unwrap());
+            }
+        }
+        assert_eq!(sidecar.as_deref(), Some(format!("{text}\n").as_str()));
+    }
+
+    #[test]
+    fn a_hand_edit_to_an_asset_backed_notes_sidecar_outranks_the_asset() {
+        // The same promise `a_hand_edited_note_outranks_board_json` makes for
+        // a bare note, kept for one whose words live in an asset — and kept
+        // even when the edit is *shorter* than the head, which is the case no
+        // length test can catch. The asset's ext rides along, so a dropped
+        // `.md` stays a `.md` through the edit.
+        let (doc, _) = doc_with_a_grown_note();
+        let packed = to_bytes(&doc, "now").unwrap();
+        let rezipped = with_sidecars_rewritten(packed, "actually, the small one\n");
+
+        let back = read(Cursor::new(rezipped)).unwrap();
+        let note = back.board.item("p81m4x").unwrap();
+        assert_eq!(note.note_text(), Some("actually, the small one"));
+
+        let hash = note.asset.as_ref().and_then(ItemAsset::hash).expect("still asset-backed");
+        let asset = back.assets.get(hash).expect("re-pointed at real bytes");
+        assert_eq!(asset.bytes, b"actually, the small one");
+        assert_eq!(asset.ext, "md");
+    }
+
+    #[test]
+    fn a_head_only_sidecar_from_an_older_build_leaves_the_asset_alone() {
+        // A pre-0.4 build wrote the sidecar from `meta.text` — the head — so
+        // every long note it saved has a sidecar that is exactly the asset's
+        // first `NOTE_MAX` characters. That file was never edited by anybody,
+        // and a reader that took it at its word would shear the note down to
+        // its head on the next open: the original clipping bug, rebuilt.
+        let (doc, text) = doc_with_a_grown_note();
+        let packed = to_bytes(&doc, "now").unwrap();
+        let head: String = text.chars().take(NOTE_MAX).collect();
+        let rezipped = with_sidecars_rewritten(packed, &format!("{head}\n"));
+
+        let back = read(Cursor::new(rezipped)).unwrap();
+        let note = back.board.item("p81m4x").unwrap();
+
+        let hash = note.asset.as_ref().and_then(ItemAsset::hash).expect("still asset-backed");
+        let asset = back.assets.get(hash).expect("the bytes survived");
+        assert_eq!(asset.bytes, text.as_bytes(), "the whole text, untouched");
     }
 
     #[test]

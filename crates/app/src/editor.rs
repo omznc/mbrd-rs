@@ -108,11 +108,11 @@ enum Change {
 
 /// The text and the caret, as they were before some edit.
 ///
-/// The whole string rather than a diff. A note is capped at
-/// `mbrd_core::model::NOTE_MAX` characters and a name at far less, so the
-/// stack is bounded by [`Editor::UNDO_MAX`] copies of something small — and a
-/// diff would be a second representation of the edit that could disagree with
-/// the first.
+/// The whole string rather than a diff. Every field this editor holds is
+/// bounded — `mbrd_core::preview::TEXT_MAX` at the widest — so the stack is
+/// bounded by [`Editor::UNDO_MAX`] copies of something that fits in memory
+/// many times over, and a diff would be a second representation of the edit
+/// that could disagree with the first.
 #[derive(Debug, Clone)]
 struct Step {
     text: String,
@@ -154,8 +154,8 @@ impl Editor {
     ///
     /// A session is one card's text between opening it and committing it, so
     /// this is generous rather than tight: the board's own history takes over
-    /// past the end of it, and the cost of a step is a copy of something that
-    /// is capped at `NOTE_MAX` characters anyway.
+    /// past the end of it, and a step only ever costs a copy of what the
+    /// session's own limit allows.
     pub const UNDO_MAX: usize = 256;
 
     pub fn new(text: impl Into<String>, limit: usize, multiline: bool) -> Self {

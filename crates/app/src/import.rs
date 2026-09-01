@@ -314,7 +314,11 @@ fn measure(bytes: &[u8]) -> Option<(u32, u32)> {
         .ok()
 }
 
-/// A text file's words, held to what a note may carry.
+/// A text file's words, held to the head the board carries in `meta.text`.
+///
+/// Not a limit on the note: the file's whole text rides along as the card's
+/// asset, and everything that shows or edits the words prefers it — see
+/// `opened::words_of`. This is only the derived, searchable first paragraph.
 fn words(bytes: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(bytes).ok()?;
     let mut out = text.trim().to_string();

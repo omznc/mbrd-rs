@@ -31,7 +31,7 @@
 //! enough to call on every frame, which is what it is called on.
 
 use crate::mbrd::Asset;
-use crate::model::{Item, ItemType, NOTE_MAX};
+use crate::model::{Item, ItemType};
 
 /// The longest text this build will open for typing.
 ///
@@ -243,17 +243,20 @@ pub fn editable(item: &Item, asset: Option<&Asset>) -> Vec<Editable> {
 
 /// The cap on this card's text, where its text can be typed into at all.
 ///
-/// Two different limits and the difference matters: a note with no file behind
-/// it lives in `meta.text` and is held to [`NOTE_MAX`] because that is what the
-/// board carries, while a card that came from a file is the *file* and is held
-/// to [`TEXT_MAX`] because that is what an editor can carry.
+/// One limit, [`TEXT_MAX`], and it is the editor's rather than the board's: it
+/// says what a `String` with a caret in it can be asked to hold, not what
+/// `meta.text` may carry. A note used to be held to
+/// [`NOTE_MAX`](crate::model::NOTE_MAX) here because
+/// the board's copy was its *only* copy; now every note is a Markdown file
+/// underneath — its words move to an asset the moment they outgrow the head —
+/// so the cap on `meta.text` is the committer's business, not the typist's.
 fn writable(item: &Item, asset: Option<&Asset>) -> Option<usize> {
     match of(item, asset) {
         // A vector is drawn as a picture but is still, underneath, the XML that
         // makes one — and that stays true and stays editable even once it can
         // also be looked at rather than read.
         Preview::Document | Preview::Source { .. } | Preview::Sheet { .. } | Preview::Vector => {
-            Some(if asset.is_some() { TEXT_MAX } else { NOTE_MAX })
+            Some(TEXT_MAX)
         }
         _ => None,
     }
@@ -735,7 +738,7 @@ mod tests {
     #[test]
     fn the_principal_field_comes_first() {
         let note = Item::new("a", ItemType::Note);
-        assert_eq!(editable(&note, None)[0], Editable::Text { limit: NOTE_MAX });
+        assert_eq!(editable(&note, None)[0], Editable::Text { limit: TEXT_MAX });
 
         let link = Item::new("a", ItemType::Link);
         assert_eq!(editable(&link, None), vec![Editable::Url, Editable::Name]);

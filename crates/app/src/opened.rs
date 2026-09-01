@@ -49,9 +49,12 @@
 //! `.md` is usually not.
 //!
 //! So this page edits whichever of the two the card actually has. A note
-//! somebody typed is the card's words and stays under the cap. A card that came
-//! from a file is **the file**: the whole of it, edited here and written back
-//! as a new asset, with `meta.text` refreshed to the first `NOTE_MAX`
+//! somebody typed is the card's words while they fit the head, and **becomes
+//! the file the moment they don't**: the commit promotes it through the asset
+//! path (`BoardView::commit_edit`), because every note is a Markdown file
+//! underneath and the cap belongs to `meta.text`, not to the note. A card that
+//! came from a file is **the file**: the whole of it, edited here and written
+//! back as a new asset, with `meta.text` refreshed to the first `NOTE_MAX`
 //! characters so the card behind still says what the file starts with. Both go
 //! through the ledger, so both undo.
 

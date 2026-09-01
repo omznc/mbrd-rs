@@ -8039,7 +8039,22 @@ impl BoardView {
         }
 
         let mut card = Item::new(id.clone(), ItemType::Note);
-        let words: String = text.trim().chars().take(mbrd_core::model::NOTE_MAX).collect();
+        // The head onto the board, the whole of it as an asset where there is
+        // more — the same bargain every other door strikes now that a note is
+        // a Markdown file underneath. This line used to quietly cut a pasted
+        // page down to its first 512 characters.
+        let text = text.trim();
+        let words: String = text.chars().take(mbrd_core::model::NOTE_MAX).collect();
+        if text.chars().count() > mbrd_core::model::NOTE_MAX {
+            let bytes = text.as_bytes().to_vec();
+            let hash = mbrd_core::mbrd::hash_bytes(&bytes);
+            self.doc.assets.entry(hash.clone()).or_insert(mbrd_core::mbrd::Asset {
+                bytes,
+                ext: "md".into(),
+                label: "note".into(),
+            });
+            card.asset = Some(ItemAsset::Embedded { hash, family: None });
+        }
         card.name = "note".into();
         card.w = 260.0;
         card.h = 200.0;
@@ -8216,14 +8231,32 @@ impl BoardView {
         // next — the one way this door can blur two edits into one.
         self.stop_editing(true, cx);
         let Some(item) = self.doc.board.item(id) else { return };
-        let (field, before, limit, multiline) = match item.kind {
-            ItemType::Note | ItemType::Text => (
-                Field::Note,
-                item.note_text().unwrap_or_default().to_string(),
-                mbrd_core::model::NOTE_MAX,
-                true,
-            ),
-            _ => (Field::Name, item.name.clone(), mbrd_core::model::NOTE_MAX, false),
+        let (field, before, limit, multiline, file) = match item.kind {
+            ItemType::Note | ItemType::Text => {
+                // The whole of the words, not the head the card face carries —
+                // a note that outgrew `meta.text` keeps its text as an asset,
+                // and an editor that opened on the first 512 characters of it
+                // would commit the first 512 characters *as* it.
+                let words = crate::opened::words_of(item, self);
+                // The same bar the opened page sets: a file this long is not
+                // something a `String` with a caret in it should be asked to
+                // hold, and it still has a name worth changing.
+                if words.chars().count() > mbrd_core::preview::TEXT_MAX {
+                    return;
+                }
+                let file = crate::opened::file_text(item, self).is_some();
+                // A note whose asset is not words — a retyped image card —
+                // has only its head to type into, and the head keeps its cap:
+                // there is nowhere for an overflow to go without overwriting
+                // the picture. Through `asset_of` rather than `item.asset`,
+                // because an asset whose bytes were scrubbed protects nothing.
+                let limit = match self.asset_of(item).is_some() && !file {
+                    true => mbrd_core::model::NOTE_MAX,
+                    false => mbrd_core::preview::TEXT_MAX,
+                };
+                (Field::Note, words, limit, true, file)
+            }
+            _ => (Field::Name, item.name.clone(), mbrd_core::model::NOTE_MAX, false, false),
         };
         // A name opens selected, so typing replaces it; a note opens with the
         // caret at the end, so typing continues it. Which is what each of them
@@ -8238,7 +8271,7 @@ impl BoardView {
             on: Subject::Card(id.to_string(), field),
             editor,
             before,
-            file: false,
+            file,
             open: self.doc.board.start(),
         });
         self.hint(Some(hint_for(field)));
@@ -8325,6 +8358,13 @@ impl BoardView {
     /// commit path that only two of the three took would lose a file's worth of
     /// typing on Escape.
     fn commit_edit(&mut self, on: &Subject, file: bool, text: &str, token: &Pending) {
+        // Decided again here rather than trusted from the session, because a
+        // note can cross the line *during* one: words typed past `NOTE_MAX`
+        // have outgrown `meta.text` even though the session opened on a bare
+        // note, and the Escape path's second commit lands on a card the first
+        // commit just gave an asset. Either way the words go through the
+        // archive path — the head stays derived, and nothing is clipped.
+        let file = file || self.outgrown(on, text);
         match (file, on) {
             (true, Subject::Card(id, _)) => {
                 let id = id.clone();
@@ -8335,6 +8375,30 @@ impl BoardView {
                 let measure = self.measure.clone();
                 self.doc.board.during(token, |board| write_to(board, &on, text, &measure));
             }
+        }
+    }
+
+    /// Whether this text has to commit as bytes in the archive rather than as
+    /// `meta.text`.
+    ///
+    /// True past the moment there is no way back: words longer than the head
+    /// the board carries, or a note whose words already live in an asset —
+    /// writing `meta.text` under one of those would put down a copy the asset
+    /// immediately shadows (see `opened::words_of`). A note whose asset is
+    /// *not* words — a retyped image card — never commits over it; its editor
+    /// held the head to `NOTE_MAX`, so the length arm cannot fire either. An
+    /// asset whose bytes are *gone* — scrubbed from the history — counts as no
+    /// asset at all: there is nothing left to shadow the words, and nothing
+    /// left to protect.
+    fn outgrown(&self, on: &Subject, text: &str) -> bool {
+        let Subject::Card(id, Field::Note) = on else { return false };
+        let Some(item) = self.doc.board.item(id) else { return false };
+        if !matches!(item.kind, ItemType::Note | ItemType::Text) {
+            return false;
+        }
+        match self.asset_of(item) {
+            Some(asset) => mbrd_core::preview::readable_text(&asset.bytes),
+            None => text.chars().count() > mbrd_core::model::NOTE_MAX,
         }
     }
 
@@ -15420,10 +15484,12 @@ const FIT_TEXT: &str = "fitText";
 
 /// The most lines a fitted note is measured over.
 ///
-/// A note holds [`mbrd_core::model::NOTE_MAX`] characters, so at one character
-/// a line this is the ceiling that is actually reachable. It exists to keep
-/// the measurement finite rather than to clip anything: a note that hit it
-/// would be one character wide.
+/// A note's card face carries at most [`mbrd_core::model::NOTE_MAX`]
+/// characters — the head in `meta.text`; longer words live in the asset and
+/// are read on the opened page — so at one character a line this is the
+/// ceiling that is actually reachable. It exists to keep the measurement
+/// finite rather than to clip anything: a note that hit it would be one
+/// character wide.
 const FIT_ROWS: usize = mbrd_core::model::NOTE_MAX;
 
 /// The shortest a fitted note is allowed to get, in world units.

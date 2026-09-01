@@ -20,7 +20,13 @@
 
 use serde_json::{Map, Value};
 
-/// The longest a note may be, enforced at every door onto the board.
+/// The longest a note's words stay in `board.json` itself.
+///
+/// Not a limit on a note — every note is a Markdown file underneath, and one
+/// that outgrows this moves its words to an asset at whichever door the growth
+/// happens (typing, the archive's own `notes/` sidecar). What stays behind in
+/// `meta.text` is the first `NOTE_MAX` characters: the derived head that keeps
+/// the board searchable, diffable and small.
 pub const NOTE_MAX: usize = 512;
 /// The longest a board's title may be. Also bounds the exported filename.
 pub const BOARD_TITLE_MAX: usize = 32;
