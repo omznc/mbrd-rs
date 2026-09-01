@@ -7,9 +7,18 @@
 //!     ▼                        │
 //!   Found ◀────────────────────┘
 //!     │
-//!     ├── Tell   — say so; this install cannot replace itself
+//!     ├── Tell   — say so; this install cannot become the new version itself
 //!     └── Ready  — stage(), then apply(), then restart
 //! ```
+//!
+//! ## Two ways of becoming the new version
+//!
+//! Most installs are a file this app owns, and `install.rs` swaps it. A `.deb`
+//! or `.rpm` install is not: `dpkg` owns `/usr/bin/mbrd` and records a hash for
+//! it, so the update for those is the *package*, downloaded through the same
+//! signed manifest and handed to the tool that owns the file — `package.rs`.
+//! `eligible.rs` decides which, before anything is downloaded, because the two
+//! are different artifacts under different keys.
 //!
 //! ## What is trusted, and by what
 //!
@@ -39,6 +48,7 @@ pub mod eligible;
 pub mod install;
 pub mod manifest;
 pub mod net;
+pub mod package;
 pub mod version;
 
 use std::path::PathBuf;
@@ -47,7 +57,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Result};
 
 use crate::dirs;
-use eligible::{Install, Verdict};
+use eligible::{How, Install, Plan, Verdict};
 use manifest::{Artifact, Manifest};
 use version::Version;
 
@@ -76,11 +86,30 @@ const EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 pub enum Found {
     /// This is the newest version, or there is nothing to say.
     Nothing,
-    /// A new version exists and this install can replace itself with it.
-    Ready { version: Version, artifact: Artifact, target: PathBuf },
+    /// A new version exists and this install can become it. The [`Plan`] says
+    /// how — a swap, or a package handed to `dpkg`.
+    Ready { version: Version, artifact: Artifact, plan: Plan },
     /// A new version exists and this install cannot. Carries what to say
     /// instead — see `eligible.rs`, which is where the sentence comes from.
     Tell { version: Version, why: String },
+}
+
+/// The manifest key an install of this shape looks itself up under.
+///
+/// One triple, up to three artifacts: the tarball or bundle or `.exe` under
+/// the bare triple, and the two Linux packages under it with a suffix. The
+/// suffix rather than a separate map because the manifest's whole index is
+/// "which download is mine", and a `.deb` install's answer is as much a
+/// property of the install as its architecture is.
+///
+/// Written here rather than in `manifest.rs` so that the shape of an install
+/// and the shape of the manifest meet in exactly one function; the drift test
+/// in `manifest.rs` calls this one rather than spelling the names out again.
+pub fn key(target: &str, how: How) -> String {
+    match how {
+        How::Replace => target.to_string(),
+        How::Package(package) => format!("{target}.{}", package.suffix()),
+    }
 }
 
 /// Whether this build is capable of updating at all.
@@ -120,11 +149,11 @@ pub fn due(wanted: bool, by_hand: bool) -> bool {
 /// Ask, and work out what it means for this install. Blocking; call it on the
 /// background executor.
 pub fn look() -> Result<Found> {
-    let key = KEY.context("this build has no update key and cannot verify a release")?;
+    let trusted = KEY.context("this build has no update key and cannot verify a release")?;
 
     let json = net::fetch_small(MANIFEST_URL)?;
     let signature = net::fetch_small(&format!("{MANIFEST_URL}.minisig"))?;
-    let manifest = Manifest::verify(json.as_bytes(), &signature, key)?;
+    let manifest = Manifest::verify(json.as_bytes(), &signature, trusted)?;
 
     remember_check();
 
@@ -133,31 +162,47 @@ pub fn look() -> Result<Found> {
     }
     let version = manifest.version;
 
-    // A release that skipped this platform is not an error and not worth
-    // mentioning — there is genuinely nothing on offer.
-    let Some(artifact) = manifest.artifact_for(TARGET) else {
-        return Ok(Found::Nothing);
-    };
-
     let Some(install) = Install::detect() else {
         return Ok(Found::Tell { version, why: "this install cannot be located".into() });
     };
 
-    Ok(match eligible::verdict(&install) {
-        Verdict::Install(target) => Found::Ready { version, artifact: artifact.clone(), target },
-        Verdict::Tell(why) => Found::Tell { version, why },
-    })
+    // The verdict first, because *which* artifact is on offer depends on it:
+    // a `.deb` install is offered the `.deb` and not the tarball, and the two
+    // sit under different keys for the same triple. See [`key`].
+    let plan = match eligible::verdict(&install) {
+        Verdict::Go(plan) => plan,
+        Verdict::Tell(why) => return Ok(Found::Tell { version, why }),
+    };
+
+    match manifest.artifact_for(&key(TARGET, plan.how)) {
+        Some(artifact) => Ok(Found::Ready { version, artifact: artifact.clone(), plan }),
+
+        // A release that skipped this platform is not an error and not worth
+        // mentioning — there is genuinely nothing on offer. The one case that
+        // *is* worth a sentence is a packaged install and a release with no
+        // package in it: this install could have been updated and the release
+        // is why it was not, which is not something to be silent about.
+        None => Ok(match plan.how {
+            How::Replace => Found::Nothing,
+            How::Package(package) => Found::Tell {
+                version,
+                why: format!(
+                    "this release has no .{package} — update it through your package manager"
+                ),
+            },
+        }),
+    }
 }
 
-/// Download and unpack it beside the app. Blocking; call it on the background
-/// executor.
+/// Download and check it, ready to be installed. Blocking; call it on the
+/// background executor.
 pub fn stage(
     artifact: &Artifact,
     version: Version,
-    target: &std::path::Path,
+    plan: &Plan,
     progress: impl FnMut(u64),
 ) -> Result<install::Staged> {
-    install::stage(artifact, version, target, progress)
+    install::stage(artifact, version, plan, progress)
 }
 
 /// Clear up after the last update, if there was one.
@@ -241,6 +286,18 @@ mod tests {
         // silently match nothing in every manifest forever.
         assert!(TARGET.contains('-'), "{TARGET} is not a target triple");
         assert!(!TARGET.is_empty());
+    }
+
+    #[test]
+    fn a_package_install_looks_itself_up_under_its_own_key() {
+        // Three artifacts share this triple and only one of them is the right
+        // download. Handing a `.deb` install the tarball would put a binary
+        // nowhere useful; handing a tarball install the `.deb` would ask for a
+        // password it has no business asking for.
+        use package::Package;
+        assert_eq!(key(TARGET, How::Replace), TARGET);
+        assert_eq!(key(TARGET, How::Package(Package::Deb)), format!("{TARGET}.deb"));
+        assert_eq!(key(TARGET, How::Package(Package::Rpm)), format!("{TARGET}.rpm"));
     }
 
     #[test]

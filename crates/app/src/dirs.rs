@@ -165,13 +165,13 @@ pub fn boards() -> Option<PathBuf> {
 /// itself. Everything under here is rebuildable from a `.mbrd` that still
 /// exists, which is what the word cache is claiming.
 ///
-/// Allowed dead on the platforms that swap in `pipeline_off.rs`, where there is
-/// no media backend to lay a file out for — see that file's note. The three
-/// real ones all reach here through [`crate::spill`].
-#[cfg_attr(
-    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
-    allow(dead_code)
-)]
+/// The second caller is `update/install.rs`, which stages a `.deb` or `.rpm`
+/// here on its way to the package manager. Every other update is staged beside
+/// the app it replaces, because that swap ends in a `rename` and a `rename`
+/// cannot cross a filesystem — a package is not renamed anywhere, so it belongs
+/// in the discardable place instead. That caller is on every platform, which is
+/// why the `allow(dead_code)` this used to carry for the ones that swap in
+/// `pipeline_off.rs` is gone: there is nowhere left for it to be dead.
 pub fn cache() -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     let dir = from_env("XDG_CACHE_HOME").or_else(|| home(".cache"))?.join(APP);

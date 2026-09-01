@@ -306,10 +306,18 @@ jobs:
       # knew about this. Both set MBRD_PACKAGED, which is what stops the
       # in-app updater writing over a file dpkg or rpm believes it owns —
       # see crates/app/src/update/eligible.rs.
+      #
+      # The key is set here too, and it has to be: these binaries update
+      # themselves like any other, by fetching the next release's package and
+      # handing it to apt or dnf. A package built without the key would be a
+      # package that cannot verify a manifest and therefore never checks for
+      # one — the whole path dead, silently, in the one build shape it exists
+      # for. See crates/app/src/update/package.rs.
       - name: Package the deb and the rpm
         if: runner.os == 'Linux'
         env:
           MBRD_PACKAGED: "1"
+          MBRD_UPDATE_KEY: ${{ vars.MBRD_UPDATE_PUBLIC_KEY }}
         run: |
           # Both tools read `target/release`, not `target/<triple>/release`,
           # and the matrix builds into the latter. Rebuild rather than copy:
@@ -414,10 +422,11 @@ jobs:
 
       - name: Write the manifest
         run: |
-          # The updater is indexed by target triple, so the map is written by
-          # hand rather than derived: the triple a binary was *built* for is
-          # not recoverable from the name of the file it ended up in, and
-          # guessing it wrong would offer somebody another platform's build.
+          # The updater is indexed by target triple — and, for the two Linux
+          # packages, by triple plus format — so the map is written by hand
+          # rather than derived: the triple a binary was *built* for is not
+          # recoverable from the name of the file it ended up in, and guessing
+          # it wrong would offer somebody another platform's build.
           write() {
             local triple="$1" file="dist/$2"
             if [ ! -f "$file" ]; then
@@ -434,6 +443,13 @@ jobs:
             write x86_64-apple-darwin      "mbrd_${VERSION}_x64.app.tar.gz"
             write x86_64-pc-windows-msvc   "mbrd_${VERSION}_x64.exe"
             write x86_64-unknown-linux-gnu "mbrd_${VERSION}_x86_64-linux.tar.gz"
+            # The same triple twice more, with a suffix. A .deb install is
+            # offered the .deb and not the tarball — it would land in the
+            # wrong place and leave dpkg's record wrong — and these are the
+            # names it looks for. `update::key` builds them; a test in
+            # manifest.rs checks the two spellings against each other.
+            write x86_64-unknown-linux-gnu.deb "mbrd_${VERSION}_amd64.deb"
+            write x86_64-unknown-linux-gnu.rpm "mbrd-${VERSION}-1.x86_64.rpm"
           } > targets.txt
 
           BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${REF}"

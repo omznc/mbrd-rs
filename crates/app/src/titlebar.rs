@@ -413,14 +413,18 @@ const PROGRESS_TRACK: f32 = 34.0;
 /// What the bar says about an update.
 ///
 /// `None` only on a build with no updater in it — see `BoardView::update_badge`.
-/// Otherwise it is always drawn, and the four states are one chip walking a
-/// stepper rather than four different pieces of chrome: *resting* (the version
+/// Otherwise it is always drawn, and the five states are one chip walking a
+/// stepper rather than five different pieces of chrome: *resting* (the version
 /// you are running; press to check), *available* (press to download), the bar
-/// filling, and *ready* (press to save, install and restart).
+/// filling, *ready* (press to save, install and restart), and — on a `.deb` or
+/// `.rpm` install, where the last step belongs to a package manager —
+/// *installing*.
 ///
 /// **Loudness is earned.** Resting has no border and no fill. The middle two
 /// have a wash and an edge. Only Ready fills, and it is also the only one
 /// whose words are a verb — which is the whole of why it is allowed to.
+/// Installing goes quiet again: the verb has been pressed, and what is being
+/// waited on is a password box belonging to something else on the screen.
 ///
 /// The dot and the progress track occupy the same slot, so the chip's width
 /// barely moves as it walks; a badge that jumped the window title sideways
@@ -533,6 +537,20 @@ fn update_badge(view: &BoardView, cx: &mut Context<BoardView>) -> Option<gpui::A
             ))
             .child(icon(Icon::Restart, crate::icons::ICON_SM, theme.ground))
             .child("Restart to update")
+            .into_any_element(),
+
+        // Quiet, and nothing to press: the click still lands on the stepper,
+        // where it only describes what is already happening. The dot stays
+        // accent because something *is* in flight — it is simply not ours.
+        UpdateBadge::Installing { version } => pill
+            .text_color(theme.muted)
+            .tooltip(tip(
+                theme,
+                format!("installing mbrd {version}"),
+                "answer the permission prompt",
+            ))
+            .child(dot(theme.accent))
+            .child("Installing…")
             .into_any_element(),
     })
 }

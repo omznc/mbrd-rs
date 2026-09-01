@@ -1000,32 +1000,47 @@ enum Updating {
     Idle,
     /// Asking.
     Looking,
-    /// A newer version exists and this install may replace itself with it.
+    /// A newer version exists and this install can become it. The plan says
+    /// how — a swap, or a package for the tool that owns this one.
     Offered {
         version: update::version::Version,
         artifact: update::manifest::Artifact,
-        target: PathBuf,
+        plan: update::eligible::Plan,
     },
     /// Downloading it. `done` and `total` are bytes.
     Fetching { version: update::version::Version, done: u64, total: u64 },
-    /// Downloaded, hashed, unpacked, and sitting beside the app.
+    /// Downloaded, hashed, and ready — beside the app, or in the cache waiting
+    /// for a package manager.
     Staged(update::install::Staged),
+    /// Being installed by something that is not us, which is the `.deb` and
+    /// `.rpm` path and only that path: `pkexec` is on screen asking for a
+    /// password, and it may be there for a while.
+    ///
+    /// Its own state because it is the one step that is neither instant nor
+    /// cancellable, and because a second press during it must not start a
+    /// second one.
+    Installing { version: update::version::Version },
 }
 
 /// What the title bar should say about the update, if anything.
 ///
 /// A projection of [`Updating`] rather than the thing itself, so the bar can
 /// read the state without the state machine leaking out of this module: the
-/// bar needs four sentences and a fraction, not artifacts and paths.
+/// bar needs five sentences and a fraction, not artifacts and paths.
 ///
-/// **The four are one control at four stages, not four things.** They keep the
+/// **They are one control at five stages, not five things.** They keep the
 /// same place, near enough the same width, and the same press; what changes is
 /// how loudly they are drawn, and the loudness is earned — nothing waiting is
-/// a version in muted with no border, and only the last one, which has a
-/// finished download behind it and a verb to offer, is allowed to fill.
+/// a version in muted with no border, and only [`Ready`], which has a finished
+/// download behind it and a verb to offer, is allowed to fill. [`Installing`]
+/// goes quiet again, because by then the press has been made and what is being
+/// waited on belongs to something else on the screen.
 ///
 /// `None` means this build has no updater at all — see [`update::possible`] —
 /// which is the one case where there is nothing to say and nothing to press.
+///
+/// [`Ready`]: UpdateBadge::Ready
+/// [`Installing`]: UpdateBadge::Installing
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpdateBadge {
     /// Nothing waiting. `version` is the one running; clicking checks now.
@@ -1042,6 +1057,9 @@ pub enum UpdateBadge {
     Downloading { fraction: f32 },
     /// Unpacked and waiting; clicking saves the board and restarts into it.
     Ready { version: String },
+    /// Being installed by the system's package manager, which is the only
+    /// step this app cannot get on with by itself. See `update/package.rs`.
+    Installing { version: String },
 }
 
 /// A drop that is still arriving.
@@ -2048,6 +2066,9 @@ impl BoardView {
             Updating::Staged(staged) => {
                 Some(UpdateBadge::Ready { version: staged.version.to_string() })
             }
+            Updating::Installing { version } => {
+                Some(UpdateBadge::Installing { version: version.to_string() })
+            }
         }
     }
 
@@ -2065,9 +2086,13 @@ impl BoardView {
                 self.updating = Updating::Fetching { version, done, total };
                 self.tell(format!("downloading {version} — {}", portion(done, total)));
             }
+            Updating::Installing { version } => {
+                self.updating = Updating::Installing { version };
+                self.tell(format!("installing {version} — answer the permission prompt"));
+            }
 
-            Updating::Offered { version, artifact, target } => {
-                self.fetch_update(version, artifact, target, cx)
+            Updating::Offered { version, artifact, plan } => {
+                self.fetch_update(version, artifact, plan, cx)
             }
             Updating::Staged(staged) => self.apply_update(staged, cx),
         }
@@ -2128,16 +2153,17 @@ impl BoardView {
             }
             // Worth saying whether or not anybody asked — this is the good
             // news the check exists for.
-            Ok(update::Found::Ready { version, artifact, target }) => {
+            Ok(update::Found::Ready { version, artifact, plan }) => {
                 // The badge in the top bar is the durable half of this
                 // announcement — see `update_badge` — so the line here only
                 // has to break the news, not carry the instructions.
                 self.tell(format!("mbrd {version} is out — see the top bar"));
-                self.updating = Updating::Offered { version, artifact, target };
+                self.updating = Updating::Offered { version, artifact, plan };
             }
             // Also worth saying unasked, and it is the end of the road: this
-            // install cannot replace itself, so the sentence has to carry the
-            // next step with it. See `update/eligible.rs`.
+            // install can neither replace itself nor be handed a package, so
+            // the sentence has to carry the next step with it. See
+            // `update/eligible.rs`.
             Ok(update::Found::Tell { version, why }) => {
                 self.tell(format!("mbrd {version} is out — {why}"));
             }
@@ -2152,12 +2178,13 @@ impl BoardView {
         }
     }
 
-    /// Download it, hash it, and unpack it beside the app.
+    /// Download it, hash it, and get it ready — beside the app, or in the
+    /// cache if what is coming down is a package.
     fn fetch_update(
         &mut self,
         version: update::version::Version,
         artifact: update::manifest::Artifact,
-        target: PathBuf,
+        plan: update::eligible::Plan,
         cx: &mut Context<Self>,
     ) {
         let total = artifact.size;
@@ -2169,7 +2196,7 @@ impl BoardView {
         // view is only ever written from its own thread.
         let (progress, updates) = std::sync::mpsc::channel::<u64>();
         let staging = cx.background_executor().spawn(async move {
-            update::stage(&artifact, version, &target, |done| {
+            update::stage(&artifact, version, &plan, |done| {
                 let _ = progress.send(done);
             })
         });
@@ -2231,8 +2258,17 @@ impl BoardView {
         match staged {
             Ok(staged) => {
                 let version = staged.version;
+                // The `.deb` and `.rpm` path ends in a password prompt, and
+                // this is where that is said — before it happens, so the box
+                // arrives as the answer to something rather than out of
+                // nowhere. See `update/package.rs`.
+                let asks = staged.asks_for_permission();
                 self.updating = Updating::Staged(staged);
-                self.tell(format!("mbrd {version} is ready — restart from the top bar to install"));
+                self.tell(if asks {
+                    format!("mbrd {version} is ready — installing it will ask for your password")
+                } else {
+                    format!("mbrd {version} is ready — restart from the top bar to install")
+                });
             }
             Err(err) => {
                 self.updating = Updating::Idle;
@@ -2241,7 +2277,7 @@ impl BoardView {
         }
     }
 
-    /// Move it into place and restart into it.
+    /// Put it where it belongs and restart into it.
     fn apply_update(&mut self, staged: update::install::Staged, cx: &mut Context<Self>) {
         // The board goes to disk before the restart discards what is in
         // memory — the same write the close button does, for the same reason.
@@ -2255,6 +2291,14 @@ impl BoardView {
             self.updating = Updating::Staged(staged);
             self.warn("could not save the board — the update is still ready, try again".into());
             return;
+        }
+
+        // The one step that is somebody else's to take, and the one that is
+        // not instant. It gets its own path rather than a branch inside this
+        // one, because everything after it has to happen on a different
+        // thread — see below.
+        if staged.asks_for_permission() {
+            return self.hand_to_package_manager(staged, cx);
         }
 
         let version = staged.version;
@@ -2274,6 +2318,53 @@ impl BoardView {
                 self.warn(format!("could not install the update: {err:#}"));
             }
         }
+    }
+
+    /// Give the package to `dpkg` or `rpm`, and restart if they take it.
+    ///
+    /// On the background executor, unlike every other apply, because this one
+    /// blocks for as long as somebody takes to notice a password prompt and
+    /// type into it. Doing it on the thread that draws would freeze the window
+    /// behind the very box it is asking about — and if the box is dismissed,
+    /// freeze it for nothing.
+    ///
+    /// The `Staged` goes out to that thread and comes back, rather than being
+    /// consumed: a dismissed prompt is the likeliest failure here and it is not
+    /// a failure of the download, so the download stays staged and the badge
+    /// goes back to offering it. See `Staged::hand_over`.
+    fn hand_to_package_manager(&mut self, staged: update::install::Staged, cx: &mut Context<Self>) {
+        let version = staged.version;
+        let target = staged.target().to_path_buf();
+        self.updating = Updating::Installing { version };
+        self.tell(format!("installing mbrd {version} — answer the permission prompt"));
+
+        let installing = cx.background_executor().spawn(async move {
+            let outcome = staged.hand_over();
+            (staged, outcome)
+        });
+
+        cx.spawn(async move |view, cx| {
+            let (staged, outcome) = installing.await;
+            view.update(cx, |view, cx| {
+                match outcome {
+                    Ok(()) => {
+                        // The package manager has put the new binary at the
+                        // same path this one is running from, so the restart
+                        // path is the target exactly as it is for a swap.
+                        cx.set_restart_path(target);
+                        view.tell(format!("installed mbrd {version} — restarting"));
+                        cx.restart();
+                    }
+                    Err(err) => {
+                        view.updating = Updating::Staged(staged);
+                        view.warn(format!("could not install the update: {err:#}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Bring the marks beside each card a frame nearer where they belong.

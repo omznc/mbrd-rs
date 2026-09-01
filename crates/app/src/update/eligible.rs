@@ -1,23 +1,33 @@
-//! Whether this copy of the app is allowed to replace itself.
+//! Whether this copy of the app can become the next version, and how.
 //!
-//! Most installs are not. A `.deb` puts the binary at `/usr/bin/mbrd` and
-//! `dpkg` owns it from then on; a Flatpak runs from a read-only mount; a
-//! `cargo build` in a checkout is somebody's working tree. Writing over any of
-//! those is between rude and destructive, and the package manager that finds a
-//! file it did not put there will say so at the worst possible moment.
+//! Most installs cannot do it the obvious way. A `.deb` puts the binary at
+//! `/usr/bin/mbrd` and `dpkg` owns it from then on; a Flatpak runs from a
+//! read-only mount; a `cargo build` in a checkout is somebody's working tree.
+//! Writing over any of those is between rude and destructive, and the package
+//! manager that finds a file it did not put there will say so at the worst
+//! possible moment.
 //!
 //! So the question is asked before anything is downloaded, and the answer is a
-//! [`Verdict`] rather than a `bool`, because **a refusal still has something to
-//! say**. "0.3.0 is out, run `dnf upgrade mbrd`" is more useful than silence
-//! and more honest than an install button that fails. This is also where the
-//! notify-only behaviour lives, which means it is a path with real users rather
-//! than a fallback nobody exercises.
+//! [`Verdict`] rather than a `bool`, because it has three shapes rather than
+//! two:
+//!
+//! - **replace it** — a portable binary, an AppImage, a `.app`, an installed
+//!   `.exe`. The app owns the file and swaps it. See `install.rs`.
+//! - **hand it over** — a `.deb` or `.rpm`, where the new version is the
+//!   *package* and the tool that owns the file installs it. See `package.rs`.
+//! - **say something** — everything else. **A refusal still has something to
+//!   say**: "0.3.0 is out, update it through Flatpak" is more useful than
+//!   silence and more honest than an install button that fails. This is also
+//!   where the notify-only behaviour lives, which means it is a path with real
+//!   users rather than a fallback nobody exercises.
 //!
 //! Everything here is pure — it is handed the facts rather than going to look
 //! for them — which is what makes the table of cases testable on one machine.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+
+use super::package::{self, Package};
 
 /// What the app is running as, gathered once by [`Install::detect`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +37,12 @@ pub struct Install {
     pub target: PathBuf,
     /// Whether a distribution's package manager put it there.
     pub packaged: bool,
+    /// Which package format owns it, where that is knowable and where the
+    /// package we publish would replace this exact file. See
+    /// [`Package::owning`].
+    pub package: Option<Package>,
+    /// Whether there is a way to ask for the permission to install one.
+    pub escalation: bool,
     /// Whether it is running inside a sandbox with its own update channel.
     pub sandboxed: Option<&'static str>,
     /// Whether the target can actually be written to.
@@ -35,11 +51,29 @@ pub struct Install {
     pub development: bool,
 }
 
+/// What would be done, and to what.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    /// The file this install *is*, which is what gets replaced or what the
+    /// package puts back — and either way what the restart reopens.
+    pub target: PathBuf,
+    pub how: How,
+}
+
+/// The two ways an install can become a newer one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum How {
+    /// Move the new version over the old one ourselves.
+    Replace,
+    /// Give the package to the tool that owns the old one.
+    Package(Package),
+}
+
 /// Whether an update can be installed, and if not, what to say instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
-    /// Go ahead. Carries what would be replaced.
-    Install(PathBuf),
+    /// Go ahead, this way.
+    Go(Plan),
     /// Say a new version exists, and say this about getting it.
     Tell(String),
 }
@@ -47,7 +81,10 @@ pub enum Verdict {
 impl fmt::Display for Verdict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Install(_) => write!(f, "ready to install"),
+            Self::Go(plan) => match plan.how {
+                How::Replace => write!(f, "ready to install"),
+                How::Package(package) => write!(f, "ready to install {}", package.label()),
+            },
             Self::Tell(why) => write!(f, "{why}"),
         }
     }
@@ -63,22 +100,37 @@ pub fn verdict(install: &Install) -> Verdict {
         return Verdict::Tell(format!("update it through {sandbox}"));
     }
 
-    if install.packaged {
-        return Verdict::Tell("update it through your package manager".into());
-    }
-
     if install.development {
         // Not a safety rule so much as a sanity one. A development build
         // replacing itself with a release would delete somebody's build
-        // directory out from under a compiler.
+        // directory out from under a compiler — and a development build
+        // asking for a password to install a package over itself is worse.
         return Verdict::Tell("this is a development build".into());
+    }
+
+    // Before the packaged refusal below, because this is the case where the
+    // package manager can be *used* rather than merely deferred to.
+    if let Some(package) = install.package {
+        if install.escalation {
+            return Verdict::Go(Plan {
+                target: install.target.clone(),
+                how: How::Package(package),
+            });
+        }
+        // Nothing to ask for the permission with. The old sentence is still
+        // the right one, and it is better said now than after a download.
+        return Verdict::Tell("update it through your package manager".into());
+    }
+
+    if install.packaged {
+        return Verdict::Tell("update it through your package manager".into());
     }
 
     if !install.writable {
         return Verdict::Tell(format!("{} is not writable by this user", install.target.display()));
     }
 
-    Verdict::Install(install.target.clone())
+    Verdict::Go(Plan { target: install.target.clone(), how: How::Replace })
 }
 
 impl Install {
@@ -96,9 +148,18 @@ impl Install {
             None => bundle_of(&exe).unwrap_or(exe),
         };
 
+        let packaged = packaged(&target);
+        // Only asked of an install a distribution owns, and only then. On
+        // every other install — which is most of them, and all of Windows and
+        // macOS — this costs nothing, because the question above has already
+        // said no.
+        let package = packaged.then(|| Package::owning(&target)).flatten();
+
         Some(Self {
             writable: writable(&target),
-            packaged: packaged(&target),
+            packaged,
+            escalation: package.is_some() && package::can_escalate(),
+            package,
             sandboxed: sandboxed(),
             development: cfg!(debug_assertions),
             target,
@@ -133,6 +194,10 @@ fn bundle_of(exe: &Path) -> Option<PathBuf> {
 /// builds remembered; the prefix check catches anything installed into a
 /// system location by other means, including a `make install` and a
 /// distribution that packaged this without asking.
+///
+/// This says *that* something owns it, not *what* — the marker cannot say
+/// which, because one build becomes both packages. See [`Package::owning`],
+/// which answers the second question at runtime.
 fn packaged(target: &Path) -> bool {
     if option_env!("MBRD_PACKAGED").is_some() {
         return true;
@@ -176,9 +241,23 @@ mod tests {
         Install {
             target: PathBuf::from("/home/somebody/Apps/mbrd"),
             packaged: false,
+            package: None,
+            escalation: false,
             sandboxed: None,
             writable: true,
             development: false,
+        }
+    }
+
+    /// The shape of a `.deb` install on a machine with polkit.
+    fn from_a_package(package: Package) -> Install {
+        Install {
+            target: PathBuf::from("/usr/bin/mbrd"),
+            packaged: true,
+            package: Some(package),
+            escalation: true,
+            writable: false,
+            ..install()
         }
     }
 
@@ -186,7 +265,37 @@ mod tests {
     fn an_ordinary_install_may_replace_itself() {
         assert_eq!(
             verdict(&install()),
-            Verdict::Install(PathBuf::from("/home/somebody/Apps/mbrd"))
+            Verdict::Go(Plan {
+                target: PathBuf::from("/home/somebody/Apps/mbrd"),
+                how: How::Replace
+            })
+        );
+    }
+
+    #[test]
+    fn a_packaged_install_is_offered_its_own_package() {
+        // The whole point of `package.rs`: `/usr/bin/mbrd` is not writable and
+        // never will be, and the update for it is not a swap.
+        for package in [Package::Deb, Package::Rpm] {
+            assert_eq!(
+                verdict(&from_a_package(package)),
+                Verdict::Go(Plan {
+                    target: PathBuf::from("/usr/bin/mbrd"),
+                    how: How::Package(package)
+                }),
+                "a {package} install should be offered a {package}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_packaged_install_with_no_way_to_ask_is_told_instead() {
+        // No polkit, so there is no way to install a package without a
+        // terminal. Said before the download rather than after it.
+        let no_polkit = Install { escalation: false, ..from_a_package(Package::Deb) };
+        assert_eq!(
+            verdict(&no_polkit),
+            Verdict::Tell("update it through your package manager".into())
         );
     }
 
@@ -200,10 +309,11 @@ mod tests {
             Install { sandboxed: Some("Flatpak"), ..install() },
             Install { writable: false, ..install() },
             Install { development: true, ..install() },
+            Install { escalation: false, ..from_a_package(Package::Rpm) },
         ];
         for case in cases {
             match verdict(&case) {
-                Verdict::Install(_) => panic!("{case:?} should not have been installable"),
+                Verdict::Go(plan) => panic!("{case:?} should not have been installable: {plan:?}"),
                 Verdict::Tell(why) => {
                     assert!(!why.trim().is_empty(), "{case:?} refused without saying why");
                 }
@@ -221,8 +331,18 @@ mod tests {
     }
 
     #[test]
+    fn a_development_build_is_never_given_a_package_to_install() {
+        // A checkout that somehow looks packaged — a debug build run out of
+        // `/opt`, a container — must not reach the password prompt. The
+        // development case is the one with the useful sentence anyway.
+        let building = Install { development: true, ..from_a_package(Package::Deb) };
+        assert_eq!(verdict(&building), Verdict::Tell("this is a development build".into()));
+    }
+
+    #[test]
     fn a_package_manager_is_named_before_a_permission_problem() {
-        // `/usr/bin` is both, and "run dnf upgrade" is the useful half.
+        // `/usr/bin` is both, and the useful half is the package manager —
+        // whether that means using it or being sent to it.
         let system = Install { packaged: true, writable: false, ..install() };
         assert_eq!(
             verdict(&system),

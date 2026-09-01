@@ -1742,6 +1742,7 @@ fn update_row(view: &BoardView, cx: &mut Context<BoardView>) -> Spec {
         Some(UpdateBadge::Available { .. }) => "Download",
         Some(UpdateBadge::Downloading { .. }) => "Downloading…",
         Some(UpdateBadge::Ready { .. }) => "Restart to update",
+        Some(UpdateBadge::Installing { .. }) => "Installing…",
     };
     let about: SharedString = if live {
         format!("You have mbrd {}.", crate::update::version::Version::current()).into()

@@ -155,18 +155,65 @@ knowing when cutting a release:
   UI — which makes publishing the moment the update goes out, not tagging.
 - One signature over the whole manifest; a SHA-256 per artifact inside it. The
   signature is checked before the JSON is parsed.
-- The manifest is indexed by target triple, and the triples in the workflow have
-  to match the ones the binaries report. A test in `manifest.rs` parses a
-  verbatim copy of the workflow's output for exactly this reason: the two are
-  connected by nothing but a `printf`, and if they drift the symptom is that
-  nobody is ever offered anything.
-- It refuses to replace a `.deb`/`.rpm` install, anything under `/usr`, a
-  Flatpak or Snap, or a target it cannot write. Those cases are not silent — the
-  app still says a new version exists and says where to get it.
+- The manifest is indexed by target triple — and by triple plus format for the
+  two Linux packages, so `x86_64-unknown-linux-gnu` has a `.deb` and a `.rpm`
+  key beside it — and the keys in the workflow have to match the ones the
+  binaries build for themselves. A
+  test in `manifest.rs` parses a verbatim copy of the workflow's output for
+  exactly this reason: the two are connected by nothing but a `printf`, and if
+  they drift the symptom is that nobody is ever offered anything.
+- A `.deb` or `.rpm` install is **updated, not refused** — see below.
+- It still refuses anything under `/usr` that no package of ours owns, a
+  Flatpak or Snap, a target it cannot write, and a packaged install on a machine
+  with no `pkexec` to ask with. Those cases are not silent — the app still says
+  a new version exists and says where to get it.
 
 To test an update end to end without publishing: install the previous release,
 then point the app at a manifest you control. There is no substitute for doing
 this on each platform before the first release that carries the updater.
+
+### How a `.deb` or `.rpm` updates itself
+
+`crates/app/src/update/package.rs`. This one is worth writing down because it is
+the only install shape where the app does *not* put the new version in place
+itself, and the reason is not squeamishness: `dpkg` records a hash for
+`/usr/bin/mbrd`, and a `rename` over that file leaves the package database
+describing something that is no longer there. It would work once and be wrong
+for ever after. So the update for those installs is the package, downloaded
+through the same signed manifest and verified against the same SHA-256 as
+everything else, and then handed to the tool that owns the file.
+
+Three questions, answered in this order:
+
+- **Which package is this?** One build becomes both, so `MBRD_PACKAGED` cannot
+  say. The runtime signals are `/var/lib/dpkg/info/mbrd.list` first — which is
+  exactly this package — then an rpm database, then dpkg's status file. No
+  subprocess: `dpkg -S` walks every file list on the machine and this question
+  is asked during launch. Only for a target that *is* `/usr/bin/mbrd`, which is
+  where both of our packages put the binary; anywhere else, installing the
+  package would update a file the running app is not, and the restart would come
+  back up on the old one having reported success.
+- **How to ask for the permission?** `pkexec`, or the path is off and the old
+  "update it through your package manager" sentence comes back — before the
+  download rather than after it. Not `sudo`, which wants a terminal the app does
+  not have, and certainly not a password box of our own.
+- **What to run?** `apt-get install -y <file>` or `dnf install -y <file>`, with
+  `dpkg -i`, `zypper` and `rpm -U` behind them. The dependency-resolving tool
+  first: a release that needs a library the last one did not is precisely what
+  `dpkg -i` installs broken and `rpm -U` refuses outright.
+
+The download is staged in the *cache* directory rather than beside the target —
+nothing is renamed on this path, and `/usr/bin` is not ours to write in — and a
+dismissed password prompt keeps it, so pressing the button again costs nothing.
+The install runs on the background executor, because it blocks for as long as
+somebody takes to answer a prompt.
+
+This is also why the packaging step sets `MBRD_UPDATE_KEY` as well as
+`MBRD_PACKAGED`: a build with no key never asks for a manifest at all, so
+without it the whole path would be dead in the one build shape it exists for.
+**Packages published before this existed carry no key**, so nobody already on
+one can be offered the version that fixes it — that is a one-time reinstall by
+hand, and worth a line in the release notes when it ships.
 
 ## Why Windows has to be built on Windows
 
@@ -317,7 +364,7 @@ On **Linux** nobody asks.
 | question | answer |
 | --- | --- |
 | OS vendor code signing | **No.** Unsigned stays unsigned. Trust for updates comes from our own key, not Apple's or Microsoft's. |
-| How far the updater goes | **Full self-replacement.** Check, download, verify, swap, relaunch. |
+| How far the updater goes | **Full self-replacement.** Check, download, verify, swap, relaunch — and on a `.deb` or `.rpm`, hand the package to its own package manager instead of swapping. |
 | Linux artifacts | **AppImage, `.deb`, `.rpm`**, alongside the tarball. |
 | Windows artifacts | **Portable `.exe`** plus an NSIS per-user installer. |
 

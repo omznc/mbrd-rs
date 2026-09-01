@@ -28,7 +28,9 @@ Either way SmartScreen calls it an unrecognised app the first time:
   `chmod +x` it and run it. This is the one to take if you are not sure.
 - `.deb` / `.rpm` — installs to `/usr/bin` with a launcher entry, an icon and
   `.mbrd` files associated. Your package manager owns it afterwards, and mbrd
-  will tell you to update through that rather than replacing itself.
+  updates it the way that package manager would: it downloads the next
+  release's package and asks for permission to install it, so nothing goes
+  behind `dpkg`'s or `rpm`'s back.
 - `.tar.gz` — the bare binary, for putting somewhere yourself.
 
 The bare binary and the packages are built against glibc 2.35, so anything from
@@ -73,9 +75,20 @@ Releases are signed with mbrd's own key and the app verifies that signature
 before it writes anything. Nothing here is signed with an Apple or Microsoft
 certificate, which is what both operating-system warnings above are about.
 
-Where mbrd cannot replace itself — a `.deb` or `.rpm` your package manager owns,
-a Flatpak, anything in `/usr` — it says a new version exists and leaves the
-installing to whatever put it there.
+If you installed the `.deb` or the `.rpm`, the last step is a permission prompt
+rather than a restart: the new version is the *package*, and `apt` or `dnf`
+installs it so that what is on disk and what your package manager thinks is
+installed go on agreeing. mbrd says so before the prompt appears. Nothing else
+about it differs — the same signed manifest, the same checked download.
+
+One catch, once. The early packages shipped without the key the updater checks
+signatures against, so they never look for a new version at all. If mbrd has
+never offered you one on a `.deb` or `.rpm` install, that is why: install the
+current package by hand, and it will keep itself up to date from then on.
+
+Where mbrd can do neither — a Flatpak, a Snap, a copy somewhere in `/usr` that
+no package owns, a machine with no `pkexec` to ask with — it says a new version
+exists and leaves the installing to whatever put it there.
 
 To turn the check off entirely, either set `"update": false` in mbrd's
 `settings.json` or set `MBRD_NO_UPDATE=1` in the environment. Off means no

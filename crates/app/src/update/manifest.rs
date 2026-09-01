@@ -152,11 +152,18 @@ impl Manifest {
 
     /// What this build should download, if the manifest has anything for it.
     ///
+    /// The key is a target triple, optionally with a package suffix —
+    /// `x86_64-unknown-linux-gnu` is the tarball and
+    /// `x86_64-unknown-linux-gnu.deb` is the same release for the install
+    /// `dpkg` owns. `super::key` is what builds it, and the release workflow
+    /// writes the same names by hand.
+    ///
     /// `None` is ordinary rather than an error: a release that skipped a
-    /// platform, or a build for a target nothing is published for, both land
-    /// here and both mean "nothing to offer" rather than "something is wrong".
-    pub fn artifact_for(&self, target: &str) -> Option<&Artifact> {
-        self.targets.get(target)
+    /// platform, a build for a target nothing is published for, and a package
+    /// install asking a release older than this arrangement all land here, and
+    /// all mean "nothing to offer" rather than "something is wrong".
+    pub fn artifact_for(&self, key: &str) -> Option<&Artifact> {
+        self.targets.get(key)
     }
 
     /// Whether this is worth telling somebody about.
@@ -172,6 +179,8 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::update::eligible::How;
+    use crate::update::package::Package;
 
     /// A manifest that is fine, so each test can spoil exactly one thing.
     fn good() -> Value {
@@ -326,7 +335,9 @@ mod tests {
     "aarch64-apple-darwin": { "url": "https://github.com/omznc/mbrd-rs/releases/download/v0.3.0/mbrd_0.3.0_aarch64.app.tar.gz", "size": 100000, "sha256": "449ecdf39351d0bc0763e8db86eaad22aaed6e2a154df9a6c79b16abc6db0e98" },
     "x86_64-apple-darwin": { "url": "https://github.com/omznc/mbrd-rs/releases/download/v0.3.0/mbrd_0.3.0_x64.app.tar.gz", "size": 100000, "sha256": "7bb8d863736722256cb93d4017f525b58b66ea002093d8a0297253512c80f086" },
     "x86_64-pc-windows-msvc": { "url": "https://github.com/omznc/mbrd-rs/releases/download/v0.3.0/mbrd_0.3.0_x64.exe", "size": 100000, "sha256": "0faeecbacd022dd92fa8b6acc1677adb4b3f7bbd068c5712bf2989ba68f0c62f" },
-    "x86_64-unknown-linux-gnu": { "url": "https://github.com/omznc/mbrd-rs/releases/download/v0.3.0/mbrd_0.3.0_x86_64-linux.tar.gz", "size": 100000, "sha256": "ac55424209c66e2cf9ba1b7ada7a01ba2243d1e19908101f2808530665f9f130" }
+    "x86_64-unknown-linux-gnu": { "url": "https://github.com/omznc/mbrd-rs/releases/download/v0.3.0/mbrd_0.3.0_x86_64-linux.tar.gz", "size": 100000, "sha256": "ac55424209c66e2cf9ba1b7ada7a01ba2243d1e19908101f2808530665f9f130" },
+    "x86_64-unknown-linux-gnu.deb": { "url": "https://github.com/omznc/mbrd-rs/releases/download/v0.3.0/mbrd_0.3.0_amd64.deb", "size": 100000, "sha256": "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03" },
+    "x86_64-unknown-linux-gnu.rpm": { "url": "https://github.com/omznc/mbrd-rs/releases/download/v0.3.0/mbrd-0.3.0-1.x86_64.rpm", "size": 100000, "sha256": "1b16b1df538ba12dc3f97edbb85caa7050d46c148134290feba80f8236c83db9" }
   }
 }"#;
 
@@ -346,6 +357,22 @@ mod tests {
                 panic!("the workflow publishes {triple} and this cannot find it")
             });
             assert_eq!(artifact.size, 100_000);
+        }
+
+        // And the two package keys, which are built rather than written down —
+        // so this checks the *builder* against the workflow's spelling rather
+        // than one literal against another. A `.deb` install looking up a name
+        // the workflow does not publish is an install that is never offered
+        // anything, silently, for ever.
+        for package in [Package::Deb, Package::Rpm] {
+            let key = super::super::key("x86_64-unknown-linux-gnu", How::Package(package));
+            assert!(
+                manifest.artifact_for(&key).is_some(),
+                "the workflow publishes a {package} and this looks for {key}"
+            );
+            // The tarball is a different artifact for the same triple, and
+            // offering one to the other is the mistake the suffix prevents.
+            assert_ne!(key, "x86_64-unknown-linux-gnu");
         }
 
         // And this build's own triple is one of them, on the platforms the
