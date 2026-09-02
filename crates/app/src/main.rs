@@ -24,6 +24,7 @@
 mod anchor;
 mod board_view;
 mod camera;
+mod color;
 mod command;
 mod demo;
 mod dirs;
@@ -91,8 +92,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui::{
-    point, px, size, App, AppContext as _, Application, Bounds, Entity, Size, TitlebarOptions,
-    Window, WindowAppearance, WindowBounds, WindowDecorations, WindowOptions,
+    point, px, size, App, AppContext as _, Bounds, Entity, Size, TitlebarOptions, Window,
+    WindowAppearance, WindowBounds, WindowDecorations, WindowOptions,
 };
 use mbrd_core::Document;
 
@@ -179,7 +180,13 @@ fn main() {
     // The pictures, compiled in. Without this the default asset source
     // answers `None` to everything and every icon in the app draws as nothing
     // — silently, because a `Svg` that cannot load its file still lays out.
-    let app = Application::new().with_assets(icons::Icons);
+    //
+    // From `gpui_platform` rather than `gpui`, which is the one line where the
+    // framework being in two crates shows: `gpui` is the elements, the layout
+    // and the scene, and the crate this call comes from is the windowing, text
+    // and renderer backend for the host — Wayland or X11 here, Cocoa there,
+    // Win32 there. Choosing it is all this call does differently.
+    let app = gpui_platform::application().with_assets(icons::Icons);
 
     // A board double-clicked in the Finder arrives here rather than in `argv`:
     // macOS hands the path to a running application as an Apple Event, which

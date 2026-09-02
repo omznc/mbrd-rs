@@ -39,6 +39,7 @@ use gpui::{
 };
 
 use crate::board_view::BoardView;
+use crate::color::Tint;
 use crate::command::{Command, Entry};
 use crate::icons::{icon, Icon};
 

@@ -46,6 +46,7 @@ use gpui::{
 };
 
 use crate::board_view::BoardView;
+use crate::color::Tint;
 use crate::command::Command;
 use crate::editor::{self, Editor};
 use crate::icons::{icon, Icon, ICON_LG, ICON_MD, ICON_SM};
@@ -580,7 +581,7 @@ fn appearance(view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
                     // Its natural width, but it yields before it is cut
                     // off: the preview is the argument for the choice to
                     // its left, and half a preview makes it badly.
-                    .flex_shrink()
+                    .flex_shrink_1()
                     .w(px(PREVIEW_W))
                     .min_w(px(216.0))
                     .flex()
@@ -637,7 +638,7 @@ fn miniature(theme: Theme) -> AnyElement {
                     // The grid, in one layer, for the reason the board's own
                     // grid is: a field of dots does not overlap itself, so the
                     // bounds tree can be asked once instead of per dot.
-                    if theme.grid.a > 0.001 || true {
+                    if theme.grid.alpha > 0.001 || true {
                         // The board computes the grid's alpha from the zoom
                         // rather than reading the token's — see `Theme::grid`.
                         // At this size there is one honest answer, and it is

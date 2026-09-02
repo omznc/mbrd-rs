@@ -21,9 +21,11 @@
 
 use std::sync::Arc;
 
-use gpui::{point, px, rgb, rgba, BoxShadow, FontFeatures, Hsla};
+use gpui::{hsla, point, px, BoxShadow, FontFeatures, Hsla};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+
+use crate::color::{rgb, rgba, Tint};
 
 /// `Copy` because it is a bag of colours that every drawing path wants a
 /// private look at, and passing it by reference would tie the painter to the
@@ -31,30 +33,46 @@ use serde_json::{Map, Value};
 /// cannot hold.
 ///
 /// `Serialize` and `Deserialize` because this struct *is* the theme file
-/// format. `gpui::Hsla` already reads and writes itself as `"#rrggbbaa"`, so
-/// a field here is a key in a `.json` on somebody's disk without a line of
-/// conversion code in between — and, more to the point, without a second
-/// list of field names to keep in step with this one. See [`overlay`], which
-/// is the whole of the loader that this buys.
+/// format: a field here is a key in a `.json` on somebody's disk, without a
+/// second list of field names to keep in step with this one. See [`overlay`],
+/// which is the whole of the loader that this buys.
+///
+/// Every colour carries `#[serde(with = "crate::color::hex")]`, which is the
+/// one line of ceremony this arrangement costs. It used to be free, because
+/// gpui's own `Hsla` read and wrote itself as `"#rrggbbaa"`; the colour type
+/// is palette's now and palette writes an object of three numbers, which is
+/// the right answer for a colour library and the wrong one for a file a
+/// person types by hand and `THEMES.md` documents. A colour added below wants
+/// the attribute above it — `crate::color::hex` is where the format actually
+/// lives, and it is tested there.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Theme {
     /// Behind the canvas — the paper the board sits on.
+    #[serde(with = "crate::color::hex")]
     pub ground: Hsla,
     /// The dots of the grid.
+    #[serde(with = "crate::color::hex")]
     pub grid: Hsla,
     /// The world axes through the origin.
+    #[serde(with = "crate::color::hex")]
     pub axis: Hsla,
 
     /// The sidebar and any other furniture.
+    #[serde(with = "crate::color::hex")]
     pub chrome: Hsla,
+    #[serde(with = "crate::color::hex")]
     pub chrome_edge: Hsla,
 
     /// A card, and its outline.
+    #[serde(with = "crate::color::hex")]
     pub card: Hsla,
+    #[serde(with = "crate::color::hex")]
     pub card_edge: Hsla,
     /// A card that is selected.
+    #[serde(with = "crate::color::hex")]
     pub selected_edge: Hsla,
 
+    #[serde(with = "crate::color::hex")]
     pub text: Hsla,
     /// Labels, counts, the status bar, a placeholder, a tooltip's key —
     /// anything secondary that a person is still expected to *read*.
@@ -66,15 +84,18 @@ pub struct Theme {
     /// of each other in more than one place with nobody having asked for the
     /// weaker number. A solid colour is one a caller can dim on purpose and
     /// nothing dims it by accident.
+    #[serde(with = "crate::color::hex")]
     pub muted: Hsla,
     /// Decorative marks that are not read as words: the titlebar's chevron,
     /// the little icon beside a status-bar count. Quieter than [`Self::muted`]
     /// deliberately — those are marks that repeat what the text beside them
     /// already says, so they are allowed to sit under the contrast floor a
     /// sentence needs. Never put a word in this colour.
+    #[serde(with = "crate::color::hex")]
     pub tertiary: Hsla,
     /// The accent as a *fill* or an edge: a selected card's outline, the wash
     /// behind a chosen row, the lit segment of a control.
+    #[serde(with = "crate::color::hex")]
     pub accent: Hsla,
     /// The accent as a *word*.
     ///
@@ -86,15 +107,22 @@ pub struct Theme {
     /// `#b4553a` is 3.5:1 on its own chrome, which is fine for the border it
     /// was chosen for and was quietly failing in the six places that wrote in
     /// it. Same hue, same saturation, moved along lightness until it reads.
+    #[serde(with = "crate::color::hex")]
     pub accent_text: Hsla,
 
     /// Per-type card tints, so a board reads as a board at a glance rather than
     /// as a wall of identical grey rectangles.
+    #[serde(with = "crate::color::hex")]
     pub note: Hsla,
+    #[serde(with = "crate::color::hex")]
     pub image: Hsla,
+    #[serde(with = "crate::color::hex")]
     pub video: Hsla,
+    #[serde(with = "crate::color::hex")]
     pub audio: Hsla,
+    #[serde(with = "crate::color::hex")]
     pub link: Hsla,
+    #[serde(with = "crate::color::hex")]
     pub fence: Hsla,
 
     /// The note pad, `--note-1..4`. Muted, because a note is something to
@@ -106,11 +134,13 @@ pub struct Theme {
     /// theme: on paper the same four have to be four *pale* washes or every
     /// note on the board turns into a hole punched through it. See
     /// [`Theme::note_tint`].
+    #[serde(with = "crate::color::hex_pad")]
     pub notes: [Hsla; 4],
     /// What a swatch draws as when its `hex` is missing or is not a colour.
     ///
     /// Grey rather than the plain card, because a grey swatch is still a
     /// swatch and a card-coloured one looks like a card that failed to load.
+    #[serde(with = "crate::color::hex")]
     pub swatch_fallback: Hsla,
 
     /// A quote's bar and a rule's line, drawn on a card. Not [`Self::muted`],
@@ -120,11 +150,13 @@ pub struct Theme {
     /// on the note tints underneath this one — which is why this is checked
     /// against the pad's own background rather than borrowed from a field
     /// that was.
+    #[serde(with = "crate::color::hex")]
     pub quote: Hsla,
     /// A markdown link, drawn on a card. Not [`Self::accent`] — the accent is
     /// what a *selected* card wears, and a link that borrowed it read as a
     /// selection sitting on an unrelated note. Accent's hue family, so a link
     /// still reads as "the same idea, elsewhere" without claiming to be one.
+    #[serde(with = "crate::color::hex")]
     pub note_link: Hsla,
 
     /// A `diff`'s added and removed lines. Not [`Self::rope_leaf`] and
@@ -132,7 +164,9 @@ pub struct Theme {
     /// are named colours a *connection* may be given, and a theme file that
     /// recoloured a board's connectors should not also recolour what `+` and
     /// `-` mean in a patch.
+    #[serde(with = "crate::color::hex")]
     pub diff_add: Hsla,
+    #[serde(with = "crate::color::hex")]
     pub diff_remove: Hsla,
 
     /// The five colours a connection may be named.
@@ -141,13 +175,19 @@ pub struct Theme {
     /// connection is `"leaf"`, never a hex triple — and a name is the thing
     /// that survives a theme changing underneath it. See
     /// [`Theme::rope_for`], which is the only place the name meets a colour.
+    #[serde(with = "crate::color::hex")]
     pub rope_line: Hsla,
+    #[serde(with = "crate::color::hex")]
     pub rope_accent: Hsla,
+    #[serde(with = "crate::color::hex")]
     pub rope_warm: Hsla,
+    #[serde(with = "crate::color::hex")]
     pub rope_leaf: Hsla,
+    #[serde(with = "crate::color::hex")]
     pub rope_danger: Hsla,
     /// The marks that appear beside a card you are pointing at. Faint on
     /// purpose: an offer, not a control.
+    #[serde(with = "crate::color::hex")]
     pub anchor: Hsla,
     /// The rules that appear while a card is being dragged, saying what it has
     /// lined up with. See `core::guides`.
@@ -158,6 +198,7 @@ pub struct Theme {
     /// is warm and a saturated hue in the middle of it would read as another
     /// card. So it is the text colour, drawn as a hairline, which is only ever
     /// on screen while a hand is down.
+    #[serde(with = "crate::color::hex")]
     pub guide: Hsla,
 
     /// What a surface floating over the board casts, at full strength.
@@ -169,6 +210,7 @@ pub struct Theme {
     /// three sizes were tuned against; a paper theme turns it down, because a
     /// shadow strong enough to lift a panel off `#14150f` reads as dirt on
     /// `#f3f0e6`.
+    #[serde(with = "crate::color::hex")]
     pub shadow: Hsla,
 }
 
@@ -184,36 +226,36 @@ impl Theme {
     /// The warm dark palette the app has always drawn in.
     pub fn dark() -> Self {
         Self {
-            ground: rgb(0x14150f).into(),
-            grid: rgba(0xe8e2d000).into(),
-            axis: rgba(0xe8e2d022).into(),
+            ground: rgb(0x14150f),
+            grid: rgba(0xe8e2d000),
+            axis: rgba(0xe8e2d022),
 
-            chrome: rgb(0x1b1c15).into(),
-            chrome_edge: rgba(0xe8e2d016).into(),
+            chrome: rgb(0x1b1c15),
+            chrome_edge: rgba(0xe8e2d016),
 
-            card: rgb(0x26271e).into(),
-            card_edge: rgba(0xe8e2d01f).into(),
-            selected_edge: rgb(0xb4553a).into(),
+            card: rgb(0x26271e),
+            card_edge: rgba(0xe8e2d01f),
+            selected_edge: rgb(0xb4553a),
 
-            text: rgb(0xe8e2d0).into(),
+            text: rgb(0xe8e2d0),
             // ~7:1 on the chrome (#1b1c15) — comfortably past the 4.5:1 a
             // sentence needs, with room to spare for the tints a card wash
             // draws it over.
-            muted: rgb(0xa8a293).into(),
+            muted: rgb(0xa8a293),
             // ~4.6:1 on the chrome — past the floor, and no further: a mark
             // this quiet is only ever beside the words that already say what
             // it means.
-            tertiary: rgb(0x84806f).into(),
-            accent: rgb(0xb4553a).into(),
+            tertiary: rgb(0x84806f),
+            accent: rgb(0xb4553a),
             // ~4.5:1 on the chrome, where every word in it is drawn.
-            accent_text: rgb(0xc6694e).into(),
+            accent_text: rgb(0xc6694e),
 
-            note: rgb(0x4a422a).into(),
-            image: rgb(0x2c3a3d).into(),
-            video: rgb(0x3a2c3d).into(),
-            audio: rgb(0x2c3d33).into(),
-            link: rgb(0x33334a).into(),
-            fence: rgba(0xb4553a14).into(),
+            note: rgb(0x4a422a),
+            image: rgb(0x2c3a3d),
+            video: rgb(0x3a2c3d),
+            audio: rgb(0x2c3d33),
+            link: rgb(0x33334a),
+            fence: rgba(0xb4553a14),
 
             // ≥4.5:1 over every card colour and every tint off the pad, not
             // just over the chrome — a quote and a link are drawn on a card,
@@ -223,25 +265,25 @@ impl Theme {
             // of this file went and measured the claim: 4.2:1 and 3.3:1 over
             // the lightest note tint, which is the one background the note
             // above named and neither had been checked against.
-            quote: rgb(0xbeb9aa).into(),
-            note_link: rgb(0xe4ad99).into(),
+            quote: rgb(0xbeb9aa),
+            note_link: rgb(0xe4ad99),
 
-            diff_add: rgb(0x6f9455).into(),
+            diff_add: rgb(0x6f9455),
             // A shade brighter than `rope_danger`: read as a *line*, not
             // glanced at as a chip, and 3.75:1 on this ground was under the
             // 4.5:1 a sentence needs — see the contrast test at the bottom of
             // this file.
-            diff_remove: rgb(0xd66666).into(),
+            diff_remove: rgb(0xd66666),
 
             // Bright enough to read against the ground at a glance and dull
             // enough not to compete with the cards they join — a rope is how
             // two things relate, not a third thing on the board.
-            rope_line: rgba(0xe8e2d066).into(),
-            rope_accent: rgb(0xb4553a).into(),
-            rope_warm: rgb(0xc9913f).into(),
-            rope_leaf: rgb(0x6f9455).into(),
-            rope_danger: rgb(0xbf4a4a).into(),
-            anchor: rgba(0xe8e2d059).into(),
+            rope_line: rgba(0xe8e2d066),
+            rope_accent: rgb(0xb4553a),
+            rope_warm: rgb(0xc9913f),
+            rope_leaf: rgb(0x6f9455),
+            rope_danger: rgb(0xbf4a4a),
+            anchor: rgba(0xe8e2d059),
             // The same weight as the marks beside a card, and for the same
             // reason that note gives: this is an offer rather than a control.
             // Stronger than the axes it crosses, which sit at `22` and are
@@ -249,7 +291,7 @@ impl Theme {
             // appears over somebody's photographs while their hand is down, and
             // anything louder than this stops being feedback and starts being
             // a stripe painted across their board.
-            guide: rgba(0xe8e2d059).into(),
+            guide: rgba(0xe8e2d059),
 
             // Written as hex like every other colour here, rather than as the
             // `h`/`s`/`l` triples these were before they moved onto the
@@ -258,14 +300,9 @@ impl Theme {
             // subtly different from its own round trip through the format —
             // and a built-in that survives being written out and read back is
             // the only thing that makes a built-in a worked example.
-            notes: [
-                rgb(0x534a27).into(),
-                rgb(0x294828).into(),
-                rgb(0x2b4250).into(),
-                rgb(0x4d2d3d).into(),
-            ],
-            swatch_fallback: rgb(0x8c8c8c).into(),
-            shadow: rgba(0x000000ff).into(),
+            notes: [rgb(0x534a27), rgb(0x294828), rgb(0x2b4250), rgb(0x4d2d3d)],
+            swatch_fallback: rgb(0x8c8c8c),
+            shadow: rgba(0x000000ff),
         }
     }
 
@@ -286,74 +323,69 @@ impl Theme {
     /// something somebody eyeballed once.
     pub fn light() -> Self {
         Self {
-            ground: rgb(0xf3f0e6).into(),
+            ground: rgb(0xf3f0e6),
             // The dark theme's grid and axes are the *text* colour at a low
             // alpha; here they are the text colour too, which on paper means
             // ink rather than light.
-            grid: rgba(0x2a2b2000).into(),
-            axis: rgba(0x2a2b2024).into(),
+            grid: rgba(0x2a2b2000),
+            axis: rgba(0x2a2b2024),
 
-            chrome: rgb(0xe8e4d6).into(),
-            chrome_edge: rgba(0x2a2b201f).into(),
+            chrome: rgb(0xe8e4d6),
+            chrome_edge: rgba(0x2a2b201f),
 
             // Lighter than the ground, not darker. A card is a piece of paper
             // laid *on* the desk, and the shadow underneath is what says so.
-            card: rgb(0xfcfaf3).into(),
-            card_edge: rgba(0x2a2b2024).into(),
-            selected_edge: rgb(0xa8482a).into(),
+            card: rgb(0xfcfaf3),
+            card_edge: rgba(0x2a2b2024),
+            selected_edge: rgb(0xa8482a),
 
-            text: rgb(0x24251c).into(),
+            text: rgb(0x24251c),
             // ~5.5:1 on the chrome, and past 4.5:1 on every card tint below —
             // the same promise the dark palette's `muted` makes, measured
             // against this palette's backgrounds.
-            muted: rgb(0x5c5a4d).into(),
+            muted: rgb(0x5c5a4d),
             // Under the floor on purpose, exactly as the dark one is: this is
             // the colour for marks that repeat the words beside them.
-            tertiary: rgb(0x807d6d).into(),
+            tertiary: rgb(0x807d6d),
             // Darker than the dark theme's accent, which is what it takes for
             // the same burnt orange to still be a readable *word* on paper:
             // #b4553a is 3.5:1 on a paper chrome, and a border that survives
             // that is still a word that does not.
-            accent: rgb(0xa8482a).into(),
+            accent: rgb(0xa8482a),
             // ~4.6:1 on the chrome. Dark enough already, unlike the dark
             // palette's, so the fill and the word are the same colour here.
-            accent_text: rgb(0xa8482a).into(),
+            accent_text: rgb(0xa8482a),
 
-            note: rgb(0xf0e6c4).into(),
-            image: rgb(0xd6e6e9).into(),
-            video: rgb(0xe9d9ec).into(),
-            audio: rgb(0xd4ead9).into(),
-            link: rgb(0xdcdcf0).into(),
-            fence: rgba(0xa8482a14).into(),
+            note: rgb(0xf0e6c4),
+            image: rgb(0xd6e6e9),
+            video: rgb(0xe9d9ec),
+            audio: rgb(0xd4ead9),
+            link: rgb(0xdcdcf0),
+            fence: rgba(0xa8482a14),
 
-            quote: rgb(0x5a584a).into(),
-            note_link: rgb(0x9c4526).into(),
+            quote: rgb(0x5a584a),
+            note_link: rgb(0x9c4526),
 
-            diff_add: rgb(0x466b2e).into(),
-            diff_remove: rgb(0xa62f2f).into(),
+            diff_add: rgb(0x466b2e),
+            diff_remove: rgb(0xa62f2f),
 
-            rope_line: rgba(0x2a2b2066).into(),
-            rope_accent: rgb(0xa8482a).into(),
-            rope_warm: rgb(0x8a5e10).into(),
-            rope_leaf: rgb(0x466b2e).into(),
-            rope_danger: rgb(0xa62f2f).into(),
-            anchor: rgba(0x2a2b2059).into(),
-            guide: rgba(0x2a2b2059).into(),
+            rope_line: rgba(0x2a2b2066),
+            rope_accent: rgb(0xa8482a),
+            rope_warm: rgb(0x8a5e10),
+            rope_leaf: rgb(0x466b2e),
+            rope_danger: rgb(0xa62f2f),
+            anchor: rgba(0x2a2b2059),
+            guide: rgba(0x2a2b2059),
 
             // The four off the pad again, at the other end of the range: the
             // same hues, desaturated less because a pale wash needs the
             // saturation to still read as a colour at all.
-            notes: [
-                rgb(0xeee5c4).into(),
-                rgb(0xceeacd).into(),
-                rgb(0xd0e2ec).into(),
-                rgb(0xeed3e0).into(),
-            ],
-            swatch_fallback: rgb(0x9e9e9e).into(),
+            notes: [rgb(0xeee5c4), rgb(0xceeacd), rgb(0xd0e2ec), rgb(0xeed3e0)],
+            swatch_fallback: rgb(0x9e9e9e),
             // Just under half the dark theme's weight. The three sizes below
             // were tuned to hold a panel off a near-black ground; at full
             // strength on paper the same numbers read as smudges.
-            shadow: rgba(0x00000073).into(),
+            shadow: rgba(0x00000073),
         }
     }
 }
@@ -447,10 +479,13 @@ pub const RADIUS_LG: f32 = 12.0;
 impl Theme {
     fn cast(&self, y: f32, blur: f32, spread: f32, alpha: f32) -> Vec<BoxShadow> {
         vec![BoxShadow {
-            color: Hsla { a: self.shadow.a * alpha, ..self.shadow },
+            color: self.shadow.opacity(alpha),
             offset: point(px(0.0), px(y)),
             blur_radius: px(blur),
             spread_radius: px(spread),
+            // Cast, not carved: every shadow in this app falls from a surface
+            // that is floating over the board, which is the outside of it.
+            inset: false,
         }]
     }
 
@@ -509,7 +544,7 @@ pub fn from_hex(text: &str) -> Option<Hsla> {
         _ => return None,
     };
     let value = u32::from_str_radix(&long, 16).ok()?;
-    Some(rgb(value).into())
+    Some(rgb(value))
 }
 
 impl Theme {
@@ -518,7 +553,7 @@ impl Theme {
     /// texture, and the original solves this the same way.
     pub fn grid_at(&self, zoom: f32) -> Hsla {
         let mut c = self.grid;
-        c.a = (0.20 * ((zoom - 0.15) / 0.55).clamp(0.0, 1.0)).max(0.0);
+        c.alpha = (0.20 * ((zoom - 0.15) / 0.55).clamp(0.0, 1.0)).max(0.0);
         c
     }
 
@@ -567,7 +602,7 @@ impl Theme {
     /// one of two and the cases where the two disagree are the cases where
     /// both are legible anyway.
     pub fn ink_on(&self, fill: Hsla) -> Hsla {
-        if fill.l > 0.55 {
+        if fill.lightness > 0.55 {
             gpui::hsla(0.0, 0.0, 0.0, 1.0)
         } else {
             gpui::hsla(0.0, 0.0, 1.0, 1.0)
@@ -605,7 +640,7 @@ impl Theme {
         let of = SHADE_COUNT as usize - self.notes.len();
         let turn = (made as f32 + 0.5) / of as f32;
         let (s, l) = self.pad_weight();
-        Hsla { h: (self.notes[0].h + turn).fract(), s, l, a: 1.0 }
+        hsla((crate::color::wheel(self.notes[0]) + turn).fract(), s, l, 1.0)
     }
 
     /// The saturation and lightness the theme's own note pad is mixed at.
@@ -614,8 +649,8 @@ impl Theme {
     /// to the same theme as them rather than merely sitting beside them.
     fn pad_weight(&self) -> (f32, f32) {
         let n = self.notes.len() as f32;
-        let s = self.notes.iter().map(|c| c.s).sum::<f32>() / n;
-        let l = self.notes.iter().map(|c| c.l).sum::<f32>() / n;
+        let s = self.notes.iter().map(|c| c.saturation).sum::<f32>() / n;
+        let l = self.notes.iter().map(|c| c.lightness).sum::<f32>() / n;
         (s, l)
     }
 
@@ -675,7 +710,7 @@ mod tests {
     /// claim checked against the same arithmetic that produced it is not
     /// checked at all.
     fn luminance(c: Hsla) -> f32 {
-        let rgba = gpui::Rgba::from(c);
+        let rgba = gpui::hsla_to_rgba(c);
         let channel = |v: f32| {
             if v <= 0.03928 {
                 v / 12.92
@@ -683,7 +718,7 @@ mod tests {
                 ((v + 0.055) / 1.055).powf(2.4)
             }
         };
-        0.2126 * channel(rgba.r) + 0.7152 * channel(rgba.g) + 0.0722 * channel(rgba.b)
+        0.2126 * channel(rgba.red) + 0.7152 * channel(rgba.green) + 0.0722 * channel(rgba.blue)
     }
 
     /// How far apart two colours are, 1.0 being identical and 21.0 being black
@@ -714,9 +749,9 @@ mod tests {
     #[test]
     fn a_swatch_draws_as_the_colour_it_names() {
         let theme = Theme::default();
-        assert_eq!(theme.colour_of(&swatch(Some("#ff0000"))), rgb(0xff0000).into());
+        assert_eq!(theme.colour_of(&swatch(Some("#ff0000"))), rgb(0xff0000));
         // The short form folds out to the long one rather than being refused.
-        assert_eq!(theme.colour_of(&swatch(Some("#f00"))), rgb(0xff0000).into());
+        assert_eq!(theme.colour_of(&swatch(Some("#f00"))), rgb(0xff0000));
     }
 
     #[test]
@@ -745,13 +780,13 @@ mod tests {
         let made: Vec<Hsla> = (5..=SHADE_COUNT).map(|n| theme.shade(n)).collect();
         assert_eq!(made.len(), 12);
         for colour in &made {
-            assert!((colour.s - s).abs() < 1e-6, "off the pad's saturation");
-            assert!((colour.l - l).abs() < 1e-6, "off the pad's lightness");
+            assert!((colour.saturation - s).abs() < 1e-6, "off the pad's saturation");
+            assert!((colour.lightness - l).abs() < 1e-6, "off the pad's lightness");
         }
         // Evenly spaced, and all the way round: consecutive hues differ by a
         // twelfth of a turn, wrapping included.
         for pair in made.windows(2) {
-            let step = (pair[1].h - pair[0].h + 1.0).fract();
+            let step = (crate::color::wheel(pair[1]) - crate::color::wheel(pair[0]) + 1.0).fract();
             assert!((step - 1.0 / 12.0).abs() < 1e-5, "uneven at {step}");
         }
     }
@@ -765,7 +800,7 @@ mod tests {
         let (_, light) = Theme::light().pad_weight();
         assert!(dark < 0.5, "the dark pad is dark");
         assert!(light > 0.5, "the light pad is not");
-        assert!(Theme::dark().shade(9).l < Theme::light().shade(9).l);
+        assert!(Theme::dark().shade(9).lightness < Theme::light().shade(9).lightness);
     }
 
     #[test]
@@ -865,13 +900,48 @@ mod tests {
     }
 
     #[test]
+    fn a_palette_is_still_written_down_as_hex_strings() {
+        // What every theme file on somebody's disk is holding this struct to.
+        // The colour type belongs to a colour library now and that library
+        // writes an object of three numbers by itself — `crate::color::hex` is
+        // what keeps the format a person can type, and this is the test that
+        // says so from the outside, where a theme file stands.
+        let Value::Object(written) = serde_json::to_value(Theme::dark()).unwrap() else {
+            panic!("a theme is an object of colours");
+        };
+        assert_eq!(written["ground"], Value::String("#14150fff".into()));
+        assert_eq!(written["accent"], Value::String("#b4553aff".into()));
+        assert_eq!(written["text"], Value::String("#e8e2d0ff".into()));
+        // The pad is four of them and stays a list.
+        assert!(written["notes"].as_array().is_some_and(|pad| pad.len() == 4));
+        for (key, value) in &written {
+            let hex = value.as_str().or_else(|| value[0].as_str());
+            assert!(hex.is_some_and(|s| s.starts_with('#')), "{key} is not a colour: {value}");
+        }
+    }
+
+    #[test]
+    fn every_colour_of_a_built_in_palette_survives_the_file_it_is_written_to() {
+        // The conversion the move to palette put in the path: a colour goes
+        // out as hex and comes back through a different crate's arithmetic
+        // than the one that made it. Both built-ins, because the light one is
+        // where the pale washes are and rounding shows up in a pale wash
+        // first.
+        for theme in [Theme::dark(), Theme::light()] {
+            let text = serde_json::to_string(&theme).unwrap();
+            let back: Theme = serde_json::from_str(&text).unwrap();
+            assert_eq!(back, theme, "a palette changed on the way to disk and back");
+        }
+    }
+
+    #[test]
     fn a_theme_file_that_names_one_colour_gets_the_rest_of_the_palette() {
         // The bargain that makes a theme writable by hand. Somebody changing
         // an accent should not have to restate thirty colours, and missing one
         // should not hand them a black board.
         let style = serde_json::from_str(r##"{ "accent": "#00ff00ff" }"##).unwrap();
         let out = overlay(Theme::dark(), &style).expect("one good colour is a theme");
-        assert_eq!(out.accent, rgb(0x00ff00).into());
+        assert_eq!(out.accent, rgb(0x00ff00));
         assert_eq!(out.ground, Theme::dark().ground, "everything else is the base");
     }
 
@@ -884,7 +954,7 @@ mod tests {
             serde_json::from_str(r##"{ "accent": "#00ff00ff", "gutter_hover": "#123456" }"##)
                 .unwrap();
         let out = overlay(Theme::dark(), &style).expect("an unknown key is not an error");
-        assert_eq!(out.accent, rgb(0x00ff00).into());
+        assert_eq!(out.accent, rgb(0x00ff00));
     }
 
     #[test]

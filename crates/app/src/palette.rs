@@ -27,6 +27,7 @@ use mbrd_core::model::{Item, ItemType};
 use mbrd_core::tags;
 
 use crate::board_view::BoardView;
+use crate::color::Tint;
 use crate::command::Command;
 use crate::editor::{self, Editor};
 use crate::fuzzy;

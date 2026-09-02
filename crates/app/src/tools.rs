@@ -19,6 +19,7 @@
 use gpui::{div, prelude::*, px, Context, Modifiers, MouseButton};
 
 use crate::board_view::BoardView;
+use crate::color::Tint;
 use crate::icons::{icon, Icon};
 
 /// What a press on the board means.

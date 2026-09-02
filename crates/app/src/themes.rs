@@ -320,7 +320,7 @@ mod tests {
     /// The same two floors `theme.rs` holds its own palettes to.
     fn readable(t: &Theme) -> Result<(), String> {
         fn luminance(c: gpui::Hsla) -> f32 {
-            let rgba = gpui::Rgba::from(c);
+            let rgba = gpui::hsla_to_rgba(c);
             let ch = |v: f32| {
                 if v <= 0.03928 {
                     v / 12.92
@@ -328,7 +328,7 @@ mod tests {
                     ((v + 0.055) / 1.055).powf(2.4)
                 }
             };
-            0.2126 * ch(rgba.r) + 0.7152 * ch(rgba.g) + 0.0722 * ch(rgba.b)
+            0.2126 * ch(rgba.red) + 0.7152 * ch(rgba.green) + 0.0722 * ch(rgba.blue)
         }
         let contrast = |fg, bg| {
             let (a, b) = (luminance(fg), luminance(bg));
@@ -406,8 +406,8 @@ mod tests {
             ] }"##,
         );
         assert!(registry.unreadable.is_empty());
-        assert_eq!(registry.resolve("Pair", Appearance::Dark).accent, gpui::rgb(0x111111).into());
-        assert_eq!(registry.resolve("Pair", Appearance::Light).accent, gpui::rgb(0x222222).into());
+        assert_eq!(registry.resolve("Pair", Appearance::Dark).accent, crate::color::rgb(0x111111));
+        assert_eq!(registry.resolve("Pair", Appearance::Light).accent, crate::color::rgb(0x222222));
     }
 
     #[test]
@@ -421,7 +421,7 @@ mod tests {
                 { "name": "Ink", "appearance": "dark", "style": { "accent": "#00ff00" } }
             ] }"##,
         );
-        assert_eq!(registry.resolve("Ink", Appearance::Dark).accent, gpui::rgb(0x00ff00).into());
+        assert_eq!(registry.resolve("Ink", Appearance::Dark).accent, crate::color::rgb(0x00ff00));
         assert_eq!(registry.of(Appearance::Dark).iter().filter(|t| t.name == "Ink").count(), 1);
     }
 
@@ -482,7 +482,7 @@ mod tests {
         std::fs::write(dir.join("notes.txt"), "not a theme and not claiming to be").unwrap();
 
         let registry = Registry::load_from(Some(&dir));
-        assert_eq!(registry.resolve("Neon", Appearance::Dark).accent, gpui::rgb(0x00ff88).into());
+        assert_eq!(registry.resolve("Neon", Appearance::Dark).accent, crate::color::rgb(0x00ff88));
         assert_eq!(registry.unreadable, vec!["broken.json".to_string()]);
         // And the built-ins are still all there beside it.
         assert!(registry.knows(DEFAULT_DARK, Appearance::Dark));
