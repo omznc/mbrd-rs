@@ -39,6 +39,7 @@ use mbrd_core::Document;
 
 use crate::anchor;
 use crate::camera::{Camera, Trail};
+use crate::color::Tint;
 use crate::command::{Command, Entry};
 use crate::editor::{self, Editor};
 use crate::fetch;
@@ -6571,6 +6572,7 @@ impl BoardView {
             background_color: None,
             underline: None,
             strikethrough: None,
+            letter_spacing: None,
         };
         let advance = window
             .text_system()
@@ -7960,6 +7962,12 @@ impl BoardView {
             .filter_map(|entry| match entry {
                 gpui::ClipboardEntry::Image(image) => Some(image.bytes.clone()),
                 gpui::ClipboardEntry::String(_) => None,
+                // Files copied in a file manager, which the framework only
+                // started reporting here and this paste does not yet read.
+                // They are the same thing `part_import` already takes off a
+                // drop, so this is a wire that is not run rather than a
+                // decision — see the note there.
+                gpui::ClipboardEntry::ExternalPaths(_) => None,
             })
             .collect();
         if !images.is_empty() {
@@ -8481,6 +8489,7 @@ impl BoardView {
             background_color: None,
             underline: None,
             strikethrough: None,
+            letter_spacing: None,
         };
         let shaped = window.text_system().shape_line(line.into(), px(font_size), &[run], None);
         let column = shaped.closest_index_for_x(px(local_x.max(0.0)));
@@ -8795,7 +8804,7 @@ impl BoardView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         // Whatever this press turns out to be, it is not part of a drop that is
         // still arriving. See `part_import`.
         self.part_import();
@@ -11997,7 +12006,7 @@ impl BoardView {
                 };
                 let visible = vp.visible();
 
-                if show_grid && theme_grid.a > 0.001 {
+                if show_grid && theme_grid.alpha > 0.001 {
                     // Quantise the step so that zooming out does not ask for a
                     // dot every fraction of a pixel. Each doubling keeps the
                     // spacing on screen inside one octave.
@@ -12258,6 +12267,13 @@ impl BoardView {
                             // whole frame.
                             let _ = window.paint_image(
                                 at,
+                                // Where the picture *is*, which is the same
+                                // rectangle: the framework grew a second
+                                // bounds so a caller can draw a sub-rectangle
+                                // of an image without a mask, and the crop
+                                // here is the content mask above rather than
+                                // this. Passing `at` twice is the whole image.
+                                at,
                                 draw.radius.into(),
                                 image.clone(),
                                 picture.frame,
@@ -12318,6 +12334,7 @@ impl BoardView {
                         let _ = window.paint_svg(
                             mark,
                             Icon::Warned.path().into(),
+                            None,
                             gpui::TransformationMatrix::unit(),
                             draw.text.opacity(0.5),
                             cx,
@@ -12359,6 +12376,7 @@ impl BoardView {
                             let _ = window.paint_svg(
                                 mark,
                                 Icon::Locked.path().into(),
+                                None,
                                 gpui::TransformationMatrix::unit(),
                                 ink.opacity(0.45),
                                 cx,
@@ -12487,6 +12505,7 @@ impl BoardView {
                                     strikethrough: span.style.strike.then_some(
                                         StrikethroughStyle { thickness: px(1.0), color: None },
                                     ),
+                                    letter_spacing: None,
                                 })
                                 .collect();
                             let shaped = window.text_system().shape_line(
@@ -12553,7 +12572,14 @@ impl BoardView {
                         }
 
                         for (row, (line, height)) in shaped.iter().enumerate() {
-                            let _ = line.paint(gpui::point(left, top(row)), *height, window, cx);
+                            let _ = line.paint(
+                                gpui::point(left, top(row)),
+                                *height,
+                                gpui::TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            );
                         }
 
                         // The composing run, underlined. Under the glyphs and
@@ -12628,6 +12654,7 @@ impl BoardView {
                         background_color: None,
                         underline: None,
                         strikethrough: None,
+                        letter_spacing: None,
                     };
                     let size = px(LABEL_TEXT);
                     let shaped = window.text_system().shape_line(text.clone(), size, &[run], None);
@@ -12649,6 +12676,8 @@ impl BoardView {
                     let _ = shaped.paint(
                         gpui::point(left + pad, top + (height - size) / 2.0),
                         height,
+                        gpui::TextAlign::Left,
+                        None,
                         window,
                         cx,
                     );
@@ -12669,7 +12698,7 @@ impl BoardView {
                     let (x0, x1) = (a.x.min(b.x), a.x.max(b.x));
                     let (y0, y1) = (a.y.min(b.y), a.y.max(b.y));
                     let mut wash = accent;
-                    wash.a = 0.14;
+                    wash.alpha = 0.14;
                     window.paint_quad(fill(
                         Bounds::new(
                             gpui::point(origin.x + px(x0), origin.y + px(y0)),
@@ -12784,6 +12813,7 @@ impl BoardView {
                         background_color: None,
                         underline: None,
                         strikethrough: None,
+                        letter_spacing: None,
                     };
                     let size = px(11.0);
                     let shaped = window.text_system().shape_line(text, size, &[run], None);
@@ -12815,6 +12845,8 @@ impl BoardView {
                     let _ = shaped.paint(
                         gpui::point(left + pad, top + (height - size) / 2.0),
                         height,
+                        gpui::TextAlign::Left,
+                        None,
                         window,
                         cx,
                     );
@@ -14586,6 +14618,7 @@ fn paint_tags(
         let _ = window.paint_svg(
             mark.dilate(px(-3.0)),
             Icon::Tag.path().into(),
+            None,
             gpui::TransformationMatrix::unit(),
             ink,
             cx,
@@ -14608,6 +14641,7 @@ fn paint_tags(
             background_color: None,
             underline: None,
             strikethrough: None,
+            letter_spacing: None,
         };
         let line = window.text_system().shape_line(text, size, &[run], None);
         let width = line.width + pad * 2.0;
@@ -14694,6 +14728,8 @@ fn paint_tags(
             let _ = chip.line.paint(
                 gpui::point(left + pad, baseline + (height - size) / 2.0),
                 height,
+                gpui::TextAlign::Left,
+                None,
                 window,
                 cx,
             );
@@ -15035,6 +15071,7 @@ fn paint_controls(
             background_color: None,
             underline: None,
             strikethrough: None,
+            letter_spacing: None,
         };
         let size = px(TRANSPORT_TEXT);
         let shaped =
@@ -15044,7 +15081,14 @@ fn paint_controls(
         // time widens from `0:09` to `0:10`.
         let left = px(box2.x1 - f(shaped.width)) + origin.x;
         let top = px((box2.y0 + box2.y1) / 2.0 - TRANSPORT_TEXT * 0.62) + origin.y;
-        let _ = shaped.paint(gpui::point(left, top), size * 1.3, window, cx);
+        let _ = shaped.paint(
+            gpui::point(left, top),
+            size * 1.3,
+            gpui::TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
     }
 
     if let Some(box2) = strip.mute {
@@ -15124,6 +15168,7 @@ fn paint_mark(
     let _ = window.paint_svg(
         shift(bounds, origin),
         which.path().into(),
+        None,
         gpui::TransformationMatrix::unit(),
         colour,
         app,
@@ -15455,8 +15500,7 @@ fn zoom_reading(percent: f32) -> String {
 /// hand — so this is the one place a div needs the same tabular figures
 /// applied through [`gpui::Styled::text_style`] instead.
 fn tabular<E: Styled>(mut el: E) -> E {
-    el.text_style().get_or_insert_with(Default::default).font_features =
-        Some(crate::theme::numeric());
+    el.text_style().font_features = Some(crate::theme::numeric());
     el
 }
 
@@ -15938,8 +15982,7 @@ impl Render for BoardView {
             // text, which answers a different question and keeps its own
             // number.
             .line_height(relative(1.2));
-        root.text_style().get_or_insert_with(Default::default).font_fallbacks =
-            body_font().fallbacks;
+        root.text_style().font_fallbacks = body_font().fallbacks;
         root
             // Nothing where the compositor draws its own. See `titlebar.rs`.
             .child(crate::titlebar::render(self, window, cx))

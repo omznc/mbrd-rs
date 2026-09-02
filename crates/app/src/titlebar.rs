@@ -39,6 +39,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::board_view::{BoardView, UpdateBadge};
+use crate::color::Tint;
 use crate::command::Command;
 use crate::icons::{icon, Icon};
 use crate::tip::tip;

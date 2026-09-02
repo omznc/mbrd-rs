@@ -71,6 +71,7 @@ use mbrd_core::model::{Item, ItemAsset, ItemType};
 use mbrd_core::preview::{Editable, Preview};
 
 use crate::board_view::{BoardView, Field};
+use crate::color::Tint;
 use crate::icons::{icon, Icon};
 use crate::metrics::Estimate;
 use crate::theme::Theme;
@@ -1198,6 +1199,7 @@ fn line(run: &Run, theme: Theme, over: Style, size: f32) -> AnyElement {
                 thickness: px(1.0),
                 color: Some(theme.text.opacity(0.7)),
             }),
+            letter_spacing: None,
         });
     }
     div()
@@ -1235,7 +1237,7 @@ fn fence(lines: &[String], theme: Theme) -> AnyElement {
                 line.clone()
             }))
         }));
-    block.text_style().get_or_insert_with(Default::default).font_fallbacks =
+    block.text_style().font_fallbacks =
         Some(FontFallbacks::from_fonts(MONO_FALLBACKS.iter().map(|s| s.to_string()).collect()));
     block.into_any_element()
 }
@@ -1330,7 +1332,7 @@ fn listed(text: &str, language: Option<&'static str>, theme: Theme) -> AnyElemen
                     false => (*row).to_string(),
                 })))
         }));
-    block.text_style().get_or_insert_with(Default::default).font_fallbacks =
+    block.text_style().font_fallbacks =
         Some(FontFallbacks::from_fonts(MONO_FALLBACKS.iter().map(|s| s.to_string()).collect()));
 
     div()
@@ -1690,7 +1692,7 @@ fn source(
                 }))
                 .into_any_element()
         }));
-    page.text_style().get_or_insert_with(Default::default).font_fallbacks =
+    page.text_style().font_fallbacks =
         Some(FontFallbacks::from_fonts(MONO_FALLBACKS.iter().map(|s| s.to_string()).collect()));
     page.into_any_element()
 }
@@ -1809,6 +1811,7 @@ fn picture(ready: &Ready, theme: Theme) -> AnyElement {
                             // frame a picture rather than the whole frame.
                             let _ = window.paint_image(
                                 at,
+                                at,
                                 gpui::Corners::default(),
                                 image.clone(),
                                 frame,
@@ -1871,6 +1874,7 @@ fn mesh_picture(
                         move |bounds, _: (), window, _| {
                             let at = gpui::ObjectFit::Contain.get_bounds(bounds, image.size(frame));
                             let _ = window.paint_image(
+                                at,
                                 at,
                                 gpui::Corners::default(),
                                 image.clone(),

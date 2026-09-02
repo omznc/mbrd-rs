@@ -13,7 +13,31 @@ path = "src/main.rs"
 mbrd-core = { path = "../core" }
 anyhow.workspace = true
 flate2.workspace = true
-gpui = "0.2.2"
+# The framework, from the community fork rather than from Zed.
+#
+# `gpui 0.2.2` on crates.io is October 2025 and Zed has not published since,
+# while `crates/gpui` in their tree has moved five hundred commits past it —
+# so the choice was never "old crate or new crate", it was which *unpublished*
+# line to follow. `gpui-ce` follows Zed's (it resyncs upstream on a schedule)
+# and is the one of the two that cuts releases, which is why this is a version
+# and not a `git =` with a `rev` nobody would ever remember to move.
+#
+# The fork also takes the changes an app that is not Zed needs. Two of them are
+# already load-bearing here: `SurfaceSource::Texture` on Linux, which is the
+# GPU path a video frame can take instead of the copy `pipeline.rs` makes of
+# every one of them, and Wayland window icons.
+#
+# `gpui` is core only now — the windowing, text and renderer backends live in
+# `gpui_platform`, which picks one per host. The three features are that
+# choice: fontconfig for Linux's font sources, and both display servers, since
+# a binary that runs on Wayland *or* X11 has to carry both. They are inert on
+# macOS and Windows, which have exactly one of each.
+gpui = { package = "gpui-ce", version = "0.2.2" }
+gpui_platform = { package = "gpui_ce_platform", version = "0.1", features = [
+    "font-kit",
+    "wayland",
+    "x11",
+] }
 image.workspace = true
 lopdf.workspace = true
 minisign-verify.workspace = true
