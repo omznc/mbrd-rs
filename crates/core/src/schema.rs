@@ -1108,6 +1108,15 @@ pub(crate) fn collapse_space(s: &str, max: usize) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(max).collect()
 }
 
+/// A title as typed, held to the same rules as one arriving in a file.
+///
+/// The public face of [`clean_title`], for the window: a name typed into the
+/// app goes through the exact wash a `board.json`'s would, so the two can
+/// never disagree about what a title may hold.
+pub fn titled(text: &str) -> String {
+    clean_title(Some(&Value::String(text.to_string())))
+}
+
 /// A board's title, held to what is safe in a file picker.
 fn clean_title(v: Option<&Value>) -> String {
     let raw = string(v).unwrap_or_default();
@@ -1127,6 +1136,16 @@ fn clean_title(v: Option<&Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_typed_title_is_washed_the_way_a_filed_one_is() {
+        // The characters a file picker chokes on go, runs of space collapse,
+        // and the length stops where the format says titles stop.
+        assert_eq!(titled("  Kitchen   ideas  "), "Kitchen ideas");
+        assert_eq!(titled("a/b:c*d"), "abcd");
+        assert_eq!(titled(&"x".repeat(BOARD_TITLE_MAX + 9)), "x".repeat(BOARD_TITLE_MAX));
+        assert_eq!(titled("***"), "");
+    }
 
     #[test]
     fn nothing_at_all_is_a_default_board() {

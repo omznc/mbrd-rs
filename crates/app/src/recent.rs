@@ -92,6 +92,30 @@ pub fn forget(board: &Path) {
     write_all(&path, &boards);
 }
 
+/// A board's file moved: swap the path where it stands.
+///
+/// Not a `forget` and a `remember`, deliberately — that pair would carry the
+/// board to the top of the list, and a move is filing rather than a visit.
+/// The board's place in the list is its place in time, which renaming its
+/// file does not change. Like [`forget`], the old path is taken as given:
+/// everything in the store was written canonical already.
+pub fn rename(old: &Path, new: &Path) {
+    let Some(path) = store() else { return };
+    let new = new.canonicalize().unwrap_or_else(|_| new.to_path_buf());
+    let mut boards = read_all();
+    let mut hit = false;
+    for slot in boards.iter_mut().filter(|slot| *slot == old) {
+        *slot = new.clone();
+        hit = true;
+    }
+    // Nothing to say, so nothing is written — a board that was never in the
+    // store does not enter it by being renamed.
+    if !hit {
+        return;
+    }
+    write_all(&path, &boards);
+}
+
 /// Put the list back on disk, best effort.
 ///
 /// Best effort because there is nothing useful to do about a failure: the list

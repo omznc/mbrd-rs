@@ -16,7 +16,14 @@ use crate::model::Board;
 /// the board: a title and a filename are different strings, and conflating them
 /// is the bug the format's "title repair" exists to undo on old files.
 pub fn file_name_for(board: &Board) -> PathBuf {
-    let title = board.title.trim();
+    file_named(&board.title)
+}
+
+/// The same convention for a title that is not on a board yet — what the app
+/// asks with when a board is being made or renamed, and needs to say which
+/// file the answer would land in before there is a board to point at.
+pub fn file_named(title: &str) -> PathBuf {
+    let title = title.trim();
     let stem: String = if title.is_empty() {
         "untitled".into()
     } else {
@@ -99,5 +106,13 @@ mod tests {
     #[test]
     fn a_board_with_no_title_still_gets_a_filename() {
         assert_eq!(file_name_for(&Board::default()), PathBuf::from("untitled.mbrd"));
+    }
+
+    #[test]
+    fn a_title_of_nothing_but_punctuation_still_gets_a_filename() {
+        // The filter can eat the whole title; the fallback has to catch what
+        // is left, not just what was empty to begin with.
+        assert_eq!(file_named("!!!"), PathBuf::from("untitled.mbrd"));
+        assert_eq!(file_named("   "), PathBuf::from("untitled.mbrd"));
     }
 }

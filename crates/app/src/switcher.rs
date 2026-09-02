@@ -98,6 +98,46 @@ pub struct Switcher {
     /// *that row*, and saying so somewhere else is asking somebody to
     /// remember which of forty rows it was about.
     refused: Option<(PathBuf, String)>,
+    /// The board a new name is being typed for, while one is.
+    ///
+    /// In the row, where the old name was, for the reason the delete question
+    /// is: the name being replaced is the thing somebody is checking against.
+    /// The switcher is where this lives at all because it is the one surface
+    /// in the app that is *about boards* — F2 on the canvas renames a card,
+    /// and F2 here renames the board under the highlight.
+    renaming: Option<Rename>,
+    /// The question a rename leaves behind when the title and the file no
+    /// longer agree. See [`Switcher::offer_move`].
+    moving: Option<Refile>,
+}
+
+/// A rename in progress: which board, what its row said, and the field.
+#[derive(Debug, Clone)]
+pub struct Rename {
+    /// The board being renamed, at the path its row names.
+    pub board: PathBuf,
+    /// What the field opened as — the file's stem, because that is what the
+    /// row shows — so a commit that changed nothing can be told from one
+    /// that deliberately retyped the same name.
+    pub was: String,
+    /// The name being typed, opened with all of it selected: the first
+    /// letter typed replaces the old name, and an arrow keeps it.
+    pub field: Editor,
+}
+
+/// A title that has landed on a board whose file still carries the old name.
+///
+/// The two are allowed to disagree — the title is the board's and the file
+/// name is the disk's — so this is an offer rather than a consequence:
+/// nothing moves until it is taken. See `BoardView::move_renamed_board`.
+#[derive(Debug, Clone)]
+pub struct Refile {
+    /// The board, at the path it still has.
+    pub board: PathBuf,
+    /// The title it now carries.
+    pub title: String,
+    /// The file name that title asks for, from `naming::file_named`.
+    pub name: PathBuf,
 }
 
 impl Switcher {
@@ -120,6 +160,8 @@ impl Switcher {
             boards,
             confirming: None,
             refused: None,
+            renaming: None,
+            moving: None,
             open: current.map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf())),
         }
     }
@@ -166,6 +208,69 @@ impl Switcher {
     pub fn ask_about(&mut self, board: Option<PathBuf>) {
         self.confirming = board.filter(|b| self.deletable(b));
         self.refused = None;
+        // One question at a time, whichever it is. Two of them standing
+        // would leave Enter meaning two things at once.
+        self.renaming = None;
+        self.moving = None;
+    }
+
+    /// Start renaming a board, or put the field away with `None`.
+    ///
+    /// Arming is all this does: the name goes nowhere until Enter answers
+    /// it, and Escape puts the old one back untouched.
+    pub fn rename(&mut self, board: Option<PathBuf>) {
+        self.confirming = None;
+        self.refused = None;
+        self.moving = None;
+        self.renaming = board.map(|board| {
+            let was =
+                board.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            Rename {
+                field: Editor::selecting_all(was.clone(), mbrd_core::model::BOARD_TITLE_MAX, false),
+                was,
+                board,
+            }
+        });
+    }
+
+    /// The rename being typed, for the row that draws it.
+    pub fn renaming(&self) -> Option<&Rename> {
+        self.renaming.as_ref()
+    }
+
+    /// Take the rename, answered. The caller decides what the answer means.
+    pub fn take_rename(&mut self) -> Option<Rename> {
+        self.renaming.take()
+    }
+
+    /// Put up the offer a rename leaves behind: the title is set, and the
+    /// file still carries the old name. See [`Refile`].
+    pub fn offer_move(&mut self, board: PathBuf, title: String, name: PathBuf) {
+        self.confirming = None;
+        self.refused = None;
+        self.moving = Some(Refile { board, title, name });
+    }
+
+    /// The offer standing, for the strip that draws it.
+    pub fn moving(&self) -> Option<&Refile> {
+        self.moving.as_ref()
+    }
+
+    /// Take the offer, answered — with a move, or by leaving the file be.
+    pub fn take_move(&mut self) -> Option<Refile> {
+        self.moving.take()
+    }
+
+    /// A board's file moved. Its row keeps its place — a move is not a visit,
+    /// so it must not reorder a list that is ordered by recency — and only
+    /// the path under the row changes.
+    pub fn moved(&mut self, from: &Path, to: PathBuf) {
+        if let Some(at) = self.boards.iter().position(|p| p == from) {
+            self.boards[at] = to.clone();
+        }
+        if self.open.as_deref() == Some(from) {
+            self.open = Some(to);
+        }
     }
 
     /// A delete was tried and the disk said no. See `refused`.
@@ -198,6 +303,8 @@ impl Switcher {
         self.boards.retain(|p| p != board);
         self.confirming = None;
         self.refused = None;
+        self.renaming = None;
+        self.moving = None;
         self.cursor = self.cursor.min(self.matches().len().saturating_sub(1));
     }
 
@@ -239,6 +346,36 @@ impl Switcher {
     /// [`Editor`], which already knows the rest of what a one-line query
     /// needs.
     pub fn key(&mut self, key: &str, mods: Modifiers, text: Option<&str>) -> Reply {
+        // A name being typed takes every press, for the reason the query
+        // does: a field whose letters were shortcuts is a field you cannot
+        // type a name into. The field itself turns Enter into `Commit` and
+        // Escape into `Revert`, so those two need no arms of their own.
+        if let Some(renaming) = &mut self.renaming {
+            return match renaming.field.key(key, editor::Mods::from(mods), text) {
+                editor::Reply::Commit => Reply::Rename,
+                editor::Reply::Revert => {
+                    self.renaming = None;
+                    Reply::Held
+                }
+                editor::Reply::Ignored if mods.secondary() && key == "v" => Reply::Paste,
+                _ => Reply::Held,
+            };
+        }
+        // The move offer: Enter takes it, Escape declines it, and any other
+        // key declines it on the way to whatever that key usually does —
+        // the same terms the delete question stands on, because an offer
+        // that trailed the highlight around would end up about a row nobody
+        // was looking at when they answered.
+        if self.moving.is_some() {
+            match key {
+                "enter" => return Reply::Move,
+                "escape" => {
+                    self.moving = None;
+                    return Reply::Held;
+                }
+                _ => self.moving = None,
+            }
+        }
         match key {
             // A pending delete is what escape answers first. It is the more
             // recent of the two questions on screen, and closing the whole
@@ -256,6 +393,13 @@ impl Switcher {
             "delete" => {
                 let chosen = self.chosen();
                 self.ask_about(chosen);
+                return Reply::Held;
+            }
+            // The key that renames the selected card on the canvas, doing
+            // here what it does there — to the thing this list is a list of.
+            "f2" => {
+                let chosen = self.chosen();
+                self.rename(chosen);
                 return Reply::Held;
             }
             // Everything below moves the highlight or changes the list, so the
@@ -307,8 +451,12 @@ impl Switcher {
         Reply::Held
     }
 
-    /// Put text into the query, at the caret. For a paste.
+    /// Put text into whichever field has the keys, at the caret. For a paste.
     pub fn insert(&mut self, text: &str) {
+        if let Some(renaming) = &mut self.renaming {
+            renaming.field.insert(text);
+            return;
+        }
         self.query.insert(text);
         self.confirming = None;
         self.refused = None;
@@ -337,7 +485,14 @@ pub enum Reply {
     /// Delete the board named by [`Switcher::doomed`], which has been asked
     /// about and answered.
     Delete,
-    /// Put the clipboard into the query. The view has the clipboard.
+    /// The name in [`Switcher::renaming`] was committed: make it the title
+    /// of the board it names.
+    Rename,
+    /// Take the offer in [`Switcher::moving`]: move the board's file to the
+    /// name its new title asks for.
+    Move,
+    /// Put the clipboard into whichever field has the keys. The view has the
+    /// clipboard.
     Paste,
 }
 
@@ -429,6 +584,9 @@ pub fn render(
             // The question is asked in the row rather than over it. See
             // `Switcher::confirming`.
             let doomed = switcher.confirming.as_deref() == Some(*path);
+            // And so is the rename, in place of the name it is replacing.
+            let renaming = switcher.renaming().filter(|r| r.board.as_path() == *path);
+            let held = doomed || renaming.is_some();
             let refused = switcher.refusal(path);
             div()
                 .id(i)
@@ -440,11 +598,11 @@ pub fn render(
                 .py(px(7.0))
                 .mx(px(6.0))
                 .rounded(px(crate::theme::RADIUS_SM))
-                .when(highlighted && !doomed, |d| d.bg(theme.accent.opacity(0.20)))
+                .when(highlighted && !held, |d| d.bg(theme.accent.opacity(0.20)))
                 // Lit in the colour of the thing about to happen, so that the
                 // row being asked about is the row you are looking at.
-                .when(doomed, |d| d.bg(theme.accent.opacity(0.14)))
-                .when(!doomed, |d| {
+                .when(held, |d| d.bg(theme.accent.opacity(0.14)))
+                .when(!held, |d| {
                     d.hover(|s| s.bg(theme.accent.opacity(0.12)))
                         // Opening a board is the slowest thing in the app — a
                         // file to read and a board to build — so the row has to
@@ -467,20 +625,36 @@ pub fn render(
                         .items_center()
                         .gap(px(8.0))
                         .overflow_hidden()
+                        // The field wants the row's width; the name wants
+                        // only its own.
+                        .when(renaming.is_some(), |d| d.flex_1().min_w_0())
                         // The same picture on every row, which is the point:
                         // it is not telling one board from another, it is
                         // telling a *board* from the directory path beside it.
                         .child(icon(Icon::Board, crate::icons::ICON_MD, theme.muted))
-                        // Medium rather than regular, the same reason the
-                        // palette's row title carries the weight now: it is
-                        // the thing this list exists to let you aim at.
-                        .child(
-                            div()
+                        .child(match renaming {
+                            // The new name, typed where the old one was — the
+                            // thing it replaces is the thing being checked
+                            // against, the same reason the delete question
+                            // sits in the row.
+                            Some(renaming) => {
+                                div().flex_1().min_w_0().child(crate::palette::query_line(
+                                    &renaming.field,
+                                    "name the board\u{2026}",
+                                    13.0,
+                                    true,
+                                    &theme,
+                                ))
+                            }
+                            // Medium rather than regular, the same reason the
+                            // palette's row title carries the weight now: it
+                            // is the thing this list exists to let you aim at.
+                            None => div()
                                 .text_size(px(13.0))
                                 .font_weight(FontWeight::MEDIUM)
                                 .truncate()
                                 .child(name),
-                        ),
+                        }),
                 )
                 .child(match refused {
                     // The reason a delete failed, in the row it was asked
@@ -510,8 +684,10 @@ pub fn render(
                         // about: the question is at the foot of the panel and
                         // it has its own two buttons, and a third way to
                         // answer it sitting in the row would be a control
-                        // whose meaning changed under the pointer.
-                        .when(switcher.deletable(path) && !doomed, |d| {
+                        // whose meaning changed under the pointer. Same for
+                        // the pencil while the name is a field.
+                        .when(!held, |d| d.child(rename_button(cx, theme, path, i)))
+                        .when(switcher.deletable(path) && !held, |d| {
                             d.child(delete_button(cx, theme, path, i))
                         })
                         .into_any_element(),
@@ -659,10 +835,12 @@ pub fn render(
                 // panel worth reading, and two strips of small print at the
                 // foot of a list is how a question gets missed.
                 .children(switcher.doomed().map(|board| confirm(cx, theme, &board)))
+                // The rename's leftover question stands on the same terms.
+                .children(switcher.moving().map(|offer| refile(cx, theme, offer)))
                 // Names the keys that leave this mode, the same rule
                 // `board_view.rs` applies everywhere else a mode is entered:
                 // every mode names the key that gets out of it.
-                .when(switcher.doomed().is_none(), |d| {
+                .when(switcher.doomed().is_none() && switcher.moving().is_none(), |d| {
                     d.child(
                         div()
                             .px(px(14.0))
@@ -671,7 +849,12 @@ pub fn render(
                             .border_color(theme.chrome_edge)
                             .text_size(px(10.0))
                             .text_color(theme.muted)
-                            .child("\u{2191}\u{2193} move · enter open · del remove · esc close"),
+                            .child(match switcher.renaming().is_some() {
+                                true => "enter rename · esc keep the old name",
+                                false => {
+                                    "\u{2191}\u{2193} move · enter open · f2 rename · del remove · esc close"
+                                }
+                            }),
                     )
                 }),
         )
@@ -695,6 +878,136 @@ fn beside_heading(theme: crate::theme::Theme) -> gpui::AnyElement {
                 .text_size(px(9.5))
                 .text_color(theme.tertiary)
                 .child("SITTING NEXT TO THIS ONE"),
+        )
+        .into_any_element()
+}
+
+/// The pencil that turns a row's name into a field.
+///
+/// It arms rather than acts, like the cross beside it: nothing about the
+/// board changes until the name typed into the row is answered with Enter.
+fn rename_button(
+    cx: &mut Context<BoardView>,
+    theme: crate::theme::Theme,
+    board: &Path,
+    row: usize,
+) -> impl IntoElement {
+    let board = board.to_path_buf();
+    div()
+        .id(("rename-board", row))
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .w(px(20.0))
+        .h(px(20.0))
+        .rounded(px(crate::theme::RADIUS_XS))
+        .hover(|s| s.bg(theme.accent.opacity(0.2)))
+        .active(|s| s.bg(theme.accent.opacity(0.36)))
+        // Named the way every wordless button in this app is, and with the
+        // key, because there is one: the same F2 that renames a card.
+        .tooltip(tip(theme, "Rename board", "F2"))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _event, _window, cx| {
+                // The row underneath opens the board. Without this, asking to
+                // rename one would open it first.
+                cx.stop_propagation();
+                this.start_board_rename(board.clone());
+                cx.notify();
+            }),
+        )
+        .child(icon(Icon::Rename, crate::icons::ICON_SM, theme.muted))
+}
+
+/// The offer a rename leaves at the foot of the panel: the title is set, and
+/// the file still answers to the old name.
+///
+/// Shaped like `confirm` and deliberately not coloured like it. A delete is
+/// damage and fills its button with the danger colour; this is filing, both
+/// answers are safe, and the filled one is only the one the strip exists to
+/// offer. "Leave it" is also what Escape does and what any other key does on
+/// its way past — see `Switcher::key` — because a title and a file name are
+/// allowed to disagree, and declining must cost nothing.
+fn refile(cx: &mut Context<BoardView>, theme: crate::theme::Theme, offer: &Refile) -> AnyElement {
+    let file = offer.board.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let name = offer.name.to_string_lossy().to_string();
+    div()
+        .flex()
+        .items_center()
+        .gap(px(9.0))
+        .px(px(15.0))
+        .py(px(11.0))
+        .border_t_1()
+        .border_color(theme.chrome_edge)
+        .bg(theme.accent.opacity(0.08))
+        .child(icon(Icon::Rename, crate::icons::ICON_MD, theme.accent))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_baseline()
+                .gap(px(4.0))
+                .text_size(px(12.0))
+                .text_color(theme.text)
+                // The title carries the weight: it is the new fact, and the
+                // file name beside it is the one that has not moved.
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(offer.title.clone()),
+                )
+                .child(div().flex_none().text_color(theme.muted).child("still lives in"))
+                .child(div().min_w_0().truncate().child(file)),
+        )
+        .child(
+            div()
+                .id("refile-no")
+                .flex_none()
+                .px(px(10.0))
+                .py(px(4.0))
+                .rounded(px(crate::theme::RADIUS_XS))
+                .border_1()
+                .border_color(theme.chrome_edge)
+                .text_size(px(11.5))
+                .text_color(theme.text)
+                .hover(|s| s.bg(theme.text.opacity(0.08)))
+                .active(|s| s.bg(theme.text.opacity(0.14)))
+                .child("Leave it")
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        cx.stop_propagation();
+                        this.keep_board_file();
+                        cx.notify();
+                    }),
+                ),
+        )
+        .child(
+            div()
+                .id("refile-yes")
+                .flex_none()
+                .px(px(10.0))
+                .py(px(4.0))
+                .rounded(px(crate::theme::RADIUS_XS))
+                .text_size(px(11.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme.ground)
+                .bg(theme.accent)
+                .hover(|s| s.bg(theme.accent.opacity(0.85)))
+                .active(|s| s.bg(theme.accent.opacity(0.7)))
+                .child(format!("Move to {name}"))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        cx.stop_propagation();
+                        this.move_renamed_board(cx);
+                        cx.notify();
+                    }),
+                ),
         )
         .into_any_element()
 }
@@ -935,6 +1248,8 @@ mod tests {
             boards,
             confirming: None,
             refused: None,
+            renaming: None,
+            moving: None,
             open: None,
         }
     }
@@ -1139,6 +1454,115 @@ mod tests {
         press(&mut s, "delete");
         assert_eq!(s.doomed(), None, "the open board was armed for deletion");
         assert_eq!(press(&mut s, "enter"), Reply::Open, "and enter still opens it");
+    }
+
+    #[test]
+    fn f2_turns_the_chosen_row_into_a_field_that_opens_as_the_file_stem() {
+        let mut s = switcher(&["/a/untitled-3.mbrd", "/b/two.mbrd"]);
+        press(&mut s, "f2");
+        let renaming = s.renaming().expect("f2 armed nothing");
+        assert_eq!(renaming.board, PathBuf::from("/a/untitled-3.mbrd"));
+        assert_eq!(renaming.was, "untitled-3");
+        assert_eq!(renaming.field.text(), "untitled-3");
+        // All of it selected, so the first letter typed replaces the name.
+        assert_eq!(renaming.field.selection(), Some((0, "untitled-3".len())));
+    }
+
+    #[test]
+    fn a_name_being_typed_goes_into_the_field_and_not_the_query() {
+        let mut s = switcher(&["/a/one.mbrd"]);
+        press(&mut s, "f2");
+        s.key("k", Modifiers::default(), Some("k"));
+        assert_eq!(s.query.text(), "", "the letter leaked into the query");
+        assert_eq!(s.renaming().unwrap().field.text(), "k", "and never reached the field");
+    }
+
+    #[test]
+    fn a_paste_lands_in_the_field_while_one_is_open() {
+        let mut s = switcher(&["/a/one.mbrd"]);
+        press(&mut s, "f2");
+        assert_eq!(s.key("v", Modifiers::secondary_key(), Some("v")), Reply::Paste);
+        s.insert("Kitchen");
+        assert_eq!(s.renaming().unwrap().field.text(), "Kitchen");
+        assert_eq!(s.query.text(), "");
+    }
+
+    #[test]
+    fn escape_puts_the_old_name_back_rather_than_closing_the_list() {
+        let mut s = switcher(&["/a/one.mbrd"]);
+        press(&mut s, "f2");
+        assert_eq!(press(&mut s, "escape"), Reply::Held, "it closed instead of reverting");
+        assert!(s.renaming().is_none());
+        assert_eq!(press(&mut s, "escape"), Reply::Close);
+    }
+
+    #[test]
+    fn enter_answers_the_rename_rather_than_opening_a_board() {
+        let mut s = switcher(&["/a/one.mbrd"]);
+        press(&mut s, "f2");
+        assert_eq!(press(&mut s, "enter"), Reply::Rename);
+    }
+
+    #[test]
+    fn the_two_questions_never_stand_at_once() {
+        // Enter answers whichever question is up, so two of them standing
+        // would leave it meaning two things.
+        let mut s = switcher(&["/a/one.mbrd", "/b/two.mbrd"]);
+        press(&mut s, "delete");
+        s.rename(s.chosen());
+        assert_eq!(s.doomed(), None, "the delete outlived the rename");
+        s.ask_about(s.chosen());
+        assert!(s.renaming().is_none(), "the rename outlived the delete");
+    }
+
+    #[test]
+    fn the_move_offer_is_answered_by_enter_and_declined_by_anything_else() {
+        let mut s = switcher(&["/a/untitled-3.mbrd"]);
+        s.offer_move(
+            PathBuf::from("/a/untitled-3.mbrd"),
+            "Kitchen".into(),
+            PathBuf::from("Kitchen.mbrd"),
+        );
+        assert_eq!(press(&mut s, "enter"), Reply::Move);
+        assert!(s.moving().is_some(), "answering is the caller's to take");
+        assert_eq!(s.take_move().unwrap().title, "Kitchen");
+
+        // Escape declines it and the list stays up.
+        s.offer_move(
+            PathBuf::from("/a/untitled-3.mbrd"),
+            "Kitchen".into(),
+            PathBuf::from("Kitchen.mbrd"),
+        );
+        assert_eq!(press(&mut s, "escape"), Reply::Held);
+        assert!(s.moving().is_none());
+
+        // And a letter declines it on the way into the query, so the offer
+        // cannot end up about a list that has changed under it.
+        s.offer_move(
+            PathBuf::from("/a/untitled-3.mbrd"),
+            "Kitchen".into(),
+            PathBuf::from("Kitchen.mbrd"),
+        );
+        s.key("t", Modifiers::default(), Some("t"));
+        assert!(s.moving().is_none());
+        assert_eq!(s.query.text(), "t");
+    }
+
+    #[test]
+    fn a_moved_board_keeps_its_place_in_the_list() {
+        let mut s = beside(&["/a/one.mbrd", "/a/untitled-3.mbrd"], &["/b/three.mbrd"]);
+        s.moved(Path::new("/a/untitled-3.mbrd"), PathBuf::from("/a/Kitchen.mbrd"));
+        assert_eq!(names(&s), ["one.mbrd", "Kitchen.mbrd", "three.mbrd"]);
+        assert!(!s.found_beside(Path::new("/a/Kitchen.mbrd")), "the move demoted it");
+    }
+
+    #[test]
+    fn moving_the_open_board_keeps_it_off_the_delete_list() {
+        let mut s = switcher(&["/a/untitled-3.mbrd", "/b/two.mbrd"]);
+        s.open = Some(PathBuf::from("/a/untitled-3.mbrd"));
+        s.moved(Path::new("/a/untitled-3.mbrd"), PathBuf::from("/a/Kitchen.mbrd"));
+        assert!(!s.deletable(Path::new("/a/Kitchen.mbrd")), "the open board went deletable");
+        assert!(s.deletable(Path::new("/b/two.mbrd")));
     }
 
     #[test]
