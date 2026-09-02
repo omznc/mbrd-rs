@@ -739,8 +739,14 @@ fn header(page: &Page, view: &BoardView, cx: &mut Context<BoardView>) -> AnyElem
     let section = page.section;
     let application = section.group() == Group::Application;
     let scope = if application { "You" } else { "Board" };
-    let lands_in: SharedString =
-        if application { "settings.json".into() } else { view.doc.board.title.clone().into() };
+    // Through `project_name` rather than the raw title, so a board that was
+    // never titled names itself by its file here the way the titlebar does,
+    // instead of leaving the chip blank.
+    let lands_in: SharedString = if application {
+        "settings.json".into()
+    } else {
+        crate::titlebar::project_name(&view.doc.board.title, view.path.as_deref()).into()
+    };
     let (title, blurb): (SharedString, SharedString) = if page.searching() {
         ("Search".into(), "Every setting whose name or description says that.".into())
     } else {

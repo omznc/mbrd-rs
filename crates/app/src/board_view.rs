@@ -1359,6 +1359,15 @@ pub struct BoardView {
     /// board state and goes through `board.edit` like everything else; see
     /// [`Measuring`] and `take_measurement`.
     measuring: Option<Measuring>,
+    /// The name a new board is being given, while `Ctrl N`'s question is up.
+    ///
+    /// A field rather than board state, because the board it is about does
+    /// not exist yet: Enter is what makes it — an empty answer and all, see
+    /// `make_board` — and Escape makes nothing at all.
+    naming: Option<Editor>,
+    /// What the operating system's own titlebar was last told, so `render`
+    /// can say it again only when it changes.
+    titled: String,
     /// How far a run of the shrink has got, and `None` when none is running.
     ///
     /// Two numbers rather than a struct: what the page draws is "3 of 12", and
@@ -1852,6 +1861,8 @@ impl BoardView {
             tag_filter: std::collections::BTreeSet::new(),
             touring: None,
             measuring: None,
+            naming: None,
+            titled: String::new(),
             squeezing: None,
             let_go: LetGo::default(),
             said: None,
@@ -5446,7 +5457,39 @@ impl BoardView {
         cx.notify();
     }
 
-    /// A new, empty board — with a file of its own from the moment it exists.
+    /// A new, empty board — asked about by name first.
+    ///
+    /// One line over the board — see `name_bar` — with the old behaviour as
+    /// the default answer: Enter on nothing makes `untitled`, because a
+    /// board you can start drawing on immediately is the point of the
+    /// command, and Escape makes nothing at all. A name given here lands in
+    /// both places at once — the board's title and, through
+    /// `naming::file_name_for`, its file — so a board made with a name never
+    /// spends a moment being called `untitled-4`. The making itself is
+    /// [`Self::make_board`].
+    pub fn new_board(&mut self, cx: &mut Context<Self>) {
+        // Asked again is the question put away — the same toggle
+        // `start_calibrating` answers a second `Ctrl M` with.
+        if self.naming.take().is_some() {
+            cx.notify();
+            return;
+        }
+        // One text field at a time, the rule every field in this app keeps:
+        // a note being typed is committed, and the other two one-line
+        // questions are put away rather than fought with — the measure bar
+        // sits exactly where this one does.
+        if self.editing.is_some() {
+            self.stop_editing(true, cx);
+        }
+        self.stop_calibrating(true, cx);
+        // The tour bar shares the spot too. See `start_calibrating`.
+        self.end_tour(true, cx);
+        self.naming = Some(Editor::new("", mbrd_core::model::BOARD_TITLE_MAX, false));
+        cx.notify();
+    }
+
+    /// The question answered: make the board `new_board` asked about — with
+    /// a file of its own from the moment it exists.
     ///
     /// **Written to disk here rather than left in memory**, and that is the
     /// whole design: everything else in this app relies on a board having a
@@ -5458,7 +5501,11 @@ impl BoardView {
     /// The write is on this thread, unlike every other one. An empty board is a
     /// few hundred bytes, and the path cannot be adopted until it is known to
     /// have worked.
-    pub fn new_board(&mut self, cx: &mut Context<Self>) {
+    fn make_board(&mut self, cx: &mut Context<Self>) {
+        let Some(field) = self.naming.take() else { return };
+        // Washed the way a title arriving in a file is, so the file picker
+        // characters and the length cap cannot be typed around.
+        let title = mbrd_core::schema::titled(field.text());
         self.flush(cx);
         // What this computer's habits say a board starts as. Stamped onto the
         // `Board` *before* it becomes a `BoardState` — which is the only way
@@ -5469,6 +5516,10 @@ impl BoardView {
         // to decide this and not allowed to reach into the board on screen.
         let mut born = mbrd_core::Board::default();
         self.prefs.new_board.apply(&mut born.settings.desktop);
+        // The name it was born with, on the same terms as the preferences
+        // above. `fresh_board_path` reads it through `naming::file_name_for`,
+        // which is what puts the same word on the file.
+        born.title = title;
         let doc = Document { board: mbrd_core::BoardState::new(born), ..Document::default() };
         let Some(path) = fresh_board_path(&doc.board, &self.prefs) else {
             self.warn("nowhere to put a new board: no home directory".into());
@@ -5556,6 +5607,10 @@ impl BoardView {
         // the moment something else is asked for. Only the resume itself puts
         // it back, and it does so *after* calling this.
         self.resume_card = None;
+        // The new-board question goes too: an overlay owns the keys while it
+        // is up, and a field that kept standing without them would be a
+        // question nobody can answer. Asking again is one `Ctrl N`.
+        self.naming = None;
         self.overlay = new;
         self.overlay_leaving = false;
     }
@@ -5635,6 +5690,170 @@ impl BoardView {
         };
         if let Some(board) = doomed {
             self.delete_board(&board, cx);
+        }
+    }
+
+    /// Turn a switcher row's name into a field, for a press on its pencil.
+    /// The keyboard way in — F2 — lives in `Switcher::key`; this is the same
+    /// door `ask_about_board` is, and for the same reason.
+    pub fn start_board_rename(&mut self, board: PathBuf) {
+        if let Overlay::Switcher(switcher) = &mut self.overlay {
+            switcher.rename(Some(board));
+        }
+    }
+
+    /// Whether this path is the board that is open, said carefully: the
+    /// switcher's rows are canonical and `self.path` is whatever was adopted,
+    /// so both sides are canonicalised before they are compared.
+    fn names_open_board(&self, board: &Path) -> bool {
+        self.path
+            .as_deref()
+            .map(|open| open.canonicalize().unwrap_or_else(|_| open.to_path_buf()))
+            .is_some_and(|open| {
+                open == board.canonicalize().unwrap_or_else(|_| board.to_path_buf())
+            })
+    }
+
+    /// Make the name in the switcher's rename field the board's title.
+    ///
+    /// The title only. `naming::file_name_for`'s own note says why in six
+    /// words — a title and a filename are different strings — so the file
+    /// half arrives as an offer, `Switcher::offer_move`, rather than as a
+    /// consequence: a file somebody has a shortcut to is theirs, not this
+    /// app's to move quietly. See `move_renamed_board`, where taking the
+    /// offer lands.
+    ///
+    /// For the open board this is one step of the ledger, which makes it the
+    /// cheapest rename in the app: `Ctrl Z` takes it back. For any other
+    /// board the title lives inside its archive, so it is a read and a write
+    /// of the whole file — done off this thread, like every other read of
+    /// one, with the answer reported back into the row it was typed in.
+    fn commit_board_rename(&mut self, cx: &mut Context<Self>) {
+        let rename = match &mut self.overlay {
+            Overlay::Switcher(switcher) => switcher.take_rename(),
+            _ => None,
+        };
+        let Some(rename) = rename else { return };
+        let typed = rename.field.text().trim().to_string();
+        let title = mbrd_core::schema::titled(&typed);
+        // Nothing typed, the same name back, or a name the wash keeps none
+        // of: not a rename. Deliberately not a title write either — "did not
+        // change it" must not quietly become "set the title to what the file
+        // happened to be called".
+        if title.is_empty() || typed == rename.was {
+            cx.notify();
+            return;
+        }
+        let name = mbrd_core::naming::file_named(&title);
+        if self.names_open_board(&rename.board) {
+            let titled = title.clone();
+            self.doc.board.edit("Rename board", move |b| b.title = titled);
+            self.renamed_board(rename.board, title, name, cx);
+        } else {
+            let board = rename.board.clone();
+            let titled = title.clone();
+            cx.spawn(async move |view, cx| {
+                let wrote = board.clone();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let mut doc = crate::save::read_watched(&wrote, |_, _| {})?;
+                        doc.board.edit("Rename board", |b| b.title = titled);
+                        crate::save::write(&wrote, &doc)?;
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await;
+                view.update(cx, |this, cx| match result {
+                    Ok(()) => this.renamed_board(board, title, name, cx),
+                    // In the row the name was typed in, like a delete the
+                    // disk said no to — see `Switcher::refused`.
+                    Err(err) => {
+                        if let Overlay::Switcher(switcher) = &mut this.overlay {
+                            switcher.refuse(board, format!("could not rename: {err:#}"));
+                        }
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    /// A title has landed. Say so — and where the file's name no longer
+    /// answers to it, put up the offer to move the file too.
+    fn renamed_board(
+        &mut self,
+        board: PathBuf,
+        title: String,
+        name: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let agrees = board.file_name() == Some(name.as_os_str());
+        match &mut self.overlay {
+            Overlay::Switcher(switcher) if !agrees => switcher.offer_move(board, title, name),
+            // The switcher closed before the write landed, or the file
+            // already answers to the name. Either way the rename is done and
+            // the status line says so; the offer can be made again by
+            // renaming again.
+            _ => self.tell(format!("renamed to {title}")),
+        }
+        cx.notify();
+    }
+
+    /// Take the offer a rename left standing: move the board's file to the
+    /// name its title asks for. Same collision rule as a new board —
+    /// `unused_in` — so a rename can never land one file on another.
+    pub fn move_renamed_board(&mut self, cx: &mut Context<Self>) {
+        let offer = match &mut self.overlay {
+            Overlay::Switcher(switcher) => switcher.take_move(),
+            _ => None,
+        };
+        let Some(offer) = offer else { return };
+        let from = offer.board;
+        let Some(dir) = from.parent() else { return };
+        let to = unused_in(dir, &offer.name);
+        if to == from {
+            return;
+        }
+        let open = self.names_open_board(&from);
+        // An autosave in flight is a write aimed at the old path. Moving the
+        // file out from under it would let the write put the old name
+        // straight back beside the new one, so this waits its turn instead.
+        if open && self.saving {
+            if let Overlay::Switcher(switcher) = &mut self.overlay {
+                switcher.refuse(from, "still saving — ask again in a moment".into());
+            }
+            cx.notify();
+            return;
+        }
+        match std::fs::rename(&from, &to) {
+            Ok(()) => {
+                // The row keeps its place and `recent.json` keeps its order:
+                // a move is filing, not a visit.
+                crate::recent::rename(&from, &to);
+                if open {
+                    self.path = Some(to.clone());
+                }
+                if let Overlay::Switcher(switcher) = &mut self.overlay {
+                    switcher.moved(&from, to.clone());
+                }
+                self.tell(format!("filed as {}", short_name(&to)));
+            }
+            Err(err) => {
+                if let Overlay::Switcher(switcher) = &mut self.overlay {
+                    switcher.refuse(from, format!("could not move: {err}"));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Decline the offer: the title is the board's, the file name stays the
+    /// disk's, and the two are allowed to disagree.
+    pub fn keep_board_file(&mut self) {
+        if let Overlay::Switcher(switcher) = &mut self.overlay {
+            switcher.take_move();
         }
     }
 
@@ -10492,6 +10711,8 @@ impl BoardView {
                     }
                 }
                 Reply::Delete => self.delete_doomed_board(cx),
+                Reply::Rename => self.commit_board_rename(cx),
+                Reply::Move => self.move_renamed_board(cx),
                 // The clipboard is the view's, not the switcher's — same
                 // division the palette draws, above.
                 Reply::Paste => {
@@ -10734,6 +10955,33 @@ impl BoardView {
             }
             // Anything still unclaimed falls through to the board's own
             // shortcuts below, which is how `Ctrl S` saves from inside a note.
+        }
+
+        // A new board being named. Takes every press for the reason every
+        // one-line field here does — `n` itself is bound out here, and a
+        // question that could not hold the letter that asked it would be a
+        // strange question. Never up at the same time as the measure bar
+        // below: arming either one puts the other away, see `new_board`.
+        if self.naming.is_some() {
+            let mods = editor::Mods::from(mods);
+            let typed = event.keystroke.key_char.clone();
+            let reply = self.naming.as_mut().map(|name| name.key(key, mods, typed.as_deref()));
+            match reply {
+                Some(editor::Reply::Commit) => self.make_board(cx),
+                Some(editor::Reply::Revert) => self.naming = None,
+                // The clipboard is the view's, not the field's — the same
+                // division every other field draws.
+                Some(editor::Reply::Ignored) if mods.secondary && key == "v" => {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        if let Some(name) = self.naming.as_mut() {
+                            name.insert(&text);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            cx.notify();
+            return;
         }
 
         // A measurement being named. The third text field in the app, and it
@@ -13826,6 +14074,76 @@ impl BoardView {
         )
     }
 
+    /// The one-line question `Ctrl N` asks: what is the board called?
+    ///
+    /// The same fixture as [`Self::measure_bar`], in the same place, for the
+    /// same reasons — and never up at the same time, because arming either
+    /// question puts the other away. The placeholder is the default answer
+    /// spelled out: Enter on an empty field makes `untitled`, exactly what
+    /// the command made before it learned to ask.
+    fn name_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let name = self.naming.as_ref()?;
+        let theme = self.theme;
+        Some(
+            div()
+                .absolute()
+                .bottom(px(STATUS_HEIGHT))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .pb(px(14.0))
+                // Chrome over a live board — see `measure_bar`, which stops
+                // the same three buttons for the same reason.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .px(px(12.0))
+                        .py(px(8.0))
+                        .rounded(px(crate::theme::RADIUS_MD))
+                        .bg(theme.chrome)
+                        .border_1()
+                        .border_color(theme.chrome_edge)
+                        .text_size(px(12.0))
+                        .child(div().flex_none().text_color(theme.text).child("Name the new board"))
+                        .child(div().min_w(px(160.0)).max_w(px(260.0)).child(
+                            crate::palette::query_line(name, "untitled", 13.0, true, &theme),
+                        ))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(10.5))
+                                .text_color(theme.muted)
+                                .child("enter to make it \u{00b7} esc to cancel"),
+                        )
+                        .child(
+                            div()
+                                .id("name-close")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(22.0))
+                                .rounded(px(crate::theme::RADIUS_SM))
+                                .hover(|s| s.bg(theme.accent.opacity(0.16)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.naming = None;
+                                        cx.notify();
+                                        cx.stop_propagation();
+                                    }),
+                                )
+                                .child(icon(Icon::Close, ICON_SM, theme.muted)),
+                        ),
+                ),
+        )
+    }
+
     /// The one-line question the measuring mode asks: how long is that?
     ///
     /// `None` until there is a line to ask about — while the mode is merely
@@ -16123,6 +16441,21 @@ impl Render for BoardView {
         // indicator anywhere in this app.
         self.arm_autosave(cx);
 
+        // The operating system's own titlebar follows the board's title, the
+        // same words `main.rs` opens the window with — said again only when
+        // they change, because this runs every frame and the platform call
+        // does not need to. Here rather than on the open and rename paths
+        // because this is the one place in the app that always has a window,
+        // and it also catches the title changing under undo.
+        let titled = match self.doc.board.title.is_empty() {
+            true => "mbrd".to_string(),
+            false => format!("{} \u{2014} mbrd", self.doc.board.title),
+        };
+        if self.titled != titled {
+            window.set_window_title(&titled);
+            self.titled = titled;
+        }
+
         // Hand back the atlas tiles of anything the cache evicted since the
         // last frame. Here because this is the one place in the frame that has
         // a window, and skipping it does not break anything visible — it just
@@ -16281,6 +16614,7 @@ impl Render for BoardView {
                     .child(tools)
                     .children(self.tour_bar(cx))
                     .children(self.measure_bar(cx))
+                    .children(self.name_bar(cx))
                     .child(self.status_bar())
                     // Above the strip as well as the board: a menu opened near
                     // the bottom of the window flips upward, but one opened on
