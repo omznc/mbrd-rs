@@ -122,6 +122,18 @@ pub struct Welcome {
     /// Whether the folder field is wearing the keyboard. Only ever true on
     /// [`Step::Boards`], which is the only page with anything to type into.
     pub focused: bool,
+    /// Which of the current page's controls the keyboard is on.
+    ///
+    /// **This screen could be walked and not answered.** The rail moved with
+    /// Enter, Tab and the arrows from the beginning, and none of the controls
+    /// *on* a page could be reached at all — so the appearance question could be
+    /// paged past but not answered, and on the last page `go(1)` clamps, which
+    /// meant Enter did nothing and the four doors were pointer-only. The first
+    /// of them is drawn accented specifically to read as the default answer.
+    ///
+    /// Reset on every page change: an index into one page's controls means
+    /// nothing on the next.
+    pub focus: Option<usize>,
     pub picking: Option<Picker>,
 }
 
@@ -145,6 +157,7 @@ impl Welcome {
             steps,
             folder: Editor::new(shown, PATH_MAX, false),
             focused: false,
+            focus: None,
             picking: None,
         }
     }
@@ -173,6 +186,7 @@ impl Welcome {
     pub fn go(&mut self, by: isize) {
         let at = (self.at() as isize + by).clamp(0, self.steps.len() as isize - 1);
         self.step = self.steps[at as usize];
+        self.focus = None;
         // Leaving the folder page puts the field down. Carrying `focused`
         // onto a page with no field would leave a caret drawn on the page
         // somebody moved to.
@@ -186,6 +200,7 @@ impl Welcome {
             return;
         }
         self.step = step;
+        self.focus = None;
         if step != Step::Boards {
             self.focused = false;
         }
@@ -196,12 +211,16 @@ impl Welcome {
     /// `names` is the theme list a picker is choosing from, empty except while
     /// one is open — passed in for the reason `settings::Page::key` documents:
     /// the registry lives on the view and this is a plain struct.
+    /// `count` is how many controls the page currently showing has — worked out
+    /// by the view through [`controls`], for the same reason `names` is passed
+    /// in: this is a plain struct and the answer depends on the prefs.
     pub fn key(
         &mut self,
         key: &str,
         mods: Modifiers,
         text: Option<&str>,
         names: &[String],
+        count: usize,
     ) -> settings::Reply {
         if self.picking.is_some() {
             return settings::picker_key(&mut self.picking, key, mods, text, names);
@@ -230,12 +249,35 @@ impl Welcome {
             }
         }
 
+        // The controls *on* the page, which until now could not be reached at
+        // all. Tab and the vertical arrows walk them; the horizontal arrows are
+        // still the rail, because walking the four pages is the more common
+        // thing and it had them first.
+        let controls = count;
         match key {
-            // Enter is Next everywhere but the last page, where `go` clamps
-            // and it does nothing — which is right: the last page's answer is
-            // which of the four doors, and there is no default among them.
+            "tab" if controls > 0 => {
+                let by = if mods.shift { -1 } else { 1 };
+                self.focus = Some(settings::step_focus(self.focus, by, controls));
+                return settings::Reply::Held;
+            }
+            "down" | "up" if controls > 0 => {
+                let by = if key == "up" { -1 } else { 1 };
+                self.focus = Some(settings::step_focus(self.focus, by, controls));
+                return settings::Reply::Held;
+            }
+            // Enter answers the ring where there is one. Where there is not, it
+            // is Next — except on the last page, which has no next and whose
+            // first door is drawn as the default answer. So a bare Enter there
+            // takes it, which is what the accent has been promising all along.
+            "enter" if self.focus.is_some() => {
+                return settings::Reply::Press(self.focus.unwrap_or(0))
+            }
+            "enter" if self.at() + 1 == self.steps.len() && controls > 0 => {
+                return settings::Reply::Press(0)
+            }
             "enter" | "right" | "tab" => self.go(1),
             "left" => self.go(-1),
+            "escape" => {}
             _ => {}
         }
         settings::Reply::Held
@@ -247,6 +289,74 @@ impl Welcome {
             Some(picker) => picker.query.insert(text),
             None => self.folder.insert(text),
         }
+    }
+}
+
+/// What the keyboard can reach on the page currently showing, in the order it
+/// is drawn.
+///
+/// **One list, read by the ring and by nothing else.** It has to stay in step
+/// with what each page below actually draws, and nothing enforces that: this
+/// screen's pages are four hand-written functions rather than a list of rows
+/// like the settings page's, so a control added to one of them has to be added
+/// here too. That is the standing cost of the shape, and it is written down
+/// here because there is no test that can catch it — every arm needs a
+/// `BoardView`, which these tests cannot build.
+pub fn controls(screen: &Welcome, view: &BoardView) -> Vec<settings::Does> {
+    use settings::Does;
+    match screen.step {
+        Step::Appearance => {
+            let modes = [Mode::System, Mode::Light, Mode::Dark];
+            vec![
+                Does::Step {
+                    pick: |this, at, cx| {
+                        this.set_mode([Mode::System, Mode::Light, Mode::Dark][at], cx)
+                    },
+                    count: modes.len(),
+                    at: modes.iter().position(|&m| m == view.prefs.mode).unwrap_or(0),
+                },
+                Does::PickTheme(Appearance::Dark),
+                Does::PickTheme(Appearance::Light),
+            ]
+        }
+        // The field takes its own keys; this is the button beside it.
+        Step::Boards => vec![Does::Press(|this, cx| this.browse_for_boards(cx))],
+        Step::Behaviour => {
+            let at = settings::GRID_STEPS
+                .iter()
+                .position(|s| (*s - view.prefs.new_board.grid_step).abs() < 0.5)
+                .unwrap_or(0);
+            vec![
+                Does::Flip(Command::ToggleMotion),
+                Does::Flip(Command::ToggleUpdateChecks),
+                Does::Press(|this, cx| {
+                    this.set_new_board_snap(!this.prefs.new_board.snap, cx);
+                }),
+                Does::Step {
+                    pick: |this, at, cx| this.set_new_board_step(settings::GRID_STEPS[at], cx),
+                    count: settings::GRID_STEPS.len(),
+                    at,
+                },
+            ]
+        }
+        // The four doors, in the order they are drawn. The first is the one
+        // drawn accented, so a bare Enter on this page now answers with the
+        // thing the page already looks like it is offering.
+        Step::Started => vec![
+            Does::Go(|this, window, cx| {
+                this.close_welcome(cx);
+                Command::NewBoard.run(this, window, cx);
+            }),
+            Does::Go(|this, window, cx| {
+                this.close_welcome(cx);
+                this.open_switcher(window, cx);
+            }),
+            Does::Go(|this, _window, cx| this.close_welcome(cx)),
+            Does::Go(|this, window, cx| {
+                this.close_welcome(cx);
+                Command::Tour.run(this, window, cx);
+            }),
+        ],
     }
 }
 
@@ -481,10 +591,10 @@ fn walk(
 
 fn body(screen: &Welcome, view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
     match screen.step {
-        Step::Appearance => appearance(view, cx),
+        Step::Appearance => appearance(screen.focus, view, cx),
         Step::Boards => boards(screen, view, cx),
-        Step::Behaviour => behaviour(view, cx),
-        Step::Started => started(view, cx),
+        Step::Behaviour => behaviour(screen.focus, view, cx),
+        Step::Started => started(screen.focus, view, cx),
     }
 }
 
@@ -513,7 +623,7 @@ fn over(words: &'static str, theme: Theme) -> AnyElement {
 // 1 · Appearance
 // ---------------------------------------------------------------------------
 
-fn appearance(view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
+fn appearance(focus: Option<usize>, view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
     let theme = view.theme;
     let modes = [Mode::System, Mode::Light, Mode::Dark];
     let labels: Vec<String> = modes.iter().map(|m| m.label().to_string()).collect();
@@ -530,14 +640,27 @@ fn appearance(view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
             // control stretched to the column's width reads as a toolbar
             // rather than as one setting with three answers — the container
             // is the whole of what says the options belong together.
-            .child(div().flex().child(settings::segmented(
-                "welcome-mode",
-                &labels,
-                modes.iter().position(|&m| m == view.prefs.mode),
-                |this, at, cx| this.set_mode([Mode::System, Mode::Light, Mode::Dark][at], cx),
-                view,
-                cx,
-            ))),
+            .child(
+                div()
+                    .flex()
+                    .when(focus == Some(0), |d| {
+                        d.rounded(px(crate::theme::RADIUS_SM))
+                            .border_1()
+                            .border_color(theme.accent.opacity(0.6))
+                            .p(px(2.0))
+                            .m(px(-3.0))
+                    })
+                    .child(settings::segmented(
+                        "welcome-mode",
+                        &labels,
+                        modes.iter().position(|&m| m == view.prefs.mode),
+                        |this, at, cx| {
+                            this.set_mode([Mode::System, Mode::Light, Mode::Dark][at], cx)
+                        },
+                        view,
+                        cx,
+                    )),
+            ),
     );
 
     // Both slots, always, and in the order the app is most likely wearing —
@@ -546,7 +669,10 @@ fn appearance(view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
     // half you are not looking at has to be reachable while you are not
     // looking at it.
     let mut pair = div().flex().flex_col().gap(px(8.0));
-    for appearance in [Appearance::Dark, Appearance::Light] {
+    for (slot, appearance) in [Appearance::Dark, Appearance::Light].into_iter().enumerate() {
+        // 1 and 2: the mode control above them is 0. See `controls`, which is
+        // the list this has to agree with.
+        let ringed = focus == Some(slot + 1);
         let name = view.prefs.theme_for(appearance).to_string();
         let known = view.themes.knows(&name, appearance);
         let id = match appearance {
@@ -580,15 +706,25 @@ fn appearance(view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
                             )
                         }),
                 )
-                .child(settings::dropdown(
-                    id,
-                    appearance,
-                    &name,
-                    known,
-                    theme,
-                    cx,
-                    |this, appearance, cx| this.pick_welcome_theme(appearance, cx),
-                )),
+                .child(
+                    div()
+                        .when(ringed, |d| {
+                            d.rounded(px(crate::theme::RADIUS_SM))
+                                .border_1()
+                                .border_color(theme.accent.opacity(0.6))
+                                .p(px(2.0))
+                                .m(px(-3.0))
+                        })
+                        .child(settings::dropdown(
+                            id,
+                            appearance,
+                            &name,
+                            known,
+                            theme,
+                            cx,
+                            |this, appearance, cx| this.pick_welcome_theme(appearance, cx),
+                        )),
+                ),
         );
     }
     choices = choices.child(pair);
@@ -835,14 +971,24 @@ fn boards(screen: &Welcome, view: &BoardView, cx: &mut Context<BoardView>) -> An
                             ),
                         )),
                 )
-                .child(settings::button(
-                    "welcome-browse",
-                    "Browse…",
-                    true,
-                    theme,
-                    cx,
-                    |this, cx| this.browse_for_boards(cx),
-                )),
+                .child(
+                    div()
+                        .when(screen.focus == Some(0), |d| {
+                            d.rounded(px(crate::theme::RADIUS_SM))
+                                .border_1()
+                                .border_color(theme.accent.opacity(0.6))
+                                .p(px(2.0))
+                                .m(px(-3.0))
+                        })
+                        .child(settings::button(
+                            "welcome-browse",
+                            "Browse…",
+                            true,
+                            theme,
+                            cx,
+                            |this, cx| this.browse_for_boards(cx),
+                        )),
+                ),
         )
         // What will actually happen, in the words of the path it will happen
         // in. A field is a promise and this is the receipt for it.
@@ -885,7 +1031,7 @@ fn boards(screen: &Welcome, view: &BoardView, cx: &mut Context<BoardView>) -> An
 // 3 · How it behaves
 // ---------------------------------------------------------------------------
 
-fn behaviour(view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
+fn behaviour(focus: Option<usize>, view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
     let theme = view.theme;
     let motion_note = crate::prefs::Prefs::forced(crate::prefs::Setting::Motion)
         .map(|var| format!("Set by {var} at startup. Changing it here holds until you quit."));
@@ -913,6 +1059,7 @@ fn behaviour(view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
                 "Let the interface move. Turn off to land every change instantly.".into()
             }),
             command_switch(Command::ToggleMotion, view, cx),
+            focus == Some(0),
             theme,
         ))
         .child(row(
@@ -921,6 +1068,7 @@ fn behaviour(view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
                 "Check quietly at startup and say so in the top bar when one exists.".into()
             }),
             command_switch(Command::ToggleUpdateChecks, view, cx),
+            focus == Some(1),
             theme,
         ))
         // The heading is load-bearing rather than decorative: it is the whole
@@ -944,6 +1092,7 @@ fn behaviour(view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
                 cx,
                 |this, _window, cx| this.set_new_board_snap(!this.prefs.new_board.snap, cx),
             ),
+            focus == Some(2),
             theme,
         ))
         .child(row(
@@ -957,6 +1106,7 @@ fn behaviour(view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
                 view,
                 cx,
             ),
+            focus == Some(3),
             theme,
         ))
         .into_any_element()
@@ -982,6 +1132,7 @@ fn row(
     title: impl Into<SharedString>,
     about: impl Into<SharedString>,
     control: AnyElement,
+    focused: bool,
     theme: Theme,
 ) -> AnyElement {
     div()
@@ -992,6 +1143,17 @@ fn row(
         .py(px(11.0))
         .border_t_1()
         .border_color(theme.chrome_edge.opacity(0.6))
+        // The ring, on the row rather than on the control, for the reason
+        // `settings::Spec::into_row` gives: the controls are all in one column
+        // and lighting only the control puts the focus where the eye has to
+        // hunt for it.
+        .when(focused, |d| {
+            d.bg(theme.accent.opacity(0.08))
+                .border_color(theme.accent.opacity(0.5))
+                .rounded(px(crate::theme::RADIUS_SM))
+                .px(px(8.0))
+                .mx(px(-8.0))
+        })
         .child(
             div()
                 .flex()
@@ -1015,7 +1177,7 @@ fn row(
 // 4 · Four doors
 // ---------------------------------------------------------------------------
 
-fn started(view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
+fn started(focus: Option<usize>, view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
     let theme = view.theme;
     div()
         .flex()
@@ -1032,6 +1194,7 @@ fn started(view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
                     "Create a board",
                     "Name it, and land on empty paper.",
                     true,
+                    focus == Some(0),
                     theme,
                     cx,
                     |this, window, cx| {
@@ -1045,6 +1208,7 @@ fn started(view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
                     "Open a board",
                     "The switcher, or a file anywhere on disk.",
                     false,
+                    focus == Some(1),
                     theme,
                     cx,
                     |this, window, cx| {
@@ -1058,6 +1222,7 @@ fn started(view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
                     "Look around the demo",
                     "A few cards and a note on how to move.",
                     false,
+                    focus == Some(2),
                     theme,
                     cx,
                     |this, _window, cx| this.close_welcome(cx),
@@ -1068,6 +1233,7 @@ fn started(view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
                     "Take the tour",
                     "Every stop on the demonstration board.",
                     false,
+                    focus == Some(3),
                     theme,
                     cx,
                     |this, window, cx| {
@@ -1091,6 +1257,7 @@ fn door(
     title: &'static str,
     blurb: &'static str,
     first: bool,
+    ringed: bool,
     theme: Theme,
     cx: &mut Context<BoardView>,
     press: fn(&mut BoardView, &mut gpui::Window, &mut Context<BoardView>),
@@ -1105,8 +1272,15 @@ fn door(
         .p(px(16.0))
         .rounded(px(crate::theme::RADIUS_MD))
         .border_1()
-        .border_color(if first { theme.accent } else { theme.chrome_edge })
-        .bg(if first { theme.accent.opacity(0.10) } else { theme.chrome })
+        .border_color(if first || ringed { theme.accent } else { theme.chrome_edge })
+        // The ring is a fill rather than a border here, because the first door
+        // already wears the accent on its edge to say it is the default — two
+        // accents on two edges would be two doors claiming to be the answer.
+        .bg(match (first, ringed) {
+            (_, true) => theme.accent.opacity(0.22),
+            (true, false) => theme.accent.opacity(0.10),
+            (false, false) => theme.chrome,
+        })
         .hover(|s| s.bg(theme.accent.opacity(if first { 0.18 } else { 0.08 })))
         .active(|s| s.bg(theme.accent.opacity(0.26)))
         .on_mouse_down(
@@ -1163,7 +1337,7 @@ mod tests {
             let mut w = screen();
             w.show(step);
             assert_eq!(
-                w.key("escape", Modifiers::default(), None, &[]),
+                w.key("escape", Modifiers::default(), None, &[], 0),
                 settings::Reply::Close,
                 "{step:?}"
             );
@@ -1179,7 +1353,7 @@ mod tests {
         w.show(Step::Boards);
         w.folder = Editor::new("", PATH_MAX, false);
         for letter in ["n", "o", "t", "e", "s"] {
-            w.key(letter, Modifiers::default(), Some(letter), &[]);
+            w.key(letter, Modifiers::default(), Some(letter), &[], 0);
         }
         assert_eq!(w.step, Step::Boards, "the field kept the keys");
         assert_eq!(w.folder.text(), "notes");
@@ -1193,6 +1367,56 @@ mod tests {
         assert!(w.folder_text().is_some());
         w.folder = Editor::new("   ", PATH_MAX, false);
         assert_eq!(w.folder_text(), None);
+    }
+
+    #[test]
+    fn the_last_page_answers_enter_with_the_door_it_is_offering() {
+        // `go(1)` clamps on the last page, so Enter there used to do nothing at
+        // all — on the one page whose first control is drawn accented precisely
+        // to read as the default answer. The four doors were pointer-only.
+        let mut w = screen();
+        w.show(Step::Started);
+        assert_eq!(w.key("enter", Modifiers::default(), None, &[], 4), settings::Reply::Press(0));
+    }
+
+    #[test]
+    fn tab_walks_the_controls_on_a_page_and_wraps() {
+        // None of these could be reached before: the rail took Tab and the
+        // arrows, and the controls on a page took nothing.
+        let mut w = screen();
+        w.show(Step::Behaviour);
+        assert_eq!(w.focus, None, "a page opened to be read has no ring on it");
+
+        w.key("tab", Modifiers::default(), None, &[], 4);
+        assert_eq!(w.focus, Some(0));
+        w.key("down", Modifiers::default(), None, &[], 4);
+        assert_eq!(w.focus, Some(1));
+
+        // And round, rather than stopping dead, which is what Tab has always
+        // done everywhere else.
+        for _ in 0..3 {
+            w.key("tab", Modifiers::default(), None, &[], 4);
+        }
+        assert_eq!(w.focus, Some(0));
+
+        let back = Modifiers { shift: true, ..Default::default() };
+        w.key("tab", back, None, &[], 4);
+        assert_eq!(w.focus, Some(3));
+
+        // Enter answers the ring rather than walking the rail.
+        assert_eq!(w.key("enter", Modifiers::default(), None, &[], 4), settings::Reply::Press(3));
+        assert_eq!(w.step, Step::Behaviour, "Enter on a ring is not Next");
+    }
+
+    #[test]
+    fn changing_page_puts_the_ring_down() {
+        // An index into one page's controls means nothing on the next.
+        let mut w = screen();
+        w.show(Step::Behaviour);
+        w.key("tab", Modifiers::default(), None, &[], 4);
+        assert_eq!(w.focus, Some(0));
+        w.go(1);
+        assert_eq!(w.focus, None);
     }
 
     #[test]

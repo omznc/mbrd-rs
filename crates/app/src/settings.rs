@@ -268,6 +268,21 @@ pub struct Page {
     /// an empty field, which reads as a text box that has seized the page
     /// rather than one waiting to be used.
     pub focused: bool,
+    /// Which of the shown rows the keyboard is on.
+    ///
+    /// `None` until somebody presses Tab or an arrow, so a page opened to be
+    /// read is not a page with a ring already sitting on its first row. An
+    /// index into the list `render` draws, which is why [`Page::shown`] exists.
+    pub focus: Option<usize>,
+    /// How many rows are on screen, written by `render` and read by
+    /// [`Page::key`].
+    ///
+    /// A `Cell` because `render` takes `&Page` — the page is behind the
+    /// overlay and the paint does not own it — and because this is a fact about
+    /// the last frame rather than a decision. The alternative is for `key` to
+    /// rebuild every row to count them, which means building forty `div`s to
+    /// answer "is there a row below this one".
+    pub shown: std::cell::Cell<usize>,
     pub picking: Option<Picker>,
 }
 
@@ -278,6 +293,8 @@ impl Page {
             open: [true; 2],
             query: Editor::new("", 64, false),
             focused: false,
+            focus: None,
+            shown: std::cell::Cell::new(0),
             picking: None,
         }
     }
@@ -333,6 +350,16 @@ pub enum Reply {
     /// the Appearance page is for.
     /// Ctrl V, which needs the clipboard, which is the view's.
     Paste,
+    /// Enter on the focused row, by index into what `render` last drew.
+    ///
+    /// The index rather than the action, because a `Spec` is built from the
+    /// view and thrown away every frame — the page has no way to hold one. The
+    /// view rebuilds the same list through `shown_rows` and reads the `Does`
+    /// off the row this lands on.
+    Press(usize),
+    /// Left or right on the focused row: `-1` or `1`. Only a segmented control
+    /// does anything with it.
+    Nudge(usize, isize),
     /// The welcome screen's folder field took the key and its text may now be
     /// different. The view writes it through to the prefs — see
     /// `BoardView::commit_welcome_folder`.
@@ -362,11 +389,13 @@ impl Page {
             return self.picker_key(key, mods, text, names);
         }
 
-        // Escape clears the search before it closes the page. Somebody who
-        // has typed something and wants the whole page back should not have
-        // to reopen it, and the two meanings never collide: an empty field
-        // has nothing to clear.
+        // Escape gives up the focus ring first, then the search, then the page.
+        // Three things to back out of and one key, in the order they were most
+        // recently taken on.
         if key == "escape" {
+            if self.focus.take().is_some() {
+                return Reply::Held;
+            }
             if self.searching() {
                 self.query = Editor::new("", 64, false);
                 self.focused = false;
@@ -375,12 +404,51 @@ impl Page {
             return Reply::Close;
         }
 
+        // **Walking the rows, which this page could not do at all.** Every
+        // control on it is `on_mouse_down`, and everything that was not Escape
+        // went into the search field — so the grid step, the card gap, the media
+        // fit, the boards folder and all four buttons were reachable with a
+        // pointer and by no other means.
+        //
+        // Tab and the vertical arrows walk; the field keeps every printable key,
+        // so typing to search still works from the moment the page opens and
+        // does not have to be aimed at first.
+        let rows = self.shown.get();
+        match key {
+            "tab" if rows > 0 => {
+                let by = if mods.shift { -1 } else { 1 };
+                self.focus = Some(step_focus(self.focus, by, rows));
+                self.focused = false;
+                return Reply::Held;
+            }
+            "down" | "up" if rows > 0 => {
+                let by = if key == "up" { -1 } else { 1 };
+                self.focus = Some(step_focus(self.focus, by, rows));
+                self.focused = false;
+                return Reply::Held;
+            }
+            // Only once a row has been aimed at. Left and right are a segmented
+            // control's own keys, and Enter answers whatever the row is — the
+            // view resolves which, because the rows live there.
+            "left" | "right" if self.focus.is_some() => {
+                let at = self.focus.unwrap_or(0);
+                return Reply::Nudge(at, if key == "left" { -1 } else { 1 });
+            }
+            "enter" | "space" if self.focus.is_some() => {
+                return Reply::Press(self.focus.unwrap_or(0));
+            }
+            _ => {}
+        }
+
         let reply = self.query.key(key, editor::Mods::from(mods), text);
         // A press the field did something with is somebody using the field,
         // whether or not they ever pointed at it. A press it ignored — an
         // arrow key, a bare modifier — is not, and must not light it up.
         if reply != editor::Reply::Ignored {
             self.focused = true;
+            // The list is about to be a different list, and an index into the
+            // old one points at whatever happens to be there now.
+            self.focus = None;
         }
         if reply == editor::Reply::Ignored && mods.secondary() && key == "v" {
             return Reply::Paste;
@@ -404,6 +472,48 @@ impl Page {
             Some(picker) => picker.query.insert(text),
             None => self.query.insert(text),
         }
+    }
+}
+
+impl Does {
+    /// Do it. `by` is the direction for a segmented control and is ignored by
+    /// everything else — Enter arrives as `0` and takes the next one round,
+    /// so a row reached by Tab alone is still answerable without the arrows.
+    pub(crate) fn run(
+        self,
+        view: &mut BoardView,
+        by: isize,
+        window: &mut gpui::Window,
+        cx: &mut Context<BoardView>,
+    ) {
+        match self {
+            Self::Flip(command) => command.run(view, window, cx),
+            Self::Step { pick, count, at } => {
+                if count == 0 {
+                    return;
+                }
+                let step = if by == 0 { 1 } else { by };
+                let next = (at as isize + step).rem_euclid(count as isize) as usize;
+                pick(view, next, cx);
+            }
+            Self::Press(press) => press(view, cx),
+            Self::PickTheme(appearance) => view.pick_theme(appearance, cx),
+            Self::Go(go) => go(view, window, cx),
+        }
+    }
+}
+
+/// Where the ring goes next, wrapping at both ends.
+///
+/// Wrapping rather than stopping, which is the opposite of what the switcher's
+/// list does — and the difference is that this is a *ring around a page* rather
+/// than an aim at a list. Tab has wrapped since Tab existed, and a Tab that
+/// stopped dead on the last row would read as the key having broken.
+pub(crate) fn step_focus(from: Option<usize>, by: isize, rows: usize) -> usize {
+    match from {
+        None if by < 0 => rows - 1,
+        None => 0,
+        Some(at) => (at as isize + by).rem_euclid(rows as isize) as usize,
     }
 }
 
@@ -511,13 +621,22 @@ pub fn render(page: &Page, view: &BoardView, cx: &mut Context<BoardView>) -> imp
         let mut hits: Vec<(i32, Spec)> =
             all.into_iter().filter_map(|spec| score(&query, &spec).map(|s| (s, spec))).collect();
         hits.sort_by_key(|a| std::cmp::Reverse(a.0));
-        hits.into_iter().map(|(_, spec)| spec.into_row(true, theme)).collect()
+        hits.into_iter()
+            .enumerate()
+            .map(|(i, (_, spec))| spec.into_row(true, page.focus == Some(i), theme))
+            .collect()
     } else {
         all.into_iter()
             .filter(|spec| spec.section == page.section)
-            .map(|spec| spec.into_row(false, theme))
+            .enumerate()
+            .map(|(i, spec)| spec.into_row(false, page.focus == Some(i), theme))
             .collect()
     };
+    // What the arrows are walking, recorded where the key path can read it.
+    // `render` is the only thing that knows how long the list is — the filter
+    // and the search both live here — and `Page::key` is a plain struct with no
+    // view to ask. See `Page::focus`.
+    page.shown.set(shown.len());
     let nothing_matched = shown.is_empty();
 
     div()
@@ -948,21 +1067,62 @@ fn group_block(
 /// A struct rather than a finished `AnyElement`, because the page has to be
 /// able to *match* on a row's words — see the module note on searching — and
 /// a row that had already become a `div` would have thrown them away.
-struct Spec {
+pub(crate) struct Spec {
     section: Section,
     title: SharedString,
     about: SharedString,
     control: AnyElement,
+    /// What the keyboard does to this row, if anything.
+    ///
+    /// **The page had no keyboard at all.** Every control on it was
+    /// `on_mouse_down` and `Page::key` sent everything but Escape into the
+    /// search field, so the grid step, the card gap, the media fit, the boards
+    /// folder and all four buttons could only be reached with a pointer. The
+    /// toggles had a way round — they are `Command`s, so the palette reaches
+    /// them — and nothing else did.
+    ///
+    /// `None` for a row with nothing to do: pressing one is simply nothing,
+    /// the same way the menus' keyboard walks past a rule.
+    pub(crate) does: Option<Does>,
+}
+
+/// What pressing a focused row does.
+///
+/// An enum rather than a closure because a `Spec` is rebuilt every frame and
+/// this has to survive being handed back out of the key path — see
+/// `BoardView::press_settings_row`, which rebuilds the list to find the row the
+/// focus is on. Four kinds, which is every control this page has.
+#[derive(Clone, Copy)]
+pub(crate) enum Does {
+    /// A switch. Enter flips it.
+    Flip(Command),
+    /// A segmented control. Left and right walk it; Enter takes the next one
+    /// round, so a row reached by Tab alone is still answerable.
+    Step { pick: fn(&mut BoardView, usize, &mut Context<BoardView>), count: usize, at: usize },
+    /// A button. Enter presses it.
+    Press(fn(&mut BoardView, &mut Context<BoardView>)),
+    /// A theme dropdown. Enter opens the picker, which has its own keyboard
+    /// already and is the model the rest of this is written to match.
+    PickTheme(Appearance),
+    /// A button that needs the window as well — the welcome screen's four
+    /// doors, which open a board, a switcher or the tour.
+    Go(fn(&mut BoardView, &mut gpui::Window, &mut Context<BoardView>)),
 }
 
 impl Spec {
+    /// Say what the keyboard does to this row.
+    fn does(mut self, does: Does) -> Self {
+        self.does = Some(does);
+        self
+    }
+
     /// One setting: a name, the sentence under it, and its control at the
     /// edge.
     ///
     /// The ruled line belongs to the row rather than the list so every row is
     /// the same shape; the last one's rule reads as the section's own edge.
-    fn into_row(self, say_where: bool, theme: Theme) -> AnyElement {
-        let Self { section, title, about, control } = self;
+    fn into_row(self, say_where: bool, focused: bool, theme: Theme) -> AnyElement {
+        let Self { section, title, about, control, does: _ } = self;
         div()
             .flex()
             .items_center()
@@ -971,6 +1131,17 @@ impl Spec {
             .py(px(13.0))
             .border_b_1()
             .border_color(theme.chrome_edge.opacity(0.6))
+            // The ring, and it is the row rather than the control: a settings
+            // row is a name, a sentence and a switch, and lighting only the
+            // switch would put the focus somewhere the eye has to hunt for it
+            // on a page where the switches are all in one column.
+            .when(focused, |d| {
+                d.bg(theme.accent.opacity(0.08))
+                    .border_color(theme.accent.opacity(0.5))
+                    .rounded(px(crate::theme::RADIUS_SM))
+                    .px(px(8.0))
+                    .mx(px(-8.0))
+            })
             .child(
                 div()
                     .flex()
@@ -1001,6 +1172,25 @@ impl Spec {
     }
 }
 
+/// The rows the page is currently showing, in the order it shows them.
+///
+/// **The same filter and the same sort `render` uses**, and deliberately so:
+/// the focus ring is an index into this list, and a key path that ordered the
+/// rows differently from the paint would activate a row somebody was not
+/// looking at. Called once per press rather than once per frame.
+pub(crate) fn shown_rows(page: &Page, view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
+    let all = rows(view, cx);
+    if page.searching() {
+        let query = page.query.text().trim().to_lowercase();
+        let mut hits: Vec<(i32, Spec)> =
+            all.into_iter().filter_map(|spec| score(&query, &spec).map(|s| (s, spec))).collect();
+        hits.sort_by_key(|a| std::cmp::Reverse(a.0));
+        hits.into_iter().map(|(_, spec)| spec).collect()
+    } else {
+        all.into_iter().filter(|spec| spec.section == page.section).collect()
+    }
+}
+
 /// How well one row answers a query, or `None` if it does not.
 ///
 /// Title and description both, at the better of the two scores. The words
@@ -1026,7 +1216,7 @@ fn spec(
     about: impl Into<SharedString>,
     control: AnyElement,
 ) -> Spec {
-    Spec { section, title: title.into(), about: about.into(), control }
+    Spec { section, title: title.into(), about: about.into(), control, does: None }
 }
 
 /// Every row the page has, in the order the sections are listed.
@@ -1074,7 +1264,12 @@ fn canvas_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
                 view,
                 cx,
             ),
-        ),
+        )
+        .does(Does::Step {
+            pick: pick_step,
+            count: GRID_STEPS.len(),
+            at: GRID_STEPS.iter().position(|&v| (v - step).abs() < 0.01).unwrap_or(0),
+        }),
     ]
 }
 
@@ -1092,7 +1287,12 @@ fn arranging_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
             view,
             cx,
         ),
-    )]
+    )
+    .does(Does::Step {
+        pick: pick_gap,
+        count: GAPS.len(),
+        at: GAPS.iter().position(|&v| (v - gap).abs() < 0.01).unwrap_or(0),
+    })]
 }
 
 fn media_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
@@ -1104,7 +1304,8 @@ fn media_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
         "Media fit",
         "How photos and videos sit in their cards: the whole picture with margins, or the whole card with crops. A card's own menu can override it.",
         segmented("media-fit", &fits, chosen, pick_fit, view, cx),
-    )]
+    )
+    .does(Does::Step { pick: pick_fit, count: fits.len(), at: chosen.unwrap_or(0) })]
 }
 
 fn general_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
@@ -1155,7 +1356,8 @@ fn general_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
             button("settings-boards-folder", "Browse…", true, theme, cx, |this, cx| {
                 this.browse_for_boards(cx);
             }),
-        ),
+        )
+        .does(Does::Press(|this, cx| this.browse_for_boards(cx))),
         spec(
             Section::General,
             "Snap new boards to the grid",
@@ -1167,7 +1369,10 @@ fn general_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
                 cx,
                 |this, _window, cx| this.set_new_board_snap(!this.prefs.new_board.snap, cx),
             ),
-        ),
+        )
+        .does(Does::Press(|this, cx| {
+            this.set_new_board_snap(!this.prefs.new_board.snap, cx);
+        })),
         spec(
             Section::General,
             "Grid step for new boards",
@@ -1181,7 +1386,12 @@ fn general_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
                 view,
                 cx,
             ),
-        ),
+        )
+        .does(Does::Step {
+            pick: |this, at, cx| this.set_new_board_step(GRID_STEPS[at], cx),
+            count: GRID_STEPS.len(),
+            at: chosen.unwrap_or(0),
+        }),
         toggle(
             Section::General,
             Command::ToggleLinkFetch,
@@ -1203,7 +1413,8 @@ fn general_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
             button("settings-welcome", "Run setup again", true, theme, cx, |this, cx| {
                 this.open_welcome(cx);
             }),
-        ),
+        )
+        .does(Does::Press(|this, cx| this.open_welcome(cx))),
     ]
 }
 
@@ -1251,7 +1462,12 @@ fn appearance_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
             view,
             cx,
         ),
-    )];
+    )
+    .does(Does::Step {
+        pick: pick_mode,
+        count: modes.len(),
+        at: modes.iter().position(|&m| m == view.prefs.mode).unwrap_or(0),
+    })];
 
     // Both rows, always, and the one not currently being worn is drawn
     // quieter rather than hidden. A row that disappears is a row somebody
@@ -1287,43 +1503,49 @@ fn appearance_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
             Appearance::Dark => "settings-theme-dark",
             Appearance::Light => "settings-theme-light",
         };
-        all.push(spec(
-            Section::Appearance,
-            format!("{} theme", appearance.label()),
-            about,
-            dropdown(id, appearance, &name, known, theme, cx, |this, appearance, cx| {
-                this.pick_theme(appearance, cx)
-            }),
-        ));
+        all.push(
+            spec(
+                Section::Appearance,
+                format!("{} theme", appearance.label()),
+                about,
+                dropdown(id, appearance, &name, known, theme, cx, |this, appearance, cx| {
+                    this.pick_theme(appearance, cx)
+                }),
+            )
+            .does(Does::PickTheme(appearance)),
+        );
     }
 
-    all.push(spec(
-        Section::Appearance,
-        "Themes folder",
-        match crate::dirs::themes() {
-            Some(path) => {
-                // Named, and with the reason. This was a count, and a count is
-                // the one thing nobody can act on: "one file there could not be
-                // read" is the same sentence whether the folder holds one theme
-                // or forty, and it does not say which of the two silences a
-                // misspelled key fell into. See `themes::Complaint`.
-                let said = match view.themes.complaints.as_slice() {
-                    [] => "Everything there was read.".to_string(),
-                    [one] => format!("{} {}.", one.file, one.why),
-                    many => many
-                        .iter()
-                        .map(|c| format!("{} {}", c.file, c.why))
-                        .collect::<Vec<_>>()
-                        .join("; "),
-                };
-                format!("Drop a .json in {} and press Reload. {said}", path.display())
-            }
-            None => "There is nowhere on this computer to keep themes.".into(),
-        },
-        button("settings-reload-themes", "Reload", true, theme, cx, |this, cx| {
-            this.reload_themes(cx);
-        }),
-    ));
+    all.push(
+        spec(
+            Section::Appearance,
+            "Themes folder",
+            match crate::dirs::themes() {
+                Some(path) => {
+                    // Named, and with the reason. This was a count, and a count is
+                    // the one thing nobody can act on: "one file there could not be
+                    // read" is the same sentence whether the folder holds one theme
+                    // or forty, and it does not say which of the two silences a
+                    // misspelled key fell into. See `themes::Complaint`.
+                    let said = match view.themes.complaints.as_slice() {
+                        [] => "Everything there was read.".to_string(),
+                        [one] => format!("{} {}.", one.file, one.why),
+                        many => many
+                            .iter()
+                            .map(|c| format!("{} {}", c.file, c.why))
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    };
+                    format!("Drop a .json in {} and press Reload. {said}", path.display())
+                }
+                None => "There is nowhere on this computer to keep themes.".into(),
+            },
+            button("settings-reload-themes", "Reload", true, theme, cx, |this, cx| {
+                this.reload_themes(cx);
+            }),
+        )
+        .does(Does::Press(|this, cx| this.reload_themes(cx))),
+    );
     all
 }
 
@@ -1593,7 +1815,7 @@ fn toggle(
         Some(words) => words.into(),
         None => about.into(),
     };
-    spec(section, command.label(), about, switch(command, on, view, cx))
+    spec(section, command.label(), about, switch(command, on, view, cx)).does(Does::Flip(command))
 }
 
 /// The switch's footprint, and how far its knob crosses it. Named because
@@ -1848,6 +2070,7 @@ fn update_row(view: &BoardView, cx: &mut Context<BoardView>) -> Spec {
             this.update_step(cx);
         }),
     )
+    .does(Does::Press(|this, cx| this.update_step(cx)))
 }
 
 #[cfg(test)]
@@ -1914,6 +2137,73 @@ mod tests {
         page.key("escape", Modifiers::default(), None, &[]);
         assert!(!page.focused, "escape clears the search and lets go of it");
         assert!(!page.searching());
+    }
+
+    #[test]
+    fn tab_walks_the_rows_and_escape_gives_them_up_before_the_page() {
+        // The page had no keyboard at all: every control on it is
+        // `on_mouse_down`, and everything but Escape went into the search
+        // field. The toggles had a way round — they are `Command`s, so the
+        // palette reaches them — and the grid step, the card gap, the media
+        // fit, the boards folder and all four buttons did not.
+        let mut page = Page::open();
+        page.shown.set(5);
+        assert_eq!(page.focus, None, "a page opened to be read has no ring on it");
+
+        page.key("tab", Modifiers::default(), None, &[]);
+        assert_eq!(page.focus, Some(0));
+        page.key("down", Modifiers::default(), None, &[]);
+        assert_eq!(page.focus, Some(1));
+        page.key("up", Modifiers::default(), None, &[]);
+        assert_eq!(page.focus, Some(0));
+
+        // Backwards off the first row is the last one, not a stop.
+        let back = Modifiers { shift: true, ..Default::default() };
+        page.key("tab", back, None, &[]);
+        assert_eq!(page.focus, Some(4));
+
+        // Enter answers the row rather than the page.
+        assert_eq!(page.key("enter", Modifiers::default(), None, &[]), Reply::Press(4));
+        assert_eq!(page.key("right", Modifiers::default(), None, &[]), Reply::Nudge(4, 1));
+        assert_eq!(page.key("left", Modifiers::default(), None, &[]), Reply::Nudge(4, -1));
+
+        // Three things to back out of and one key, most recent first.
+        assert_eq!(page.key("escape", Modifiers::default(), None, &[]), Reply::Held);
+        assert_eq!(page.focus, None, "the ring goes before the page does");
+        assert_eq!(page.key("escape", Modifiers::default(), None, &[]), Reply::Close);
+    }
+
+    #[test]
+    fn typing_puts_the_ring_down_because_the_list_is_about_to_change() {
+        // The ring is an index into what was drawn, and a search rewrites that
+        // list — so an index kept across a keystroke points at whatever landed
+        // in that slot instead.
+        let mut page = Page::open();
+        page.shown.set(5);
+        page.key("tab", Modifiers::default(), None, &[]);
+        assert_eq!(page.focus, Some(0));
+
+        page.key("g", Modifiers::default(), Some("g"), &[]);
+        assert_eq!(page.focus, None);
+        assert_eq!(page.query.text(), "g");
+    }
+
+    #[test]
+    fn a_page_with_no_rows_on_it_does_not_take_the_arrows() {
+        // A search that matched nothing. Without the guard the ring would be
+        // an index into an empty list, and `step_focus` would divide by it.
+        let mut page = Page::open();
+        page.shown.set(0);
+        page.key("tab", Modifiers::default(), None, &[]);
+        assert_eq!(page.focus, None);
+    }
+
+    #[test]
+    fn the_ring_wraps_from_nothing_in_both_directions() {
+        assert_eq!(step_focus(None, 1, 4), 0, "forwards from nowhere is the first");
+        assert_eq!(step_focus(None, -1, 4), 3, "backwards from nowhere is the last");
+        assert_eq!(step_focus(Some(3), 1, 4), 0);
+        assert_eq!(step_focus(Some(0), -1, 4), 3);
     }
 
     #[test]
