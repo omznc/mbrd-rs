@@ -5850,6 +5850,31 @@ impl BoardView {
         )
     }
 
+    /// Do whatever the settings page's focus ring is sitting on.
+    ///
+    /// The rows are built from the view and thrown away every frame, so the page
+    /// hands back an *index* and this rebuilds the same list to read the action
+    /// off it — through `settings::shown_rows`, which is the same filter and the
+    /// same sort the paint uses, because a different order here would answer a
+    /// row nobody was looking at.
+    ///
+    /// `by` is the direction for a segmented control; `0` is Enter.
+    fn press_settings_row(
+        &mut self,
+        at: usize,
+        by: isize,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Overlay::Settings(page) = &self.overlay else { return };
+        let page = page.clone();
+        let Some(does) = crate::settings::shown_rows(&page, self, cx).get(at).and_then(|r| r.does)
+        else {
+            return;
+        };
+        does.run(self, by, window, cx);
+    }
+
     pub fn close_settings(&mut self) {
         if matches!(self.overlay, Overlay::Settings(_)) {
             self.close_overlay();
@@ -5898,6 +5923,26 @@ impl BoardView {
         self.taps.forget();
         self.open_overlay(Overlay::Welcome(crate::welcome::Welcome::open(boards.as_deref())));
         cx.notify();
+    }
+
+    /// Do whatever the welcome screen's focus ring is sitting on.
+    ///
+    /// The same shape as `press_settings_row`, and for the same reason: the
+    /// controls are worked out from the view, so the screen hands back an index
+    /// and this reads the action off `welcome::controls`.
+    fn press_welcome_control(
+        &mut self,
+        at: usize,
+        by: isize,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Overlay::Welcome(screen) = &self.overlay else { return };
+        let screen = screen.clone();
+        let Some(does) = crate::welcome::controls(&screen, self).get(at).copied() else {
+            return;
+        };
+        does.run(self, by, window, cx);
     }
 
     pub fn close_welcome(&mut self, cx: &mut Context<Self>) {
@@ -10506,6 +10551,12 @@ impl BoardView {
                         }
                     }
                 }
+                // The row the ring is on, answered here because the rows are
+                // built from the view and the page cannot hold one.
+                crate::settings::Reply::Press(at) => self.press_settings_row(at, 0, window, cx),
+                crate::settings::Reply::Nudge(at, by) => {
+                    self.press_settings_row(at, by, window, cx)
+                }
                 // A name, not a palette: the page never holds colours, so a
                 // theme file reloaded underneath it cannot leave a stale one
                 // sitting in an overlay.
@@ -10547,8 +10598,14 @@ impl BoardView {
                     .unwrap_or_default(),
                 _ => Vec::new(),
             };
+            // How many controls the page showing has, worked out before the
+            // screen is borrowed — same reason as `names` just above.
+            let count = match &self.overlay {
+                Overlay::Welcome(screen) => crate::welcome::controls(screen, self).len(),
+                _ => 0,
+            };
             let Overlay::Welcome(screen) = &mut self.overlay else { unreachable!() };
-            let reply = screen.key(key, mods, event.keystroke.key_char.as_deref(), &names);
+            let reply = screen.key(key, mods, event.keystroke.key_char.as_deref(), &names, count);
             match reply {
                 crate::settings::Reply::Held => {}
                 crate::settings::Reply::Close => self.close_welcome(cx),
@@ -10573,6 +10630,10 @@ impl BoardView {
                     self.prefs.set_theme(appearance, was);
                     self.cancel_preview(cx);
                     self.retheme(cx);
+                }
+                crate::settings::Reply::Press(at) => self.press_welcome_control(at, 0, window, cx),
+                crate::settings::Reply::Nudge(at, by) => {
+                    self.press_welcome_control(at, by, window, cx)
                 }
             }
             cx.notify();
