@@ -44,11 +44,17 @@
 //! ## Reading is best-effort and silent
 //!
 //! Like `prefs.rs` and `recent.rs`. A theme file that is not JSON, or that
-//! names a colour as `"grue"`, is skipped and counted rather than thrown — the
-//! alternative is an app that will not start because of a file somebody was
-//! halfway through editing. The count is not thrown away either: the settings
-//! page says how many were unreadable, because a theme that silently does not
-//! appear in a list is indistinguishable from one that was never saved.
+//! names a colour as `"grue"`, is skipped rather than thrown — the alternative
+//! is an app that will not start because of a file somebody was halfway through
+//! editing. What went wrong is not thrown away either: the settings page names
+//! the file and says what it was, because a theme that silently does not appear
+//! in a list is indistinguishable from one that was never saved.
+//!
+//! **A key this build has no colour for is kept, and still said out loud.**
+//! Ignoring it is the promise `THEMES.md` makes, so that a theme written
+//! against a later build draws in every colour it shares with this one. But a
+//! *misspelled* key is ignored in the same silence, and the two are only
+//! tellable apart by being named — see [`Complaint`] and `theme::unknown_keys`.
 
 use std::path::PathBuf;
 
@@ -142,18 +148,50 @@ const BUILT_IN: &[(&str, &str)] = &[
     ("moss.json", include_str!("../assets/themes/moss.json")),
     ("plum.json", include_str!("../assets/themes/plum.json")),
     ("slate.json", include_str!("../assets/themes/slate.json")),
+    // Four with a hue each, and a pair apiece. The five above are variations
+    // on the two base palettes and read as one another in a list — which is
+    // most of why the dark list and the light list looked like the same list
+    // before the rows grew swatches. These are meant to be told apart at a
+    // glance: a warm orange, a cool teal, a blue, and a near-monochrome with a
+    // single red in it.
+    ("ember.json", include_str!("../assets/themes/ember.json")),
+    ("tide.json", include_str!("../assets/themes/tide.json")),
+    ("cobalt.json", include_str!("../assets/themes/cobalt.json")),
+    ("vellum.json", include_str!("../assets/themes/vellum.json")),
 ];
+
+/// Something wrong with a file in the themes directory, in the words the
+/// settings page shows.
+///
+/// A sentence rather than an error type, for the reason `theme::overlay`'s note
+/// gives about its own: nothing matches on this. It is read once, by whoever is
+/// working out why the theme they just wrote is not in the list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Complaint {
+    /// The file it is about, as it is named on disk. **The whole point.** This
+    /// used to be a count, and a count cannot be acted on: "one file there
+    /// could not be read" is the same sentence whether somebody has one theme
+    /// or forty.
+    pub file: String,
+    pub why: String,
+}
 
 /// Every theme this run can offer.
 #[derive(Debug, Clone)]
 pub struct Registry {
     themes: Vec<Named>,
-    /// Files in the themes directory that could not be read, by name.
+    /// What is wrong in the themes directory, and which file it is wrong in.
     ///
     /// Kept rather than logged. Nothing in this app has a console somebody is
     /// looking at, so a warning printed to stderr is a warning nobody receives
     /// — the settings page says this out loud instead.
-    pub unreadable: Vec<String>,
+    ///
+    /// **Only files from the folder.** The built-in families go through the
+    /// same reader, and a complaint about one of those is a bug in this build
+    /// rather than something the person sitting here can fix — it would send
+    /// them looking for `ink.json` in a directory it has never been in. A test
+    /// stands in for the report instead; see `every_built_in_family_is_clean`.
+    pub complaints: Vec<Complaint>,
 }
 
 impl Default for Registry {
@@ -177,7 +215,7 @@ impl Default for Registry {
                     theme: Theme::light(),
                 },
             ],
-            unreadable: Vec::new(),
+            complaints: Vec::new(),
         }
     }
 }
@@ -203,7 +241,7 @@ impl Registry {
     fn load_from(dir: Option<&std::path::Path>) -> Self {
         let mut registry = Self::default();
         for (file, text) in BUILT_IN {
-            registry.read(file, text);
+            registry.read(file, text, false);
         }
 
         let Some(dir) = dir else { return registry };
@@ -221,31 +259,66 @@ impl Registry {
         for path in files {
             let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into());
             match std::fs::read_to_string(&path) {
-                Ok(text) => registry.read(&name, &text),
-                Err(_) => registry.unreadable.push(name),
+                Ok(text) => registry.read(&name, &text, true),
+                Err(_) => registry.complain(true, &name, "could not be opened".into()),
             }
         }
         registry
     }
 
+    /// Note something wrong with a file, once.
+    ///
+    /// Deduplicated on the pair, because a family with the same mistake in both
+    /// of its themes is one mistake — the old count pushed per *entry* and then
+    /// reported per *file*, so a two-theme family with one bad half announced
+    /// that two files could not be read when there was one.
+    fn complain(&mut self, mine: bool, file: &str, why: String) {
+        if !mine {
+            return;
+        }
+        let complaint = Complaint { file: file.to_string(), why };
+        if !self.complaints.contains(&complaint) {
+            self.complaints.push(complaint);
+        }
+    }
+
     /// One file's worth, however many themes that is.
-    fn read(&mut self, file: &str, text: &str) {
+    ///
+    /// `from_folder` says whether anything wrong with it is worth telling
+    /// somebody about — see [`Registry::complaints`].
+    fn read(&mut self, file: &str, text: &str, from_folder: bool) {
         let Ok(family) = serde_json::from_str::<Family>(text) else {
-            self.unreadable.push(file.to_string());
+            self.complain(from_folder, file, "is not readable JSON in this format".into());
             return;
         };
         if family.themes.is_empty() {
-            self.unreadable.push(file.to_string());
+            self.complain(from_folder, file, "has no themes in it".into());
             return;
         }
         for entry in family.themes {
-            // A theme whose style will not merge is counted with the files
-            // that would not parse, and for the same reason: from where
-            // somebody is sitting, a theme that does not appear in the list
-            // and a theme that appears wearing somebody else's colours are
-            // both "it did not work", and only one of them says so.
+            // A key this build has no colour for is *kept* — `THEMES.md`
+            // promises a theme written against a later build still draws in
+            // every colour it shares with this one — and said out loud, because
+            // a misspelling is ignored in exactly the same silence. Named, so
+            // the answer to "which of the two is this" is on the screen rather
+            // than in somebody's memory of the key list.
+            let unknown = theme::unknown_keys(&entry.style);
+            if !unknown.is_empty() {
+                let why = format!(
+                    "“{}” sets {}, which this build has no colour for — check the spelling against THEMES.md",
+                    entry.name,
+                    unknown.join(", ")
+                );
+                self.complain(from_folder, file, why);
+            }
+            // A theme whose style will not merge is refused whole, and for the
+            // reason `theme::overlay` gives: from where somebody is sitting, a
+            // theme that does not appear in the list and a theme that appears
+            // wearing somebody else's colours are both "it did not work", and
+            // only one of them says so.
             let Some(theme) = theme::overlay(entry.appearance.base(), &entry.style) else {
-                self.unreadable.push(file.to_string());
+                let why = format!("“{}” names a value that is not a colour", entry.name);
+                self.complain(from_folder, file, why);
                 continue;
             };
             self.add(Named {
@@ -361,7 +434,7 @@ mod tests {
     fn built_in() -> Registry {
         let mut registry = Registry::default();
         for (file, text) in BUILT_IN {
-            registry.read(file, text);
+            registry.read(file, text, true);
         }
         registry
     }
@@ -372,7 +445,11 @@ mod tests {
         // test is the only thing standing between a pretty palette and one
         // where the quotes on a note have vanished into the card behind them.
         let registry = built_in();
-        assert!(registry.unreadable.is_empty(), "shipped a theme that will not parse");
+        assert!(
+            registry.complaints.is_empty(),
+            "shipped a theme that will not parse: {:?}",
+            registry.complaints
+        );
         for theme in &registry.themes {
             if let Err(problem) = readable(&theme.theme) {
                 panic!("the built-in theme {:?}: {problem}", theme.name);
@@ -404,8 +481,9 @@ mod tests {
                 { "name": "Pair", "appearance": "dark",  "style": { "accent": "#111111" } },
                 { "name": "Pair", "appearance": "light", "style": { "accent": "#222222" } }
             ] }"##,
+            true,
         );
-        assert!(registry.unreadable.is_empty());
+        assert!(registry.complaints.is_empty());
         assert_eq!(registry.resolve("Pair", Appearance::Dark).accent, crate::color::rgb(0x111111));
         assert_eq!(registry.resolve("Pair", Appearance::Light).accent, crate::color::rgb(0x222222));
     }
@@ -420,6 +498,7 @@ mod tests {
             r##"{ "name": "Mine", "themes": [
                 { "name": "Ink", "appearance": "dark", "style": { "accent": "#00ff00" } }
             ] }"##,
+            true,
         );
         assert_eq!(registry.resolve("Ink", Appearance::Dark).accent, crate::color::rgb(0x00ff00));
         assert_eq!(registry.of(Appearance::Dark).iter().filter(|t| t.name == "Ink").count(), 1);
@@ -452,12 +531,86 @@ mod tests {
                     "style": { "accent": "burnt sienna" } }] }"##,
             ),
         ] {
-            let before = registry.unreadable.len();
-            registry.read(file, bad);
-            assert_eq!(registry.unreadable.len(), before + 1, "{file} should have been counted");
+            let before = registry.complaints.len();
+            registry.read(file, bad, true);
+            assert_eq!(registry.complaints.len(), before + 1, "{file} should have been named");
+            assert_eq!(registry.complaints.last().unwrap().file, file);
         }
         // And the two that cannot fail are still there to draw with.
         assert_eq!(registry.of(Appearance::Dark).len(), 1);
+    }
+
+    #[test]
+    fn a_key_this_build_has_no_colour_for_is_kept_and_named() {
+        // The silence this is about: `THEMES.md` promises an unknown key is
+        // ignored rather than refused, so a theme written against a later build
+        // still draws. A *misspelling* was ignored in exactly the same silence,
+        // and somebody who set `acent` had no way at all to find out why
+        // nothing happened.
+        let mut registry = Registry::default();
+        registry.read(
+            "mine.json",
+            r##"{ "name": "Mine", "themes": [
+                { "name": "Typo", "appearance": "dark",
+                  "style": { "acent": "#00ff88", "ground": "#101010" } }
+            ] }"##,
+            true,
+        );
+
+        // Kept: the theme loads, and the key it *did* spell right took.
+        assert!(registry.knows("Typo", Appearance::Dark));
+        assert_eq!(registry.resolve("Typo", Appearance::Dark).ground, crate::color::rgb(0x101010));
+
+        // And named, with the key in it, which is the whole of the fix.
+        assert_eq!(registry.complaints.len(), 1);
+        let said = &registry.complaints[0];
+        assert_eq!(said.file, "mine.json");
+        assert!(said.why.contains("acent"), "{said:?}");
+        assert!(said.why.contains("Typo"), "{said:?}");
+    }
+
+    #[test]
+    fn one_mistake_in_two_halves_of_a_family_is_one_complaint() {
+        // This used to push per *entry* and report per *file*, so a family whose
+        // light and dark shared a typo announced that two files could not be
+        // read when the folder held one.
+        let mut registry = Registry::default();
+        registry.read(
+            "pair.json",
+            r##"{ "name": "Pair", "themes": [
+                { "name": "Pair", "appearance": "dark",  "style": { "accent": "not a colour" } },
+                { "name": "Pair", "appearance": "light", "style": { "accent": "not a colour" } }
+            ] }"##,
+            true,
+        );
+        // One sentence, because it is one sentence: both halves share a name
+        // and share the mistake, so saying it twice would be saying it twice.
+        assert_eq!(registry.complaints.len(), 1, "{:?}", registry.complaints);
+        assert_eq!(registry.complaints[0].file, "pair.json");
+
+        // Two *different* mistakes in one file are still two things to fix.
+        let mut both = Registry::default();
+        both.read(
+            "two.json",
+            r##"{ "name": "Two", "themes": [
+                { "name": "Alpha", "appearance": "dark",  "style": { "accent": "not a colour" } },
+                { "name": "Beta",  "appearance": "light", "style": { "acent": "#123456" } }
+            ] }"##,
+            true,
+        );
+        assert_eq!(both.complaints.len(), 2, "{:?}", both.complaints);
+    }
+
+    #[test]
+    fn a_built_in_never_complains_at_somebody_about_their_own_folder() {
+        // The built-in families go through the same reader. A complaint about
+        // one of those would send somebody looking for `ink.json` in a
+        // directory it has never been in — it is a bug in this build, and
+        // `every_theme_this_binary_ships_can_be_read_on` is what stands in for
+        // the report.
+        let mut registry = Registry::default();
+        registry.read("built-in.json", "{ not json at all", false);
+        assert!(registry.complaints.is_empty());
     }
 
     #[test]
@@ -483,7 +636,13 @@ mod tests {
 
         let registry = Registry::load_from(Some(&dir));
         assert_eq!(registry.resolve("Neon", Appearance::Dark).accent, crate::color::rgb(0x00ff88));
-        assert_eq!(registry.unreadable, vec!["broken.json".to_string()]);
+        assert_eq!(
+            registry.complaints,
+            vec![Complaint {
+                file: "broken.json".into(),
+                why: "is not readable JSON in this format".into()
+            }]
+        );
         // And the built-ins are still all there beside it.
         assert!(registry.knows(DEFAULT_DARK, Appearance::Dark));
         assert!(registry.knows("Ink", Appearance::Dark));
@@ -498,7 +657,7 @@ mod tests {
         let registry = Registry::load_from(None);
         assert!(registry.knows(DEFAULT_DARK, Appearance::Dark));
         assert!(registry.knows(DEFAULT_LIGHT, Appearance::Light));
-        assert!(registry.unreadable.is_empty());
+        assert!(registry.complaints.is_empty());
 
         let missing = std::env::temp_dir().join("mbrd-themes-that-are-not-there");
         assert!(Registry::load_from(Some(&missing)).knows(DEFAULT_DARK, Appearance::Dark));

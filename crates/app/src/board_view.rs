@@ -6179,6 +6179,62 @@ impl BoardView {
         cx.notify();
     }
 
+    /// Try on a theme from a picker, if it is a theme this app could be wearing.
+    ///
+    /// **The slot being filled is not necessarily the one on screen.** Somebody
+    /// pinned to dark can be choosing what their light theme will be, and
+    /// painting the window in it would be answering a question nobody asked:
+    /// the app would go light, snap back to dark on the press that commits, and
+    /// the preview would have shown a state the setting cannot produce. So a
+    /// preview of the half that is not being worn changes nothing, and the
+    /// picker's own rows are where that choice is read instead.
+    ///
+    /// The one door for previewing off a picker, so the mouse and the arrows
+    /// cannot end up disagreeing about what a highlight means — which they did:
+    /// only the keyboard previewed at all.
+    fn preview_from_picker(
+        &mut self,
+        appearance: crate::themes::Appearance,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if appearance != self.appearance() {
+            return;
+        }
+        let theme = self.themes.resolve(name, appearance);
+        self.preview_theme(theme, cx);
+    }
+
+    /// Move a picker's highlight to a row the pointer is over, and try it on.
+    ///
+    /// What arrowing onto a row already did. Without this the mouse was the one
+    /// way through the list that never previewed anything, on a panel whose
+    /// whole shape — see `settings::Picker::was` — exists to make previewing
+    /// safe.
+    pub fn hover_theme(&mut self, at: usize, cx: &mut Context<Self>) {
+        let picker = match &mut self.overlay {
+            Overlay::Settings(page) => page.picking.as_mut(),
+            Overlay::Welcome(screen) => screen.picking.as_mut(),
+            _ => None,
+        };
+        let Some(picker) = picker else { return };
+        if picker.cursor == at {
+            return;
+        }
+        picker.cursor = at;
+        let appearance = picker.appearance;
+        let names: Vec<String> =
+            self.themes.of(appearance).iter().map(|t| t.name.clone()).collect();
+        let matched = match &self.overlay {
+            Overlay::Settings(page) => page.picking.as_ref().map(|p| p.matches(&names)),
+            Overlay::Welcome(screen) => screen.picking.as_ref().map(|p| p.matches(&names)),
+            _ => None,
+        };
+        let Some(name) = matched.and_then(|m| m.get(at).cloned()) else { return };
+        self.preview_from_picker(appearance, &name, cx);
+        cx.notify();
+    }
+
     /// Put back whatever was on screen before the preview started.
     ///
     /// Deliberately not [`Self::retheme`]: they agree in every case but one,
@@ -10403,8 +10459,7 @@ impl BoardView {
                 // theme file reloaded underneath it cannot leave a stale one
                 // sitting in an overlay.
                 crate::settings::Reply::Preview(appearance, name) => {
-                    let theme = self.themes.resolve(&name, appearance);
-                    self.preview_theme(theme, cx);
+                    self.preview_from_picker(appearance, &name, cx);
                 }
                 // Ends the preview as a side effect, which is right: a choice
                 // is the answer to what a preview was asking.
@@ -10458,8 +10513,7 @@ impl BoardView {
                     }
                 }
                 crate::settings::Reply::Preview(appearance, name) => {
-                    let theme = self.themes.resolve(&name, appearance);
-                    self.preview_theme(theme, cx);
+                    self.preview_from_picker(appearance, &name, cx);
                 }
                 crate::settings::Reply::Choose(appearance, name) => {
                     self.set_theme(appearance, name, cx);

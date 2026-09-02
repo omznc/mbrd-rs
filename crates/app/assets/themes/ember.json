@@ -1,0 +1,90 @@
+{
+  "name": "Ember",
+  "author": "mbrd",
+  "themes": [
+    {
+      "name": "Ember",
+      "appearance": "dark",
+      "style": {
+        "ground": "#141110ff",
+        "grid": "#f0e3d800",
+        "axis": "#f0e3d822",
+        "chrome": "#1d1817ff",
+        "chrome_edge": "#f0e3d818",
+        "card": "#2b2321ff",
+        "card_edge": "#f0e3d820",
+        "selected_edge": "#e0762fff",
+        "text": "#f0e3d8ff",
+        "muted": "#b3a094ff",
+        "tertiary": "#8b7a70ff",
+        "accent": "#e0762fff",
+        "accent_text": "#f08a45ff",
+        "note": "#43301eff",
+        "image": "#1f3540ff",
+        "video": "#3a2340ff",
+        "audio": "#1e3a33ff",
+        "link": "#2a2b46ff",
+        "fence": "#e0762f16",
+        "quote": "#c0aca0ff",
+        "note_link": "#f2a05aff",
+        "rope_line": "#f0e3d866",
+        "rope_accent": "#e0762fff",
+        "rope_warm": "#e8a33cff",
+        "rope_leaf": "#7f9e4dff",
+        "rope_danger": "#d64b46ff",
+        "anchor": "#f0e3d859",
+        "guide": "#f0e3d859",
+        "notes": [
+          "#43301eff",
+          "#1f3a42ff",
+          "#2a2b46ff",
+          "#43223aff"
+        ],
+        "swatch_fallback": "#8f8783ff",
+        "shadow": "#000000ff"
+      }
+    },
+    {
+      "name": "Ember",
+      "appearance": "light",
+      "style": {
+        "ground": "#f6efe7ff",
+        "grid": "#2b1d1300",
+        "axis": "#2b1d1322",
+        "chrome": "#efe4d8ff",
+        "chrome_edge": "#2b1d131f",
+        "card": "#fffaf4ff",
+        "card_edge": "#2b1d1324",
+        "selected_edge": "#a44c14ff",
+        "text": "#2b1d13ff",
+        "muted": "#6b5344ff",
+        "tertiary": "#8d7566ff",
+        "accent": "#a44c14ff",
+        "accent_text": "#93430fff",
+        "note": "#f7e3c6ff",
+        "image": "#d6e8efff",
+        "video": "#ecdaf1ff",
+        "audio": "#d3ece0ff",
+        "link": "#dcdff5ff",
+        "fence": "#a44c1414",
+        "quote": "#5d4638ff",
+        "note_link": "#9c4413ff",
+        "rope_line": "#2b1d1366",
+        "rope_accent": "#a44c14ff",
+        "rope_warm": "#8d5c0bff",
+        "rope_leaf": "#4f6f2bff",
+        "rope_danger": "#a92f2bff",
+        "anchor": "#2b1d1359",
+        "guide": "#2b1d1359",
+        "notes": [
+          "#f9e6cbff",
+          "#d9ecf2ff",
+          "#dfe2f7ff",
+          "#f3dceeff"
+        ],
+        "swatch_fallback": "#9c9490ff",
+        "shadow": "#00000073"
+      }
+    }
+  ]
+}

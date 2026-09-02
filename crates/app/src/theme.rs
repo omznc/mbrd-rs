@@ -433,6 +433,26 @@ pub const SHADE_COUNT: u32 = 16;
 /// `None` is something the caller can *count*, which is how a typo in
 /// somebody's theme file ends up said out loud on the settings page instead of
 /// silently drawing the palette they were trying to change.
+/// The keys in a `style` object this build has no colour for.
+///
+/// [`overlay`] ignores them, and `THEMES.md` promises it will: a theme written
+/// against a later build should draw in every colour it shares with this one
+/// rather than refuse. **But a key that is simply misspelled is ignored in
+/// exactly the same silence**, and from where the author is sitting "I set
+/// `acent` and nothing happened" and "I set a key this build predates" are the
+/// same non-event. Naming them is what lets `themes.rs` tell somebody which of
+/// the two they are looking at, without this having to guess which it was.
+///
+/// Asked of [`Theme::dark`] because the field list is the type's, not the
+/// palette's — the two built-ins carry the same keys and differ only in what
+/// they are set to.
+pub fn unknown_keys(style: &Map<String, Value>) -> Vec<String> {
+    let Ok(Value::Object(known)) = serde_json::to_value(Theme::dark()) else {
+        return Vec::new();
+    };
+    style.keys().filter(|key| !known.contains_key(*key)).cloned().collect()
+}
+
 pub fn overlay(base: Theme, style: &Map<String, Value>) -> Option<Theme> {
     let Ok(Value::Object(mut out)) = serde_json::to_value(base) else {
         return None;
