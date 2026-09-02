@@ -129,6 +129,11 @@ pub fn menus(cx: &mut App) {
                 MenuItem::separator(),
                 MenuItem::action("Quit mbrd", Quit),
             ],
+            // Neither of these is ever greyed as a whole. The fork carries a
+            // per-menu switch that Zed's `gpui` did not, and both of ours are
+            // always live: the application menu because Quit has to be, and
+            // Window because it acts on the one window this app opens.
+            disabled: false,
         },
         Menu {
             name: "Window".into(),
@@ -140,6 +145,7 @@ pub fn menus(cx: &mut App) {
                 MenuItem::separator(),
                 MenuItem::action("Close Window", CloseWindow),
             ],
+            disabled: false,
         },
     ]);
 }
