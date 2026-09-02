@@ -54,9 +54,13 @@ handful of them — the grid, the axes, the hairlines — and is noted below.
 
 Keys mbrd does not recognise are ignored rather than refused, so a theme
 written for a later build still draws in every colour it shares with this one.
-A *value* that is not a colour is a different matter: it fails the whole
-theme, which then shows up in the "could not be read" count on the settings
-page. Failing loudly beats a palette with four things moved and thirty not.
+**They are named on the settings page anyway**, because a key you misspelled is
+ignored in exactly the same silence as one this build predates, and the two are
+only tellable apart by being told. A theme with a typo in it still loads.
+
+A *value* that is not a colour is a different matter: it fails the whole theme,
+which then shows up on the settings page under the file it was in. Failing
+loudly beats a palette with four things moved and thirty not.
 
 ---
 

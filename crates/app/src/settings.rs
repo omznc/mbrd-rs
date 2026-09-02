@@ -1290,15 +1290,23 @@ fn appearance_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
         Section::Appearance,
         "Themes folder",
         match crate::dirs::themes() {
-            Some(path) => format!(
-                "Drop a .json in {} and press Reload. {}",
-                path.display(),
-                match view.themes.unreadable.len() {
-                    0 => "Everything there was read.".to_string(),
-                    1 => "One file there could not be read.".to_string(),
-                    n => format!("{n} files there could not be read."),
-                }
-            ),
+            Some(path) => {
+                // Named, and with the reason. This was a count, and a count is
+                // the one thing nobody can act on: "one file there could not be
+                // read" is the same sentence whether the folder holds one theme
+                // or forty, and it does not say which of the two silences a
+                // misspelled key fell into. See `themes::Complaint`.
+                let said = match view.themes.complaints.as_slice() {
+                    [] => "Everything there was read.".to_string(),
+                    [one] => format!("{} {}.", one.file, one.why),
+                    many => many
+                        .iter()
+                        .map(|c| format!("{} {}", c.file, c.why))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                };
+                format!("Drop a .json in {} and press Reload. {said}", path.display())
+            }
             None => "There is nowhere on this computer to keep themes.".into(),
         },
         button("settings-reload-themes", "Reload", true, theme, cx, |this, cx| {
@@ -1361,6 +1369,29 @@ pub(crate) fn dropdown(
         .into_any_element()
 }
 
+/// What a theme looks like, in three squares.
+///
+/// The ground it draws on, the card it draws on that, and the accent — which is
+/// the smallest set that tells two themes apart at a glance, and the one that
+/// answers "is this the light one" without reading a word. Drawn as one chip
+/// with a hairline around it rather than three loose squares, so a pale theme
+/// on a pale row still has an edge.
+fn swatches(palette: Theme) -> AnyElement {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .rounded(px(crate::theme::RADIUS_XS))
+        .border_1()
+        .border_color(palette.chrome_edge)
+        .overflow_hidden()
+        .children(
+            [palette.ground, palette.card, palette.accent]
+                .map(|colour| div().w(px(9.0)).h(px(14.0)).bg(colour)),
+        )
+        .into_any_element()
+}
+
 /// The list itself: a panel over the page, searchable, previewing live.
 pub(crate) fn picker_panel(
     picker: &Picker,
@@ -1386,6 +1417,13 @@ pub(crate) fn picker_panel(
             (t.name.as_str(), words)
         })
         .collect();
+    // The palette behind each name, for the swatches. **A list for choosing
+    // colours had no colours in it** — every row was a name and a credit, and
+    // every built-in credits "mbrd", so the dark list and the light list read
+    // as the same list. The theme is already resolved on the registry entry, so
+    // this costs a lookup rather than a merge.
+    let palettes: HashMap<&str, Theme> =
+        offered.iter().map(|t| (t.name.as_str(), t.theme)).collect();
 
     div()
         .absolute()
@@ -1445,6 +1483,7 @@ pub(crate) fn picker_panel(
                         .children(matched.iter().enumerate().map(|(i, name)| {
                             let lit = i == picker.cursor;
                             let credit = by.get(name.as_str()).cloned().unwrap_or_default();
+                            let palette = palettes.get(name.as_str()).copied();
                             let chosen = name.clone();
                             div()
                                 .id(SharedString::from(format!("theme-{i}")))
@@ -1456,6 +1495,7 @@ pub(crate) fn picker_panel(
                                 .py(px(5.0))
                                 .rounded(px(crate::theme::RADIUS_SM))
                                 .text_size(px(12.0))
+                                .cursor_pointer()
                                 .when(lit, |d| {
                                     d.bg(theme.accent.opacity(0.14)).text_color(theme.text)
                                 })
@@ -1463,6 +1503,15 @@ pub(crate) fn picker_panel(
                                     d.text_color(theme.muted)
                                         .hover(|s| s.bg(theme.accent.opacity(0.07)))
                                 })
+                                // The pointer moves the highlight and tries the
+                                // theme on, which is what arrowing already did.
+                                // Without it the mouse was the one way through
+                                // this list that previewed nothing at all.
+                                .on_hover(cx.listener(move |this, over: &bool, _window, cx| {
+                                    if *over {
+                                        this.hover_theme(i, cx);
+                                    }
+                                }))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _event, _window, cx| {
@@ -1470,9 +1519,18 @@ pub(crate) fn picker_panel(
                                         this.choose_theme(chosen.clone(), cx);
                                     }),
                                 )
-                                .child(name.clone())
                                 .child(
                                     div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .min_w_0()
+                                        .children(palette.map(swatches))
+                                        .child(div().truncate().child(name.clone())),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
                                         .text_size(px(10.0))
                                         .text_color(theme.tertiary)
                                         .child(credit),
