@@ -230,6 +230,17 @@ pub struct Prefs {
     /// again. The flag belongs with the answers it is about.
     pub welcomed: bool,
 
+    /// Whether a pasted address may be *fetched*.
+    ///
+    /// On, because a link to a photograph becoming the photograph is most of
+    /// why paste is worth pressing. A switch, because it is also the one thing
+    /// this app does that reaches a computer somebody else owns without being
+    /// asked: `fetch::worth_trying` returns true for any address with a path on
+    /// it, so pasting a link is a request to that host, made on the strength of
+    /// what was in the clipboard. Off leaves every paste a link card, which is
+    /// what a failed fetch already leaves.
+    pub fetch_links: bool,
+
     /// What a board this app makes is born with. See [`NewBoard`], whose note
     /// is about why these are here and not on the settings page's Canvas
     /// section.
@@ -246,6 +257,7 @@ impl Default for Prefs {
             theme_light: DEFAULT_LIGHT.into(),
             boards_dir: None,
             welcomed: false,
+            fetch_links: true,
             new_board: NewBoard::default(),
         }
     }
@@ -258,14 +270,27 @@ impl Prefs {
     /// that lies, so whatever offers one has to be able to say "this is being
     /// forced elsewhere". Answers the variable's name, which is the only useful
     /// thing to tell somebody: it is what they have to go and unset.
+    /// **Answers whether the variable *decided* something, not whether it is
+    /// set.** Those came apart in two of the four: `MBRD_APPEARANCE=nonsense`
+    /// is a variable that is set and changes nothing, because `Mode::parse`
+    /// does not know the word, and `MBRD_THEME=` is skipped for being empty.
+    /// A row that read "Set by MBRD_APPEARANCE, which wins at startup" over a
+    /// setting the variable had no effect on would be the same lie this exists
+    /// to prevent, pointed the other way.
+    ///
+    /// The other two cannot come apart — `load` reads the value of one and
+    /// ignores the value of the other, and neither can be present and decide
+    /// nothing — so they are still a presence check, and this is the only place
+    /// that difference is written down.
     pub fn forced(what: Setting) -> Option<&'static str> {
-        let name = match what {
-            Setting::Motion => "MBRD_MOTION",
-            Setting::Update => "MBRD_NO_UPDATE",
-            Setting::Theme => "MBRD_THEME",
-            Setting::Appearance => "MBRD_APPEARANCE",
-        };
-        std::env::var_os(name).is_some().then_some(name)
+        match what {
+            Setting::Motion => std::env::var_os("MBRD_MOTION").is_some().then_some("MBRD_MOTION"),
+            Setting::Update => {
+                std::env::var_os("MBRD_NO_UPDATE").is_some().then_some("MBRD_NO_UPDATE")
+            }
+            Setting::Appearance => forced_mode().is_some().then_some("MBRD_APPEARANCE"),
+            Setting::Theme => forced_theme().is_some().then_some("MBRD_THEME"),
+        }
     }
 
     /// Which theme name this appearance wears.
@@ -339,6 +364,9 @@ pub fn load() -> Prefs {
                 if let Some(motion) = value.get("motion").and_then(Value::as_bool) {
                     prefs.motion = motion;
                 }
+                if let Some(fetch) = value.get("fetchLinks").and_then(Value::as_bool) {
+                    prefs.fetch_links = fetch;
+                }
                 if let Some(update) = value.get("update").and_then(Value::as_bool) {
                     prefs.update = update;
                 }
@@ -406,9 +434,7 @@ pub fn load() -> Prefs {
     // cannot look at a bright screen should not have to look at one in order
     // to find the switch that stops it. Set in a launcher, a shell profile or
     // a desktop entry, and it needs nothing from this app.
-    if let Some(word) =
-        std::env::var("MBRD_APPEARANCE").ok().and_then(|w| Mode::parse(&w.to_lowercase()))
-    {
+    if let Some(word) = forced_mode() {
         prefs.mode = word;
     }
 
@@ -416,14 +442,28 @@ pub fn load() -> Prefs {
     // and there are two of them. A name that only exists as a dark theme
     // simply falls back to the light base when the app is light — which is
     // `Registry::resolve`'s ordinary behaviour rather than a special case.
-    if let Ok(name) = std::env::var("MBRD_THEME") {
-        if !name.is_empty() {
-            prefs.theme = name.clone();
-            prefs.theme_light = name;
-        }
+    if let Some(name) = forced_theme() {
+        prefs.theme = name.clone();
+        prefs.theme_light = name;
     }
 
     prefs
+}
+
+/// What `MBRD_APPEARANCE` says, if it says anything this build understands.
+///
+/// Read by [`load`] and by [`Prefs::forced`], which is the point of it being a
+/// function: a word `Mode::parse` does not know has to be "nothing was forced"
+/// in both places, and two copies of that test are two places for the settings
+/// page to start claiming an override that never happened.
+fn forced_mode() -> Option<Mode> {
+    std::env::var("MBRD_APPEARANCE").ok().and_then(|word| Mode::parse(&word.to_lowercase()))
+}
+
+/// What `MBRD_THEME` says, if it names anything. Same bargain as
+/// [`forced_mode`]; empty is not a theme name.
+fn forced_theme() -> Option<String> {
+    std::env::var("MBRD_THEME").ok().filter(|name| !name.is_empty())
 }
 
 /// Write what somebody chose.
@@ -463,6 +503,7 @@ pub fn save(prefs: &Prefs) {
     out.insert("theme".into(), Value::String(prefs.theme.clone()));
     out.insert("theme_light".into(), Value::String(prefs.theme_light.clone()));
     out.insert("welcomed".into(), Value::Bool(prefs.welcomed));
+    out.insert("fetchLinks".into(), Value::Bool(prefs.fetch_links));
     out.insert("newBoardSnap".into(), Value::Bool(prefs.new_board.snap));
     out.insert("newBoardGridStep".into(), Value::from(f64::from(prefs.new_board.grid_step)));
     // Removed rather than written as `null` or as the default path when
@@ -503,6 +544,16 @@ fn off(value: &std::ffi::OsStr) -> bool {
     matches!(value.to_string_lossy().as_ref(), "0" | "off" | "false" | "no")
 }
 
+/// Taken by every test that reads or writes one of the `MBRD_*` variables.
+///
+/// The environment is process-wide and `cargo test` runs in threads, so two of
+/// those tests overlapping is one of them seeing the other's variable — which
+/// is a failure that shows up on about one run in three and not on the run
+/// somebody is watching. `welcome.rs` locks this too: the screen's own shape
+/// depends on `MBRD_THEME`, so its test is in the same race.
+#[cfg(test)]
+pub(crate) static ENVIRONMENT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +561,44 @@ mod tests {
     #[test]
     fn the_interface_holds_still_until_somebody_asks_it_not_to() {
         assert!(!Prefs::default().motion);
+    }
+
+    #[test]
+    fn a_pasted_link_is_followed_until_somebody_says_otherwise() {
+        // On, because a link to a photograph becoming the photograph is most of
+        // why paste is worth pressing — and a switch, because it is the one
+        // thing this app does that reaches somebody else's computer unasked.
+        assert!(Prefs::default().fetch_links);
+    }
+
+    #[test]
+    fn a_variable_that_decided_nothing_is_not_reported_as_deciding_something() {
+        // `forced` used to answer "is this set", which came apart from "did
+        // this do anything" in two of the four: a word `Mode::parse` does not
+        // know and an empty theme name are both variables that are set and
+        // change nothing, and the settings page claimed an override for both.
+        //
+        // SAFETY: `ENVIRONMENT` is what makes this single-threaded with respect
+        // to every other test that touches these variables, and both are read
+        // synchronously inside the calls below.
+        let _guard = ENVIRONMENT.lock();
+        unsafe { std::env::set_var("MBRD_APPEARANCE", "chartreuse") };
+        unsafe { std::env::set_var("MBRD_THEME", "") };
+        let nonsense = Prefs::forced(Setting::Appearance);
+        let empty = Prefs::forced(Setting::Theme);
+
+        unsafe { std::env::set_var("MBRD_APPEARANCE", "dark") };
+        unsafe { std::env::set_var("MBRD_THEME", "Ember") };
+        let real_mode = Prefs::forced(Setting::Appearance);
+        let real_theme = Prefs::forced(Setting::Theme);
+
+        unsafe { std::env::remove_var("MBRD_APPEARANCE") };
+        unsafe { std::env::remove_var("MBRD_THEME") };
+
+        assert_eq!(nonsense, None, "a word this build cannot parse forces nothing");
+        assert_eq!(empty, None, "an empty name is not a theme name");
+        assert_eq!(real_mode, Some("MBRD_APPEARANCE"));
+        assert_eq!(real_theme, Some("MBRD_THEME"));
     }
 
     #[test]
@@ -581,6 +670,7 @@ mod tests {
         // them. It used to be the only thing that made a preference added
         // without a `forced` arm show up; now that the argument is an enum,
         // the compiler catches that and this checks the arms are right.
+        let _guard = ENVIRONMENT.lock();
         for what in [Setting::Motion, Setting::Update, Setting::Theme, Setting::Appearance] {
             assert_eq!(Prefs::forced(what), None, "{what:?}");
         }

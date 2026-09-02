@@ -1112,7 +1112,7 @@ fn general_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
     // rather than appearing to take and then not surviving a restart — the
     // same warning `toggle_pref` says after the fact, said before it instead.
     let motion_note = crate::prefs::Prefs::forced(crate::prefs::Setting::Motion)
-        .map(|var| format!("Set by {var}, which wins at startup."));
+        .map(|var| format!("Set by {var} at startup. Changing it here holds until you quit."));
     let theme = view.theme;
 
     // Where boards go, and what a new one is born with.
@@ -1182,6 +1182,15 @@ fn general_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
                 cx,
             ),
         ),
+        toggle(
+            Section::General,
+            Command::ToggleLinkFetch,
+            "A pasted address that points at a picture or a video becomes that card. Off, every \
+             paste is a link — and nothing here contacts the address.",
+            None,
+            view,
+            cx,
+        ),
         // The way back to the four questions. It is the only route to the
         // demonstration board and the tour standing side by side, and without
         // it the first-run screen is a thing that happened once and cannot be
@@ -1200,7 +1209,7 @@ fn general_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
 
 fn update_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
     let update_note = crate::prefs::Prefs::forced(crate::prefs::Setting::Update)
-        .map(|var| format!("Set by {var}, which wins at startup."));
+        .map(|var| format!("Set by {var} at startup. Changing it here holds until you quit."));
     vec![
         toggle(
             Section::Updates,
@@ -1231,7 +1240,7 @@ fn appearance_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
         Section::Appearance,
         "Appearance",
         match mode_pinned {
-            Some(var) => format!("Set by {var}, which wins at startup."),
+            Some(var) => format!("Set by {var} at startup. Changing it here holds until you quit."),
             None => "Light, dark, or whatever your desktop is currently set to.".into(),
         },
         segmented(
@@ -1254,7 +1263,9 @@ fn appearance_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
         let known = view.themes.knows(&name, appearance);
         let live = worn == appearance;
         let about: SharedString = match (theme_pinned, known) {
-            (Some(var), _) => format!("Set by {var}, which wins at startup.").into(),
+            (Some(var), _) => {
+                format!("Set by {var} at startup. Changing it here holds until you quit.").into()
+            }
             // The one thing a settings page must not do is show a fallback as
             // though it were a choice. The name is still what is written
             // down — it comes back if the file does — and saying so is the

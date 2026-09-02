@@ -94,10 +94,6 @@ impl Step {
             Self::Started => "Get started",
         }
     }
-
-    fn at(self) -> usize {
-        Self::ALL.iter().position(|s| *s == self).unwrap_or(0)
-    }
 }
 
 /// The open screen.
@@ -110,6 +106,16 @@ impl Step {
 #[derive(Debug, Clone)]
 pub struct Welcome {
     pub step: Step,
+    /// The pages this run of the screen actually has, in order.
+    ///
+    /// **Not always all four.** `MBRD_APPEARANCE` or `MBRD_THEME` answers the
+    /// first page before it is asked, and a page offering a choice a variable
+    /// has already made is a page that lies. It used to take the *whole screen*
+    /// with it — a `.desktop` file carrying `MBRD_THEME` silently removed the
+    /// boards question, the behaviour question and the four doors as well, for
+    /// everyone on that machine and permanently, because `welcomed` was written
+    /// before the check. See `BoardView::welcome_if_new`.
+    pub steps: Vec<Step>,
     /// The boards folder, as typed. Seeded from the prefs when the screen
     /// opens and written back as it changes — see [`Welcome::folder_text`].
     pub folder: Editor,
@@ -129,12 +135,23 @@ impl Welcome {
     /// what will happen if it is left alone.
     pub fn open(boards: Option<&std::path::Path>) -> Self {
         let shown = boards.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        // The appearance page only if there is an appearance left to choose.
+        let decided = crate::prefs::Prefs::forced(crate::prefs::Setting::Appearance).is_some()
+            || crate::prefs::Prefs::forced(crate::prefs::Setting::Theme).is_some();
+        let steps: Vec<Step> =
+            Step::ALL.into_iter().filter(|step| !(decided && *step == Step::Appearance)).collect();
         Self {
-            step: Step::Appearance,
+            step: steps[0],
+            steps,
             folder: Editor::new(shown, PATH_MAX, false),
             focused: false,
             picking: None,
         }
+    }
+
+    /// Where the current page sits on this screen's own rail.
+    pub fn at(&self) -> usize {
+        self.steps.iter().position(|s| *s == self.step).unwrap_or(0)
     }
 
     /// What the folder field says, trimmed, or `None` for a field somebody has
@@ -154,8 +171,8 @@ impl Welcome {
     /// the last page silently returns to the first, which reads as the screen
     /// having restarted itself.
     pub fn go(&mut self, by: isize) {
-        let at = (self.step.at() as isize + by).clamp(0, Step::ALL.len() as isize - 1);
-        self.step = Step::ALL[at as usize];
+        let at = (self.at() as isize + by).clamp(0, self.steps.len() as isize - 1);
+        self.step = self.steps[at as usize];
         // Leaving the folder page puts the field down. Carrying `focused`
         // onto a page with no field would leave a caret drawn on the page
         // somebody moved to.
@@ -165,6 +182,9 @@ impl Welcome {
     }
 
     pub fn show(&mut self, step: Step) {
+        if !self.steps.contains(&step) {
+            return;
+        }
         self.step = step;
         if step != Step::Boards {
             self.focused = false;
@@ -350,10 +370,10 @@ fn heading(last: bool, theme: Theme, cx: &mut Context<BoardView>) -> AnyElement 
 /// nothing to invalidate by going back.
 fn rail(screen: &Welcome, view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
     let theme = view.theme;
-    let at = screen.step.at();
+    let at = screen.at();
     let mut row = div().flex_none().flex().items_center().gap(px(8.0));
 
-    for (i, step) in Step::ALL.into_iter().enumerate() {
+    for (i, step) in screen.steps.iter().copied().enumerate() {
         if i > 0 {
             row = row.child(div().w(px(16.0)).h(px(1.0)).bg(theme.chrome_edge));
         }
@@ -411,7 +431,7 @@ fn rail(screen: &Welcome, view: &BoardView, cx: &mut Context<BoardView>) -> AnyE
         // No Next on the last page. There is nothing after it, and a button
         // that did nothing would be the screen pretending to have a fifth
         // question.
-        .when(at + 1 < Step::ALL.len(), |d| {
+        .when(at + 1 < screen.steps.len(), |d| {
             d.child(walk("welcome-next", "Next", true, 1, theme, cx))
         })
         .into_any_element()
@@ -868,9 +888,9 @@ fn boards(screen: &Welcome, view: &BoardView, cx: &mut Context<BoardView>) -> An
 fn behaviour(view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
     let theme = view.theme;
     let motion_note = crate::prefs::Prefs::forced(crate::prefs::Setting::Motion)
-        .map(|var| format!("Set by {var}, which wins at startup."));
+        .map(|var| format!("Set by {var} at startup. Changing it here holds until you quit."));
     let update_note = crate::prefs::Prefs::forced(crate::prefs::Setting::Update)
-        .map(|var| format!("Set by {var}, which wins at startup."));
+        .map(|var| format!("Set by {var} at startup. Changing it here holds until you quit."));
 
     let steps: Vec<String> =
         settings::GRID_STEPS.iter().map(|s| format!("{}", *s as i32)).collect();
@@ -1187,9 +1207,37 @@ mod tests {
 
     #[test]
     fn every_step_is_reachable_and_knows_where_it_is() {
-        for (i, step) in Step::ALL.into_iter().enumerate() {
-            assert_eq!(step.at(), i, "{step:?}");
+        let mut w = screen();
+        for (i, step) in w.steps.clone().into_iter().enumerate() {
+            w.show(step);
+            assert_eq!(w.at(), i, "{step:?}");
             assert!(!step.label().is_empty());
         }
+    }
+
+    #[test]
+    fn a_forced_appearance_takes_the_appearance_page_and_not_the_screen() {
+        // `MBRD_THEME` in a `.desktop` file used to remove the *whole* first-run
+        // screen — the boards question, the behaviour question and the four
+        // doors with it — for everyone on that machine, permanently, because
+        // `welcomed` was written before the check that bailed out.
+        //
+        // The variable is read at `open`, so this sets it around the call — and
+        // `prefs::ENVIRONMENT` is what keeps that from colliding with the tests
+        // in `prefs.rs` that read the same four.
+        let _guard = crate::prefs::ENVIRONMENT.lock();
+        let quiet = Welcome::open(None);
+        assert_eq!(quiet.steps, Step::ALL.to_vec());
+        assert_eq!(quiet.step, Step::Appearance);
+
+        // SAFETY: held under `ENVIRONMENT` above, and the variable is read
+        // once inside the call below.
+        unsafe { std::env::set_var("MBRD_THEME", "Ember") };
+        let forced = Welcome::open(None);
+        unsafe { std::env::remove_var("MBRD_THEME") };
+
+        assert!(!forced.steps.contains(&Step::Appearance), "{:?}", forced.steps);
+        assert_eq!(forced.steps.len(), 3, "the other three are still asked");
+        assert_eq!(forced.step, Step::Boards, "it opens on the first page it has");
     }
 }

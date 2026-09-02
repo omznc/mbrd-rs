@@ -140,6 +140,14 @@ pub enum Command {
     /// Whether to *look* for new versions. Not whether one can be installed,
     /// which is a fact about how this build was installed rather than a choice.
     ToggleUpdateChecks,
+    /// Whether a pasted address may be *fetched* rather than left as a link.
+    ///
+    /// The one thing this app does that reaches somebody else's computer
+    /// without being asked — `fetch::worth_trying` says yes to any address with
+    /// a path on it, so a paste is a request to that host on the strength of
+    /// what was in the clipboard. Off, every paste is the link card a failed
+    /// fetch already leaves.
+    ToggleLinkFetch,
     /// Find out whether a newer version exists, and then — pressed again —
     /// install it and restart into it.
     ///
@@ -401,6 +409,7 @@ impl Command {
             Self::Search => "Find on board…",
             Self::ToggleMotion => "Animation",
             Self::ToggleUpdateChecks => "Look for new versions",
+            Self::ToggleLinkFetch => "Fetch pasted links",
             Self::CheckForUpdates => "Check for updates…",
             Self::Settings => "Settings…",
             Self::Welcome => "Welcome screen…",
@@ -550,6 +559,7 @@ impl Command {
             Self::Search => Icon::Find,
             Self::ToggleMotion => Icon::Sparkle,
             Self::ToggleUpdateChecks | Self::CheckForUpdates => Icon::Restart,
+            Self::ToggleLinkFetch => Icon::Link,
             Self::Settings => Icon::Settings,
             Self::Welcome => Icon::Explore,
             Self::SelectTheme => Icon::SectionAppearance,
@@ -680,7 +690,8 @@ impl Command {
             | Self::ToggleUnits
             | Self::FitText
             | Self::ToggleMotion
-            | Self::ToggleUpdateChecks => "",
+            | Self::ToggleUpdateChecks
+            | Self::ToggleLinkFetch => "",
             Self::Align(_) | Self::Distribute(_) | Self::Separate => "",
             // No key: a whole-board relayout is deliberate and rare, and a
             // single letter that scattered twenty thousand cards would be the
@@ -930,6 +941,7 @@ impl Command {
             // which is why they read from `prefs` and not from `settings`.
             Self::ToggleMotion => Some(view.prefs.motion),
             Self::ToggleUpdateChecks => Some(view.prefs.update),
+            Self::ToggleLinkFetch => Some(view.prefs.fetch_links),
             // The arrangement the board was last laid out in, so the Layout
             // list reads as a state and not only as eight verbs.
             Self::Arrange(arrangement) => {
@@ -992,6 +1004,7 @@ impl Command {
             Self::ToggleUnits => view.toggle_units(cx),
             Self::ToggleMotion => view.toggle_pref(Self::ToggleMotion, cx),
             Self::ToggleUpdateChecks => view.toggle_pref(Self::ToggleUpdateChecks, cx),
+            Self::ToggleLinkFetch => view.toggle_pref(Self::ToggleLinkFetch, cx),
             Self::OpenBoard => view.open_switcher(window, cx),
             Self::Palette => view.open_palette(crate::palette::Mode::Commands, cx),
             Self::Search => view.open_palette(crate::palette::Mode::Search, cx),
@@ -1083,6 +1096,7 @@ impl Command {
             // thing somebody is looking for is usually "reduced motion".
             Self::ToggleMotion => "reduced motion accessibility animate",
             Self::ToggleUpdateChecks => "updates version automatic",
+            Self::ToggleLinkFetch => "paste url download embed privacy network",
             Self::CheckForUpdates => "upgrade version new",
             Self::Settings => "preferences options configure grid step gap spacing media fit",
             Self::Welcome => "first run setup onboarding getting started tour demo again",
@@ -1186,6 +1200,7 @@ impl Command {
             Self::ToggleLandscape,
             Self::ToggleMotion,
             Self::ToggleUpdateChecks,
+            Self::ToggleLinkFetch,
             Self::CheckForUpdates,
             Self::Settings,
             Self::Welcome,
@@ -1804,6 +1819,7 @@ mod tests {
                 | Command::Calibrate
                 | Command::ToggleMotion
                 | Command::ToggleUpdateChecks
+                | Command::ToggleLinkFetch
                 | Command::OpenBoard
                 | Command::Palette
                 | Command::Search
@@ -1845,12 +1861,12 @@ mod tests {
                 }
             }
         }
-        // 63 nullary, plus the eight that carry values mapped over their own
+        // 64 nullary, plus the eight that carry values mapped over their own
         // modules' lists: 8 arrangements, 8 paper sizes, 6 edges, 2 axes, 5
         // colours, 4 arrows, 3 styles, 3 weights.
         assert_eq!(
             Command::all().len(),
-            63 + 8 + 8 + 6 + 2 + 5 + 4 + 3 + 3,
+            64 + 8 + 8 + 6 + 2 + 5 + 4 + 3 + 3,
             "a command was added to the enum and not to Command::all",
         );
     }
