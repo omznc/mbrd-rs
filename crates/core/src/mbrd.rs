@@ -161,7 +161,7 @@ pub fn read_watched<R: Read + Seek>(
 
     let mut total: u64 = 0;
     for i in 0..zip.len() {
-        let mut entry = zip.by_index(i)?;
+        let entry = zip.by_index(i)?;
         if entry.is_dir() {
             continue;
         }
@@ -173,16 +173,33 @@ pub fn read_watched<R: Read + Seek>(
             Some(n) => n,
             None => continue,
         };
-        if entry.size() > MAX_ENTRY {
+        let declared = entry.size();
+        if declared > MAX_ENTRY {
             continue;
         }
-        total = total.saturating_add(entry.size());
+        total = total.saturating_add(declared);
         if total > MAX_ARCHIVE {
             bail!("archive is larger than the format allows");
         }
 
-        let mut bytes = Vec::with_capacity(entry.size().min(1 << 20) as usize);
-        entry.read_to_end(&mut bytes)?;
+        // **`declared` is a number the archive chose about itself, and the
+        // read below is what stops it being taken on trust.** `zip` bounds the
+        // *compressed* side of an entry — `.take(compressed_size)` on the way
+        // into the decompressor — and nothing bounds the other, so an entry
+        // that says a hundred bytes and inflates to a gigabyte would be a
+        // gigabyte in this `Vec` before the CRC at the end of the stream had a
+        // chance to disagree. The ceiling above would have been checked against
+        // the lie rather than against the bytes.
+        //
+        // So the read is capped at one byte past what was promised, and an
+        // entry that overruns is dropped like any other malformed one. That
+        // also turns the two ceilings into limits on bytes that actually
+        // arrive, which is what they were written to be.
+        let mut bytes = Vec::with_capacity(declared.min(1 << 20) as usize);
+        let read = entry.take(declared + 1).read_to_end(&mut bytes)? as u64;
+        if read != declared {
+            continue;
+        }
         // After the read rather than before it, so the number describes work
         // that has happened rather than work about to.
         watch(total, expected);
@@ -769,6 +786,58 @@ mod tests {
             }
         }
         out.finish().unwrap().into_inner()
+    }
+
+    /// The same archive with one entry's declared uncompressed size rewritten.
+    ///
+    /// That number lives in the central directory, which is where `entry.size()`
+    /// reads it from, and rewriting it is the whole of what a zip bomb is: the
+    /// claim stops describing what comes out of the decompressor. The compressed
+    /// side is left exactly as it was, so the entry still inflates in full.
+    fn understating(packed: Vec<u8>, prefix: &str, claim: u32) -> Vec<u8> {
+        let mut out = packed;
+        let mut at = 0;
+        while let Some(found) = out[at..].windows(4).position(|w| w == b"PK\x01\x02") {
+            let record = at + found;
+            let name_len = u16::from_le_bytes([out[record + 28], out[record + 29]]) as usize;
+            let name = &out[record + 46..record + 46 + name_len];
+            if name.starts_with(prefix.as_bytes()) {
+                out[record + 24..record + 28].copy_from_slice(&claim.to_le_bytes());
+                return out;
+            }
+            at = record + 4;
+        }
+        panic!("no entry under {prefix} in the archive");
+    }
+
+    #[test]
+    fn an_entry_that_inflates_past_what_it_declared_is_dropped() {
+        // `MAX_ENTRY` and `MAX_ARCHIVE` are checked against `entry.size()`,
+        // which is a number the archive writes about itself — and `zip` bounds
+        // only the *compressed* side of a read. So an archive that understates
+        // an entry used to have it read in full, past both ceilings and into
+        // memory, with the CRC only disagreeing once the damage was done.
+        let doc = doc_with_a_photo_and_a_note();
+        let packed = to_bytes(&doc, "now").unwrap();
+
+        // A megabyte of one repeated byte — a few hundred bytes on disk, and
+        // the shape every bomb has. Small here because the assertion is about
+        // the guard, not about how far it can be pushed.
+        let fat = "z".repeat(1024 * 1024);
+        let rezipped = with_sidecars_rewritten(packed, &fat);
+        let lying = understating(rezipped, "notes/", 16);
+
+        // The archive still opens: one bad entry is dropped like any other
+        // malformed one, rather than taking the board down with it.
+        let back = read(Cursor::new(lying)).unwrap();
+
+        // And the sidecar was dropped rather than believed, so the note still
+        // says what `board.json` says. Had the read been honoured it would
+        // have outranked `board.json` and been promoted to its own asset —
+        // see the two tests above, which are that path working.
+        let note = back.board.item("p81m4x").unwrap();
+        assert_eq!(note.note_text(), Some("# buy the smaller one\n\nthe big one does not fit"));
+        assert!(note.asset.is_none(), "a dropped sidecar must not promote anything");
     }
 
     #[test]

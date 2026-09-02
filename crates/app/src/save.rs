@@ -4,7 +4,8 @@
 //! pointer is doing, and a file write is the one thing in this app that can
 //! lose work. It is easier to be careful about in a module that does nothing else.
 
-use std::io::Cursor;
+use std::fs::File;
+use std::io::{Cursor, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -19,12 +20,49 @@ use mbrd_core::Document;
 /// halfway through into a board that is neither the old one nor the new one.
 /// The rename is what makes the swap all-or-nothing, and it has to be the *same
 /// directory* or it stops being a rename and becomes a copy.
+///
+/// **A rename alone is not the whole of it, and the missing half is the flush.**
+/// Renaming is atomic against another *process* — that is what stops a reader
+/// opening a board that is still being written — but it is not atomic against
+/// the power going out. The directory entry is metadata and the archive is
+/// data, and on every filesystem here they can reach the disk in that order, so
+/// a machine that loses power in the wrong second comes back to a board that is
+/// exactly the thing this function exists to prevent. [`through`] orders them.
+///
+/// It matters more here than the shape of the code suggests, because
+/// `BoardView::arm_autosave` runs this on a timer with nobody watching — which
+/// is the whole of why this app has no unsaved-work indicator.
 pub fn write(path: &Path, doc: &Document) -> Result<()> {
     let bytes = mbrd_core::mbrd::to_bytes(doc, &now_iso8601()).context("packing the board")?;
 
     let temp = path.with_extension("mbrd.part");
-    std::fs::write(&temp, &bytes).with_context(|| format!("writing {}", temp.display()))?;
-    std::fs::rename(&temp, path).with_context(|| format!("replacing {}", path.display()))?;
+    through(&temp, path, &bytes).inspect_err(|_| {
+        // Best effort, and the same rule `spill::write_through` follows: a part
+        // file left beside the board is megabytes nothing will ever come back
+        // for, and this write is already being reported as having failed.
+        let _ = std::fs::remove_file(&temp);
+    })
+}
+
+/// The write, the flush, and the rename — see [`write`], which is where the
+/// order is argued. Split out only so that a failure anywhere in it has one
+/// place to be cleaned up after.
+fn through(temp: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = File::create(temp).with_context(|| format!("writing {}", temp.display()))?;
+    file.write_all(bytes).with_context(|| format!("writing {}", temp.display()))?;
+    file.sync_all().with_context(|| format!("flushing {}", temp.display()))?;
+    drop(file);
+
+    std::fs::rename(temp, path).with_context(|| format!("replacing {}", path.display()))?;
+
+    // And the rename, which is a change to the *directory* and needs the same
+    // treatment for the same reason. Best effort rather than checked: Windows
+    // will not open a directory as a file at all, and the failure here is
+    // benign in a way the one above is not — a board whose rename is not yet
+    // durable is still the old board on disk, which is a board.
+    if let Some(dir) = path.parent() {
+        let _ = File::open(dir).and_then(|dir| dir.sync_all());
+    }
     Ok(())
 }
 
@@ -48,4 +86,53 @@ pub fn write(path: &Path, doc: &Document) -> Result<()> {
 pub fn read_watched(path: &Path, watch: impl FnMut(u64, u64)) -> Result<Document> {
     let bytes = std::fs::read(path).context("reading the file")?;
     mbrd_core::mbrd::read_watched(Cursor::new(bytes), watch).context("reading the board")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(what: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mbrd-save-{what}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temporary directory");
+        dir
+    }
+
+    fn a_board() -> Document {
+        Document::default()
+    }
+
+    #[test]
+    fn a_written_board_leaves_no_part_file_beside_it() {
+        // The part file is an implementation detail of the swap and must not
+        // outlive it — a `.part` sitting next to a board is the one thing in
+        // this directory nothing else will ever come back for.
+        let dir = scratch("clean");
+        let path = dir.join("board.mbrd");
+
+        write(&path, &a_board()).expect("writing");
+
+        assert!(path.is_file(), "the board is where it was asked for");
+        assert!(!path.with_extension("mbrd.part").exists(), "the part file was renamed, not left");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_that_fails_takes_its_part_file_with_it() {
+        // The failure arm. Before this, a rename that failed left the whole
+        // archive behind under `.part` and nothing swept it — see `write`,
+        // which now cleans up after every arm of `through` rather than only
+        // after the ones that never ran.
+        let dir = scratch("failing");
+        // A board *inside a file*: the parent of the part file is not a
+        // directory, so `File::create` cannot make it.
+        let wall = dir.join("wall");
+        std::fs::write(&wall, b"not a directory").expect("writing");
+        let path = wall.join("board.mbrd");
+
+        assert!(write(&path, &a_board()).is_err(), "there is nowhere to put this");
+        assert!(!path.with_extension("mbrd.part").exists(), "no part file survived the failure");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -3087,7 +3087,18 @@ impl BoardView {
         let Some(path) =
             self.path.clone().or_else(|| fresh_board_path(&self.doc.board, &self.prefs))
         else {
-            return true;
+            // The same answer `write_board` gives to the same question, and
+            // through the same gate as a failed write below rather than past
+            // it. There is nowhere on this computer to put the board, and a
+            // window that closed quietly on that would be the one route by
+            // which unsaved work leaves without a word.
+            if self.close_refused {
+                return true;
+            }
+            self.close_refused = true;
+            self.warn("nowhere to save: no home directory".into());
+            cx.notify();
+            return false;
         };
         match crate::save::write(&path, &self.doc) {
             Ok(()) => {
