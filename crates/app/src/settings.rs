@@ -1265,8 +1265,11 @@ fn appearance_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
             )
             .into(),
             (None, true) => {
-                format!("The palette worn when the app is {}.", appearance.label().to_lowercase())
-                    .into()
+                let when = appearance.label().to_lowercase();
+                match live {
+                    true => format!("The palette worn when the app is {when}, which it is now.").into(),
+                    false => format!("The palette worn when the app is {when}.").into(),
+                }
             }
         };
         let id = match appearance {
@@ -1277,7 +1280,7 @@ fn appearance_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
             Section::Appearance,
             format!("{} theme", appearance.label()),
             about,
-            dropdown(id, appearance, &name, known, live, theme, cx, |this, appearance, cx| {
+            dropdown(id, appearance, &name, known, theme, cx, |this, appearance, cx| {
                 this.pick_theme(appearance, cx)
             }),
         ));
@@ -1310,16 +1313,11 @@ fn appearance_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
 /// Wears the two carets a dropdown wears, because from where somebody is
 /// sitting that is what it is — what it *opens* is a searchable panel rather
 /// than a popup, for the reasons [`Picker`] gives.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one control, and every one of these is a fact about the row it sits in"
-)]
 pub(crate) fn dropdown(
     id: &'static str,
     appearance: Appearance,
     name: &str,
     known: bool,
-    live: bool,
     theme: Theme,
     cx: &mut Context<BoardView>,
     open: fn(&mut BoardView, Appearance, &mut Context<BoardView>),
@@ -1338,10 +1336,12 @@ pub(crate) fn dropdown(
         .bg(theme.chrome)
         .border_1()
         .border_color(theme.chrome_edge)
-        // The row for the appearance that is not currently on screen is drawn
-        // quieter, so the page says which of the two is answering right now
-        // without taking the other away.
-        .when(!live, |d| d.opacity(0.65))
+        .cursor_pointer()
+        // **Both at full strength, and which one is being worn is said in
+        // words.** The slot not on screen used to be drawn at 65% — meaning
+        // "not the half you are looking at" in the same dimming that means
+        // "cannot be pressed" two rows up this page. It could be pressed, and
+        // was the only control here that could while looking like it could not.
         .hover(|s| s.bg(theme.accent.opacity(0.10)))
         .active(|s| s.bg(theme.accent.opacity(0.18)))
         .on_mouse_down(
@@ -1712,9 +1712,10 @@ pub(crate) fn button(
         .rounded(px(crate::theme::RADIUS_SM))
         .text_size(px(11.0))
         .border_1()
-        .border_color(theme.chrome_edge)
         .when(live, |d| {
-            d.bg(theme.chrome)
+            d.border_color(theme.chrome_edge)
+                .bg(theme.chrome)
+                .cursor_pointer()
                 .hover(|s| s.bg(theme.accent.opacity(0.10)))
                 .active(|s| s.bg(theme.accent.opacity(0.18)))
                 .on_mouse_down(
@@ -1725,7 +1726,13 @@ pub(crate) fn button(
                     }),
                 )
         })
-        .when(!live, |d| d.text_color(theme.muted))
+        // A button that cannot be pressed has to stop looking like one. It used
+        // to keep the border and the fill of a live button and only grey its
+        // word, which reads as a button that works — so the two were told apart
+        // by pressing, and pressing did nothing. The chrome goes with the
+        // handler; *why* it went is in the row's own sentence, which is what
+        // that sentence is for.
+        .when(!live, |d| d.border_color(theme.chrome_edge.opacity(0.5)).text_color(theme.tertiary))
         .child(word.into())
         .into_any_element()
 }
@@ -1735,7 +1742,13 @@ pub(crate) fn button(
 /// same stepper the titlebar badge walks.
 fn update_row(view: &BoardView, cx: &mut Context<BoardView>) -> Spec {
     let theme = view.theme;
-    let live = Command::CheckForUpdates.available(view);
+    // **Not `Command::available`, which answers a different question.** That one
+    // is "can this build update at all", which is right for the menu row and for
+    // `Ctrl U` — both of which should still say so out loud when the answer is
+    // no. A button is a press, and a press is only worth offering when it would
+    // achieve something, which also takes the switch in the row above this one.
+    let possible = Command::CheckForUpdates.available(view);
+    let live = possible && view.prefs.update;
     let word = match view.update_badge() {
         // Nothing waiting, or a build with no updater in it at all. Either way
         // the only thing a press can do is ask.
@@ -1745,10 +1758,18 @@ fn update_row(view: &BoardView, cx: &mut Context<BoardView>) -> Spec {
         Some(UpdateBadge::Ready { .. }) => "Restart to update",
         Some(UpdateBadge::Installing { .. }) => "Installing…",
     };
-    let about: SharedString = if live {
-        format!("You have mbrd {}.", crate::update::version::Version::current()).into()
-    } else {
-        "This build was not installed from a release, so it has nothing to update.".into()
+    let about: SharedString = match (possible, view.prefs.update) {
+        (true, true) => {
+            format!("You have mbrd {}.", crate::update::version::Version::current()).into()
+        }
+        // The reason a dead button is dead, in the row's own sentence rather
+        // than in a status line this page is covering.
+        (true, false) => "Looking for new versions is switched off in the row above, so there is \
+                          nothing for this to ask."
+            .into(),
+        (false, _) => {
+            "This build was not installed from a release, so it has nothing to update.".into()
+        }
     };
     spec(
         Section::Updates,

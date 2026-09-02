@@ -539,13 +539,32 @@ fn appearance(view: &BoardView, cx: &mut Context<BoardView>) -> AnyElement {
                 .items_center()
                 .justify_between()
                 .gap(px(16.0))
-                .child(div().text_size(px(12.5)).child(format!("{} theme", appearance.label())))
+                .child(
+                    div()
+                        .flex()
+                        .items_baseline()
+                        .gap(px(6.0))
+                        .text_size(px(12.5))
+                        .child(format!("{} theme", appearance.label()))
+                        // Which of the pair is on screen right now, said rather
+                        // than drawn — the dropdown used to answer this by
+                        // dimming the other one to 65%, which is what this app
+                        // does to a control that cannot be pressed, and that one
+                        // could.
+                        .when(worn == appearance, |d| {
+                            d.child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(theme.accent_text)
+                                    .child("on screen now"),
+                            )
+                        }),
+                )
                 .child(settings::dropdown(
                     id,
                     appearance,
                     &name,
                     known,
-                    worn == appearance,
                     theme,
                     cx,
                     |this, appearance, cx| this.pick_welcome_theme(appearance, cx),
