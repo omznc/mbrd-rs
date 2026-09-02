@@ -425,6 +425,19 @@ fn open_window(cx: &mut App, doc: Document, title: String) -> Option<Entity<Boar
                 observed.update(cx, |view, cx| view.desktop_appearance(looks, cx));
             })
             .detach();
+
+        // And `settings.json`, whenever this window comes back to the front.
+        //
+        // The settings page has a button that opens that file in a text editor,
+        // and until this existed nothing ever read it again — so an edit made
+        // there was overwritten by the copy in memory the next time any switch
+        // was flipped. Coming back to the window is exactly the moment somebody
+        // returns from their editor, and `reread_prefs` does nothing at all
+        // when the file has not changed.
+        //
+        // Fires on deactivation too, which is harmless for the same reason:
+        // this only ever reads.
+        cx.observe_window_activation(window, |view, _window, cx| view.reread_prefs(cx)).detach();
     });
 
     window.entity(cx).ok()

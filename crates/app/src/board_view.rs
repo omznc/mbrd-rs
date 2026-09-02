@@ -3261,6 +3261,7 @@ impl BoardView {
         let (label, flag) = match which {
             Command::ToggleMotion => ("Animation", &mut self.prefs.motion),
             Command::ToggleUpdateChecks => ("Looking for new versions", &mut self.prefs.update),
+            Command::ToggleLinkFetch => ("Fetching pasted links", &mut self.prefs.fetch_links),
             _ => return,
         };
         *flag = !*flag;
@@ -3270,11 +3271,20 @@ impl BoardView {
         // An environment variable beats the file at load, so a choice that is
         // being overridden has to say so rather than appearing to take and then
         // silently not surviving a restart.
-        match crate::prefs::Prefs::forced(match which {
-            Command::ToggleMotion => crate::prefs::Setting::Motion,
-            _ => crate::prefs::Setting::Update,
-        }) {
-            Some(var) => self.warn(format!("{label} is set by {var}, which wins at startup")),
+        // `None` for anything no variable can force, which is how a switch with
+        // nothing overriding it gets the ordinary confirmation below.
+        let overriding = match which {
+            Command::ToggleMotion => crate::prefs::Prefs::forced(crate::prefs::Setting::Motion),
+            Command::ToggleUpdateChecks => {
+                crate::prefs::Prefs::forced(crate::prefs::Setting::Update)
+            }
+            _ => None,
+        };
+        match overriding {
+            Some(var) => self.warn(format!(
+                "{label} {} — {var} sets it again at startup",
+                if now { "on" } else { "off" }
+            )),
             // The menu this came from closes on the press that got here, so
             // there is nothing left on screen to confirm the flip — the bar
             // is the only place left to say it happened.
@@ -5867,13 +5877,12 @@ impl BoardView {
         if self.prefs.welcomed {
             return;
         }
-        self.prefs.welcomed = true;
-        crate::prefs::save(&self.prefs);
-        if crate::prefs::Prefs::forced(crate::prefs::Setting::Appearance).is_some()
-            || crate::prefs::Prefs::forced(crate::prefs::Setting::Theme).is_some()
-        {
-            return;
-        }
+        // **Not written here.** It used to be, before the screen was even
+        // shown, so a quit or a crash part-way through burned the one first run
+        // there is — and an environment variable that answered only the *first*
+        // page took the whole screen with it and marked it done. `Welcome::open`
+        // now drops that page and keeps the rest; `close_welcome` writes this
+        // once the screen has actually been seen.
         let boards = self.prefs.boards();
         self.open_overlay(Overlay::Welcome(crate::welcome::Welcome::open(boards.as_deref())));
         cx.notify();
@@ -5898,6 +5907,15 @@ impl BoardView {
             // on press; a text field has no press to hang that on, so this is
             // the one that needs a moment.
             self.commit_welcome_folder();
+            // Seen, by whatever route out — Escape, a door, or the close
+            // button. Written here rather than before the screen was shown, so
+            // a quit part-way through leaves the one first run there is still
+            // to come. Every *answer* is already through; this is only the
+            // record that the asking happened. See `welcome_if_new`.
+            if !self.prefs.welcomed {
+                self.prefs.welcomed = true;
+                crate::prefs::save(&self.prefs);
+            }
             self.close_overlay();
             cx.notify();
         }
@@ -6247,6 +6265,33 @@ impl BoardView {
             self.theme = theme;
             cx.notify();
         }
+    }
+
+    /// Read `settings.json` again, because somebody may have been editing it.
+    ///
+    /// **`Edit in settings.json` invites an edit this app would otherwise
+    /// overwrite.** `prefs::save` reads the file, re-inserts every key this
+    /// build knows from the copy in memory, and writes it back — unknown keys
+    /// survive, which is the documented bargain, and a hand-edited `mode` or
+    /// `newBoardGridStep` did not: the next flip of any switch put the
+    /// in-memory value back over the top of it.
+    ///
+    /// So the file is read again whenever the window comes back to the front,
+    /// which is the moment somebody returns from their editor. Nothing is
+    /// written here — this is the other direction — and the palette is
+    /// re-resolved because the two theme names are among the keys that can have
+    /// changed underneath.
+    ///
+    /// Cheap, total, and safe to run when nothing has changed: `prefs::load` is
+    /// a file read and a handful of `get`s, and it falls back to the defaults
+    /// rather than failing.
+    pub fn reread_prefs(&mut self, cx: &mut Context<Self>) {
+        let fresh = crate::prefs::load();
+        if fresh == self.prefs {
+            return;
+        }
+        self.prefs = fresh;
+        self.retheme(cx);
     }
 
     /// Read the themes directory again.
@@ -8161,7 +8206,13 @@ impl BoardView {
             // An address that points at a file is that file. A link card is
             // what is left when it points at a page, when the fetch fails, or
             // when somebody said they meant the address — see `paste_raw`.
-            if !raw && fetch::worth_trying(url) {
+            // `prefs.fetch_links` before `worth_trying`, because the cheap
+            // half of that decision is still a decision to go and look: a paste
+            // is the one thing in this app that reaches a computer somebody else
+            // owns without being asked, and the switch is what makes that a
+            // choice. Off, this falls through to the link card a failed fetch
+            // would have left anyway.
+            if !raw && self.prefs.fetch_links && fetch::worth_trying(url) {
                 self.fetch_onto(url.to_string(), at, cx);
                 return;
             }
