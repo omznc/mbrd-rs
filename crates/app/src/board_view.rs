@@ -5791,6 +5791,55 @@ impl BoardView {
         )
     }
 
+    /// The line the status bar is saying, drawn over a page that is covering
+    /// the status bar.
+    ///
+    /// **`tell` and `warn` are the only way anything in this app reports, and
+    /// the bar they report on is board chrome that sits under every full-window
+    /// page** — see `Render`, where `status_bar` is a child of the strip and the
+    /// overlay is drawn after it. So a press on *Check for updates* or *Edit in
+    /// settings.json* used to answer onto a surface nobody could see, and the
+    /// four-second timer usually took the answer away before the page closed.
+    ///
+    /// Only the line, and not the rest of the bar: the counts, the scale and the
+    /// zoom are facts about a board that is not on screen. `None` whenever the
+    /// bar is doing its own job, so this cannot draw twice.
+    fn covered_status(&self) -> Option<impl IntoElement> {
+        if !self.covered() {
+            return None;
+        }
+        let said = self.said.as_ref().filter(|said| said.tone.shown())?;
+        Some(
+            div()
+                .absolute()
+                .bottom(px(18.0))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                // The press goes nowhere. This floats over a page whose own
+                // ground already answers for presses, and a line that swallowed
+                // one would be a hole in that page the width of a sentence.
+                .occlude()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .max_w(px(560.0))
+                        .px(px(12.0))
+                        .py(px(7.0))
+                        .rounded(px(crate::theme::RADIUS_MD))
+                        .bg(self.theme.chrome)
+                        .border_1()
+                        .border_color(self.theme.chrome_edge)
+                        .shadow(self.theme.shadow_medium())
+                        .text_size(px(11.0))
+                        .text_color(self.theme.muted)
+                        .child(said_line(said, self.theme)),
+                ),
+        )
+    }
+
     pub fn close_settings(&mut self) {
         if matches!(self.overlay, Overlay::Settings(_)) {
             self.close_overlay();
@@ -6793,6 +6842,15 @@ impl BoardView {
             What::Does(command) => {
                 if command.available(self) {
                     command.run(self, window, cx);
+                } else {
+                    // **The palette dims a row rather than leaving it out — see
+                    // `Command::available` — so this one can be arrowed onto and
+                    // pressed, and a press that did nothing at all was the one
+                    // silent failure in the app.** The bar is visible under the
+                    // palette, which floats; `covered_status` is for the pages
+                    // that are not.
+                    let named = command.label().trim_end_matches('\u{2026}');
+                    self.tell(format!("{named} does not apply right now"));
                 }
             }
             What::Goes { id, .. } => self.reveal(&id, cx),
@@ -13843,57 +13901,7 @@ impl BoardView {
             // failure is cut rather than pushing the zoom off the edge.
             .child(
                 div().flex().flex_1().min_w_0().items_center().child(match &line {
-                    Some(said) => {
-                        let words = said.tone.colour(&theme);
-                        let mode = said.tone == Tone::Mode;
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .min_w_0()
-                            .px(px(12.0))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(7.0))
-                                    .min_w_0()
-                                    // **The only tone that gets a container.**
-                                    // A mode stands until it is replaced,
-                                    // which every other line here does not —
-                                    // so it has to read as a state the window
-                                    // is *in* rather than as something that
-                                    // just happened and is about to go. A
-                                    // border is what says that, and it is the
-                                    // difference between a line somebody
-                                    // stops seeing after ten seconds and one
-                                    // they can still find when they wonder
-                                    // why Escape is doing something odd.
-                                    .when(mode, |d| {
-                                        d.px(px(7.0))
-                                            .py(px(2.0))
-                                            .ml(px(-3.0))
-                                            .rounded(px(crate::theme::RADIUS_XS))
-                                            .bg(theme.accent.opacity(0.10))
-                                            .border_1()
-                                            .border_color(theme.accent.opacity(0.35))
-                                    })
-                                    .child(icon(said.tone.icon(), 13.0, said.tone.mark(&theme)))
-                                    .child(
-                                        div()
-                                            .truncate()
-                                            .text_color(words)
-                                            // A failure carries the weight as
-                                            // well as the colour: see
-                                            // `Tone::colour`.
-                                            .when(said.tone == Tone::Wrong, |d| {
-                                                d.font_weight(FontWeight::MEDIUM)
-                                            })
-                                            .child(said.text.clone()),
-                                    ),
-                            )
-                            .into_any_element()
-                    }
+                    Some(said) => said_line(said, theme),
                     None => div()
                         .flex()
                         .items_center()
@@ -15867,6 +15875,65 @@ impl Focusable for BoardView {
     }
 }
 
+/// The line the status bar is saying, on its own.
+///
+/// Its own function because it is drawn in two places now. The bar is board
+/// chrome and sits under everything — see `Render` — so a page that owns the
+/// whole window covers it, and every `tell` and `warn` raised from a control on
+/// one of those pages used to report to a surface nobody could see. The same
+/// line is drawn over them by `BoardView::covered_status`, and it has to be the
+/// *same* line: two of these would be two places for a tone to stop meaning
+/// what it means.
+fn said_line(said: &Said, theme: Theme) -> gpui::AnyElement {
+    let words = said.tone.colour(&theme);
+    let mode = said.tone == Tone::Mode;
+    div()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .min_w_0()
+        .px(px(12.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(7.0))
+                .min_w_0()
+                // **The only tone that gets a container.**
+                // A mode stands until it is replaced,
+                // which every other line here does not —
+                // so it has to read as a state the window
+                // is *in* rather than as something that
+                // just happened and is about to go. A
+                // border is what says that, and it is the
+                // difference between a line somebody
+                // stops seeing after ten seconds and one
+                // they can still find when they wonder
+                // why Escape is doing something odd.
+                .when(mode, |d| {
+                    d.px(px(7.0))
+                        .py(px(2.0))
+                        .ml(px(-3.0))
+                        .rounded(px(crate::theme::RADIUS_XS))
+                        .bg(theme.accent.opacity(0.10))
+                        .border_1()
+                        .border_color(theme.accent.opacity(0.35))
+                })
+                .child(icon(said.tone.icon(), 13.0, said.tone.mark(&theme)))
+                .child(
+                    div()
+                        .truncate()
+                        .text_color(words)
+                        // A failure carries the weight as
+                        // well as the colour: see
+                        // `Tone::colour`.
+                        .when(said.tone == Tone::Wrong, |d| d.font_weight(FontWeight::MEDIUM))
+                        .child(said.text.clone()),
+                ),
+        )
+        .into_any_element()
+}
+
 impl Render for BoardView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Everything that is moving, moved on by one frame — and if anything
@@ -16056,6 +16123,11 @@ impl Render for BoardView {
                     // fields this replaced, there is no order between them
                     // left to get wrong.
                     .children(overlay)
+                    // Over the page rather than under it, because the bar the
+                    // rest of the app reports on is under it. See
+                    // `covered_status`, and `status_bar` above, which is the
+                    // same line in its ordinary place.
+                    .children(self.covered_status())
                     // Last, and above everything: while a board is being read
                     // it is the only thing on screen that is still happening.
                     .children(self.loader()),

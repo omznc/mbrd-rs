@@ -816,7 +816,15 @@ impl Command {
     ///
     /// The palette is the other half of that bargain and is why it costs
     /// nothing: every command is on it, always, whether or not a menu is
-    /// currently offering it — so "it disappeared" is never "it is gone".
+    /// currently offering it — so "it disappeared" is never "it is gone". A
+    /// press on one of those dimmed rows is answered rather than ignored; see
+    /// `BoardView::run_palette_choice`.
+    ///
+    /// **A key press does not consult this, deliberately.** `Ctrl U` on a build
+    /// with no updater in it reaches `update_step` and gets told why, which is
+    /// the useful answer; gating the keyboard here would turn every one of those
+    /// into a key that does nothing. `run` is where a command answers for
+    /// itself, and this is only what the two *lists* draw with.
     pub fn available(self, view: &BoardView) -> bool {
         let selected = !view.selection.is_empty();
         let roped = view.rope.is_some();
