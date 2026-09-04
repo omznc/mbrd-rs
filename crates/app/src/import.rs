@@ -253,6 +253,14 @@ pub fn card(ready: &Ready, id: String, at: mbrd_core::geometry::Point, z: f32) -
     // original file survives a round trip even though nothing reads it.
     if let Some(text) = &ready.text {
         item.meta.insert("text".into(), serde_json::Value::String(text.clone()));
+        // And the card follows those words instead of cropping them. A file
+        // that arrives as a note arrives with its text already written on the
+        // card, so a fixed 260 by 200 hides most of what was dropped — which is
+        // the one thing a dropped text file is for. The height itself is not
+        // decided here: measuring words needs the fonts, and this runs on the
+        // task that reads the file, so `BoardView::arrive` does the measuring
+        // as the card lands.
+        item.meta.insert(crate::board_view::FIT_TEXT.into(), serde_json::Value::Bool(true));
     }
     // A measurement, not a decision: it says what the file is, so it is written
     // only where it was actually read and re-derivable if it ever is not.
@@ -786,6 +794,29 @@ mod tests {
         assert_eq!(ready.kind, ItemType::Note);
         let item = card(&ready, "x".into(), mbrd_core::geometry::point(0.0, 0.0), 1.0);
         assert_eq!(item.note_text(), Some("# a heading\n\nand a thought"));
+    }
+
+    #[test]
+    fn a_dropped_text_file_lands_as_a_note_that_grows_to_its_words() {
+        // The flag, not the height: what a note needs is measured against the
+        // fonts, which live on the window, so the card lands carrying the ask
+        // and `BoardView::arrive` answers it.
+        let note = ready("thoughts.md", b"# a heading\n\nand a thought".to_vec());
+        let item = card(&note, "x".into(), mbrd_core::geometry::point(0.0, 0.0), 1.0);
+        assert_eq!(
+            item.meta.get(crate::board_view::FIT_TEXT).and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+
+        // And nothing else asks. A photograph has a shape of its own and a fit
+        // would throw it away.
+        let picture = card(
+            &ready("wide.png", png(1600, 400)),
+            "y".into(),
+            mbrd_core::geometry::point(0.0, 0.0),
+            1.0,
+        );
+        assert!(picture.meta.get(crate::board_view::FIT_TEXT).is_none());
     }
 
     #[test]

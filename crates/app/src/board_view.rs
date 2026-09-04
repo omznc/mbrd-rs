@@ -8433,10 +8433,19 @@ impl BoardView {
         let placed = ours.then(|| importing.placed.clone());
         let open = importing.open.clone();
 
+        let measure = self.measure.clone();
         self.doc.board.during(&open, |board| {
             let step = lattice(board);
             board.items.extend(cards.into_iter().map(|mut card| {
                 settle(&mut card, step);
+                // After the snap rather than before it: a fit is measured
+                // against the card's own width, and the snap is what settles
+                // that width. A no-op on everything that did not ask — which is
+                // every card but a dropped text file, whose note is set to
+                // follow its words in `import::card` and would otherwise land
+                // showing the first few lines of the file and cropping the
+                // rest.
+                refit(&mut card, &measure, step);
                 card
             }));
         });
@@ -8903,10 +8912,16 @@ impl BoardView {
         }
 
         let ids: Vec<String> = cards.iter().map(|c| c.id.clone()).collect();
+        let measure = self.measure.clone();
         self.doc.board.edit(&Self::add_label(count), |board| {
             let step = lattice(board);
             board.items.extend(cards.into_iter().map(|mut card| {
                 settle(&mut card, step);
+                // The same fit a drop gets — see `Self::arrive`. Text pasted in
+                // as a file is the same card as text dropped in as one, and a
+                // paste that cropped what a drop showed whole would be the two
+                // doors disagreeing about the same file.
+                refit(&mut card, &measure, step);
                 card
             }));
         });
@@ -16333,7 +16348,7 @@ const SCALE_TEXT: &str = "scaleText";
 /// Present and true, or absent — same shape as [`SCALE_TEXT`], and for the
 /// same reason: a card at the default carries nothing about it, so a board
 /// written by a build that has never heard of this reads back unchanged.
-const FIT_TEXT: &str = "fitText";
+pub(crate) const FIT_TEXT: &str = "fitText";
 
 /// The most lines a fitted note is measured over.
 ///
