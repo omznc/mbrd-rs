@@ -423,6 +423,17 @@ mod tests {
                 return Err(format!("{what} is {ratio:.2}:1 on the chrome"));
             }
         }
+        // A tint is also a mark — the empty board's two doors, the stock
+        // panel's column — and `Theme::legible` is what makes one. 3:1,
+        // because none of those is a word. See `theme.rs`'s own test.
+        for (what, tint) in
+            [("note", t.note), ("image", t.image), ("video", t.video), ("link", t.link)]
+        {
+            let ratio = contrast(t.legible(tint, t.muted), t.chrome);
+            if ratio < 3.0 {
+                return Err(format!("{what} as a mark is {ratio:.2}:1 on the chrome"));
+            }
+        }
         Ok(())
     }
 

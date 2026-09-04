@@ -629,6 +629,27 @@ impl Theme {
         }
     }
 
+    /// A card tint, borrowed as a *mark* on the chrome.
+    ///
+    /// Every colour in the block above — `note`, `image`, `video`, `audio`,
+    /// `link` — is a **fill**: the ground a card of that type is painted with,
+    /// pale on a light theme and dark on a dark one, chosen to sit under words
+    /// rather than to be seen beside them. Drawn as an icon on the chrome it
+    /// is the same lightness as the chrome, which is to say invisible, in both
+    /// palettes and in every theme somebody writes.
+    ///
+    /// So a mark that wants to say "note" or "link" takes the tint's *hue and
+    /// saturation* and the lightness of a colour the theme already guarantees
+    /// is readable on that chrome — `muted` where the mark is what somebody is
+    /// looking at, `tertiary` where it only repeats the word beside it. That
+    /// fixes it for a theme this build has never seen, which is the reason it
+    /// is arithmetic here rather than five more fields in the file format.
+    pub fn legible(&self, tint: Hsla, weight: Hsla) -> Hsla {
+        let mut mark = tint;
+        mark.color.lightness = weight.lightness;
+        mark
+    }
+
     /// One of the colours a card can be tinted, numbered from one.
     ///
     /// **The first four are the theme's own note pad and nothing else.** They
@@ -915,6 +936,31 @@ mod tests {
             {
                 let ratio = contrast(colour, theme.chrome);
                 assert!(ratio >= 4.5, "{name}: {what} is {ratio:.2}:1 on the chrome");
+            }
+        }
+    }
+
+    #[test]
+    fn a_card_tint_borrowed_as_a_mark_can_be_seen_on_the_chrome() {
+        // The bug this arithmetic exists for: a tint drawn as an icon is the
+        // lightness of the chrome under it — 1.02:1 for `note` on the light
+        // palette, which is a mark nobody has ever seen. 3:1 rather than
+        // 4.5:1, because none of these is a word: a mark is furniture, and
+        // that is the floor furniture is held to.
+        for (name, theme) in [("dark", Theme::dark()), ("light", Theme::light())] {
+            for (what, tint) in [
+                ("note", theme.note),
+                ("image", theme.image),
+                ("video", theme.video),
+                ("audio", theme.audio),
+                ("link", theme.link),
+            ] {
+                let ratio = contrast(theme.legible(tint, theme.muted), theme.chrome);
+                assert!(
+                    ratio >= 3.0,
+                    "{name}: {what} as a mark is {ratio:.2}:1 on the chrome, under the 3:1 a \
+                     mark needs",
+                );
             }
         }
     }

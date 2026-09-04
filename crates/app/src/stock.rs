@@ -670,7 +670,10 @@ fn footer(
                     .gap(px(7.0))
                     .text_size(px(11.5))
                     .text_color(theme.muted)
-                    .child(icon(Icon::Told, ICON_SM, theme.link))
+                    // The tint at a weight the chrome under it cannot
+                    // swallow — see `Theme::legible`, and the status line's
+                    // own mark, which is this same blue for the same reason.
+                    .child(icon(Icon::Told, ICON_SM, theme.legible(theme.link, theme.tertiary)))
                     .child(format!(
                         "{} no card. They stay in the file until you save a copy without them.",
                         match report.orphans.count {
@@ -804,8 +807,12 @@ fn shelf(kind: &ItemType, theme: Theme) -> gpui::Hsla {
         ItemType::Image | ItemType::Swatch | ItemType::Sticker => theme.rope_leaf,
         ItemType::Video => theme.rope_accent,
         ItemType::Audio => theme.rope_warm,
-        ItemType::Note | ItemType::Text | ItemType::Title => theme.note,
-        ItemType::Link => theme.link,
+        // The two that are card *fills* rather than marks, taken to a weight
+        // that can be seen on this panel's chrome — see `Theme::legible`. The
+        // three above are rope colours, which are already drawn on the ground
+        // and need nothing.
+        ItemType::Note | ItemType::Text | ItemType::Title => theme.legible(theme.note, theme.muted),
+        ItemType::Link => theme.legible(theme.link, theme.muted),
         _ => theme.muted,
     }
 }

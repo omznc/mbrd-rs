@@ -987,19 +987,11 @@ impl Tone {
             // outline `i` that is the same colour as the sentence beside it is
             // punctuation, not a signal.
             //
-            // **`theme.link`'s hue, and `theme.tertiary`'s lightness.** Not
-            // `theme.link` itself, which is what this was and which drew
-            // nothing at all: that field is a *card tint* — the ground a link
-            // card is filled with — so it is pale on a light theme and dark on
-            // a dark one, which is to say invisible against the chrome under
-            // this mark in both. Borrowing the lightness of a colour the theme
-            // guarantees is readable on that chrome fixes it for every theme
-            // rather than for the two that ship, including one somebody wrote.
-            Tone::Done | Tone::Told => {
-                let mut mark = theme.link;
-                mark.color.lightness = theme.tertiary.lightness;
-                mark
-            }
+            // Through `Theme::legible` rather than in `theme.link` itself,
+            // which is what this was and which drew nothing at all: that field
+            // is a card *fill*. `tertiary`'s weight rather than `muted`'s,
+            // because this mark repeats the word beside it.
+            Tone::Done | Tone::Told => theme.legible(theme.link, theme.tertiary),
         }
     }
 }
@@ -14209,7 +14201,14 @@ impl BoardView {
                                     door(
                                         "empty-note",
                                         Icon::Write,
-                                        theme.note,
+                                        // The tint at a weight that can be
+                                        // seen on the chrome under it, not the
+                                        // tint itself: see `Theme::legible`.
+                                        // These two marks *are* what somebody
+                                        // is looking at on this panel, so
+                                        // `muted`'s weight rather than the
+                                        // status line's `tertiary`.
+                                        theme.legible(theme.note, theme.muted),
                                         "Write a note",
                                         Some(Command::AddNote.hint()),
                                         theme,
@@ -14226,7 +14225,7 @@ impl BoardView {
                                     door(
                                         "empty-paste",
                                         Icon::Paste,
-                                        theme.link,
+                                        theme.legible(theme.link, theme.muted),
                                         "Paste a link",
                                         Some(Command::Paste.hint()),
                                         theme,
