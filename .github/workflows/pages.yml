@@ -1,0 +1,95 @@
+# Builds the web app and publishes it to GitHub Pages.
+#
+# The same binary as every other platform, compiled to `wasm32-unknown-unknown`
+# and served as three files and a page. There is no back end: boards live in
+# the browser's own database, on the machine they were made on — see
+# `crates/app/src/webfs.rs`.
+#
+# Runs on a push to the default branch, and by hand. Deliberately *not* on a
+# tag: the desktop builds are a release somebody downloads and keeps, and a URL
+# is not — it is whatever is at the address today, and what should be there is
+# the last thing that passed CI.
+name: Pages
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+# What the deployment needs and nothing else. `id-token` is how the deploy
+# action proves to Pages that it is this workflow.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time, and never cancel one that is running: a half-published
+# site is worse than a stale one. A queued run supersedes an older queued run,
+# which is the "in-progress: false" half.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      # No Linux packages here, unlike `ci.yml`. Nothing in a wasm build links
+      # against the system: GStreamer, fontconfig and the X11 and Wayland
+      # libraries are all behind a `cfg` that this target does not match —
+      # `main.rs` swaps in `pipeline_off.rs`, and the fonts come from the web
+      # backend itself.
+      - name: Install the wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      # Keyed on the lockfile, so a run that changes no dependency reuses the
+      # whole graph — which for gpui is most of the build.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm
+
+      - name: Install wasm-bindgen
+        run: |
+          # Pinned to the version in the lockfile. A mismatch between the CLI
+          # and the crate is not a build error — it is a schema error thrown in
+          # the browser, at load, on a site that looked like it deployed fine.
+          wanted="$(sed -n '/^name = "wasm-bindgen"$/{n;s/^version = "\(.*\)"/\1/p;}' Cargo.lock | head -1)"
+          cargo install wasm-bindgen-cli --version "$wanted" --locked
+
+      # A release binary rather than the crate, because building binaryen from
+      # source costs more than the whole of the rest of this job.
+      - name: Install wasm-opt
+        run: |
+          version=123
+          curl -sfL "https://github.com/WebAssembly/binaryen/releases/download/version_${version}/binaryen-version_${version}-x86_64-linux.tar.gz" \
+            | tar -xz -C /opt
+          echo "/opt/binaryen-version_${version}/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: scripts/build-web.sh
+
+      # A build that produced nothing would otherwise deploy an empty site over
+      # a working one, and Pages would report it as a success.
+      - name: Check the output is really there
+        run: |
+          test -s dist/mbrd_bg.wasm
+          test -s dist/mbrd.js
+          test -s dist/index.html
+          ls -lh dist/
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

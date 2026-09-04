@@ -16,7 +16,13 @@
 //! The reason it is worth the trouble: every chord worth having in this app is
 //! already taken, and a double-tap spends no key at all.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// WASM EXPERIMENT: std's clock panics on wasm32-unknown-unknown; `web-time`
+// is the same API over `performance.now()`.
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
+#[cfg(target_family = "wasm")]
+use web_time::Instant;
 
 use gpui::Modifiers;
 

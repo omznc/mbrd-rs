@@ -208,7 +208,12 @@ pub fn render(view: &BoardView, window: &Window, cx: &mut Context<BoardView>) ->
                                 |_view, window, _cx| window.zoom_window(),
                             ))
                         })
-                        .child(control(
+                        // Not on the web, where there is no window to close:
+                        // the tab is the window, closing it is the browser's
+                        // own button, and a control here that removed the
+                        // gpui window would leave a blank page nothing could
+                        // bring a board back into.
+                        .when(!cfg!(target_family = "wasm"), |d| d.child(control(
                             "close",
                             Icon::Close,
                             theme.muted,
@@ -224,7 +229,7 @@ pub fn render(view: &BoardView, window: &Window, cx: &mut Context<BoardView>) ->
                                 view.flush(cx);
                                 window.remove_window();
                             },
-                        )),
+                        ))),
                 )
             },
         ))

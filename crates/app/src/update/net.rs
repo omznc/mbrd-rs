@@ -15,16 +15,23 @@
 //! life, which is why [`download`] has a timeout rather than trusting the
 //! other end to hang up.
 
+// All of this belongs to the `ureq` half, which no browser build has: an app
+// served from a URL is updated by reloading it. See the arms below.
+#[cfg(not(target_family = "wasm"))]
 use std::io::Read;
+#[cfg(not(target_family = "wasm"))]
 use std::time::Duration;
 
-use anyhow::{bail, ensure, Context as _, Result};
+#[cfg(not(target_family = "wasm"))]
+use anyhow::{ensure, Context as _};
+use anyhow::{bail, Result};
 
 /// How long to wait on the manifest.
 ///
 /// Short. Nothing is blocked on this — it happens in the background and its
 /// failure mode is saying nothing — so a slow answer is worth less than a
 /// thread back.
+#[cfg(not(target_family = "wasm"))]
 const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How long to give the whole download.
@@ -32,6 +39,7 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 /// Generous, because it is tens of megabytes and somebody may be on a train,
 /// but not unbounded: a connection that stalls forever holds a pool thread
 /// forever, and the app would give no sign of it.
+#[cfg(not(target_family = "wasm"))]
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// The largest manifest worth reading.
@@ -39,9 +47,11 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// It is two kilobytes of JSON. This bound exists so that a URL that has
 /// stopped being a manifest — a login page, an error page, an accidental
 /// redirect to something enormous — is refused rather than read into memory.
+#[cfg(not(target_family = "wasm"))]
 const MANIFEST_CEILING: u64 = 64 * 1024;
 
 /// Who we say we are. Enough for GitHub to see the traffic for what it is.
+#[cfg(not(target_family = "wasm"))]
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .user_agent(concat!("mbrd/", env!("CARGO_PKG_VERSION")))
@@ -54,6 +64,12 @@ fn agent() -> ureq::Agent {
 ///
 /// Used for the manifest and its signature, both of which are tiny and both of
 /// which are checked before a single byte of them is believed.
+#[cfg(target_family = "wasm")]
+pub fn fetch_small(_url: &str) -> Result<String> {
+    bail!("this build does not update itself")
+}
+
+#[cfg(not(target_family = "wasm"))]
 pub fn fetch_small(url: &str) -> Result<String> {
     let mut response = agent().get(url).call().with_context(|| format!("could not reach {url}"))?;
 
@@ -82,6 +98,17 @@ pub fn fetch_small(url: &str) -> Result<String> {
 ///
 /// `progress` is called with the running byte count. It is how the status line
 /// stays honest during the slowest thing the app ever does.
+#[cfg(target_family = "wasm")]
+pub fn download(
+    _url: &str,
+    _expected: u64,
+    _sink: &mut impl std::io::Write,
+    _progress: impl FnMut(u64),
+) -> Result<()> {
+    bail!("this build does not update itself")
+}
+
+#[cfg(not(target_family = "wasm"))]
 pub fn download(
     url: &str,
     expected: u64,

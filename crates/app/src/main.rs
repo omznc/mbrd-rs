@@ -75,6 +75,10 @@ mod shrink;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod spill;
 mod stock;
+// Where a file goes, and — on the web, where there is no disk — what stands
+// in for one. See the module notes; every read and write outside a test goes
+// through `store`.
+mod store;
 mod switcher;
 mod taps;
 mod theme;
@@ -84,6 +88,10 @@ mod titlebar;
 mod tools;
 mod transport;
 mod update;
+#[cfg(target_family = "wasm")]
+mod webfiles;
+#[cfg(target_family = "wasm")]
+mod webfs;
 mod welcome;
 mod wires;
 
@@ -133,6 +141,44 @@ const MIN_SIZE: Size<gpui::Pixels> = Size { width: px(640.0), height: px(420.0) 
 const OPENED_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
 
 fn main() {
+    // The browser's own console is where a panic and every `log` line go, and
+    // the hook has to be in before anything can panic.
+    #[cfg(target_family = "wasm")]
+    gpui_platform::web_init();
+
+    // A browser tab starts with nothing of ours in memory: the files this app
+    // keeps — `settings.json`, the recent list, the themes somebody wrote, the
+    // boards themselves — live in the browser's own database and have to be
+    // read out of it before the first thing asks for them. That read is
+    // asynchronous and everything above `store.rs` is not, which is the whole
+    // reason it happens *here*, once, before the window: after this the store
+    // is in memory and every read in the app is the synchronous one it is on
+    // every other platform. See `webfs.rs`.
+    #[cfg(target_family = "wasm")]
+    {
+        wasm_bindgen_futures::spawn_local(async {
+            webfs::hydrate().await;
+            launch();
+        });
+        return;
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    launch();
+}
+
+/// Everything from the command line to the window.
+///
+/// Split from [`main`] for the web, where the store has to be read before any
+/// of this can run and reading it is asynchronous. On every other platform
+/// `main` calls straight through.
+fn launch() {
+    // Before the window: a file dropped on the page while the board is still
+    // loading is queued rather than lost, and the browser is stopped from
+    // navigating away to show it. See `webfiles.rs`.
+    #[cfg(target_family = "wasm")]
+    webfiles::install();
+
     // Before the platform is built, though it would work at any point after
     // the binary loaded: gpui registers its application delegate in a `#[ctor]`
     // and this replaces one method on it. See `mac::teach_the_dock_icon`, which
@@ -232,7 +278,7 @@ fn main() {
     #[cfg(target_os = "macos")]
     mac::reopen(&app, reopen_window);
 
-    app.run(move |cx: &mut App| {
+    let launch = move |cx: &mut App| {
         // The menu bar, which on this platform is also the entire keyboard: an
         // application with no menu has no Cmd Q. See `mac::menus`.
         #[cfg(target_os = "macos")]
@@ -252,6 +298,12 @@ fn main() {
         if let Some(path) = dropped.borrow_mut().take() {
             view.update(cx, |view, cx| view.open_board(&path, cx));
         }
+
+        // Where a dropped or pasted file is delivered. A DOM callback is
+        // handed no context, so this is how it reaches the board. See
+        // `webfiles.rs`.
+        #[cfg(target_family = "wasm")]
+        webfiles::attach(view.downgrade(), cx.to_async());
 
         // The first run, if this is one.
         //
@@ -307,7 +359,16 @@ fn main() {
         }
 
         cx.activate(true);
-    });
+    };
+
+    // WASM EXPERIMENT: on the web the browser owns the run loop, so `run`
+    // returns at once and drops the whole application with it — window,
+    // canvas and board. `run_embedded` is gpui's answer: it hands back a
+    // handle that keeps the app alive for as long as the page does.
+    #[cfg(target_family = "wasm")]
+    std::mem::forget(app.run_embedded(launch));
+    #[cfg(not(target_family = "wasm"))]
+    app.run(launch);
 }
 
 /// Open the window, with everything that needs one hung off it.
@@ -368,8 +429,14 @@ fn open_window(cx: &mut App, doc: Document, title: String) -> Option<Entity<Boar
             // opened by the caller, once there is a window and a `warn()` for
             // it to fail into.
             |_window, cx| cx.new(|cx| BoardView::new(doc, None, cx)),
-        )
-        .ok()?;
+        );
+    // A window that will not open is otherwise silent on the web, where there
+    // is no terminal for the failure to reach.
+    #[cfg(target_family = "wasm")]
+    if let Err(error) = &window {
+        log::error!("open_window failed: {error:#}");
+    }
+    let window = window.ok()?;
 
     // The board goes to disk before the window goes away.
     //

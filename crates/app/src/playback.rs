@@ -35,7 +35,13 @@
 //! sleep — so what is given up is only the repaints nobody could see.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// WASM EXPERIMENT: std's clock panics on wasm32-unknown-unknown; `web-time`
+// is the same API over `performance.now()`.
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
+#[cfg(target_family = "wasm")]
+use web_time::Instant;
 
 use gpui::RenderImage;
 

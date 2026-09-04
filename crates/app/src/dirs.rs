@@ -64,11 +64,23 @@ fn home(join: &str) -> Option<PathBuf> {
 /// which is about this exact mistake being made twice already. `USERPROFILE` is
 /// what Windows calls the same thing.
 fn home_dir() -> Option<PathBuf> {
-    #[cfg(windows)]
-    let key = "USERPROFILE";
-    #[cfg(not(windows))]
-    let key = "HOME";
-    from_env(key)
+    // A browser tab has no home directory and no environment to read one out
+    // of, so this is where the web build stops looking and answers. The path
+    // is not a place on anybody's disk — `store.rs` keeps what is written
+    // under it in the store the tab *is* given — but it is a real path in
+    // every other sense: it is shown in Settings, a board under it has a
+    // location that can be named, and the switcher lists it. See `webfs.rs`.
+    #[cfg(target_family = "wasm")]
+    return Some(PathBuf::from("/home/mbrd"));
+
+    #[cfg(not(target_family = "wasm"))]
+    {
+        #[cfg(windows)]
+        let key = "USERPROFILE";
+        #[cfg(not(windows))]
+        let key = "HOME";
+        from_env(key)
+    }
 }
 
 /// An environment variable holding a path, if it holds one at all.
@@ -76,6 +88,9 @@ fn home_dir() -> Option<PathBuf> {
 /// Empty counts as unset, which is what the XDG specification says and what an
 /// exported-but-never-assigned variable in a shell profile looks like from
 /// here. Treating it as a path would put the file at the filesystem root.
+// A browser has no environment to read, and the web arms above say where
+// everything goes without asking one.
+#[cfg(not(target_family = "wasm"))]
 fn from_env(key: &str) -> Option<PathBuf> {
     match std::env::var_os(key) {
         Some(value) if !value.is_empty() => Some(PathBuf::from(value)),
@@ -96,8 +111,11 @@ pub fn config() -> Option<PathBuf> {
 
     // Every other Unix — the BSDs — follows the XDG layout, and landing there
     // is better than returning nothing.
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    #[cfg(all(not(any(target_os = "linux", target_os = "macos", windows)), not(target_family = "wasm")))]
     let dir = from_env("XDG_CONFIG_HOME").or_else(|| home(".config"))?.join(APP);
+
+    #[cfg(target_family = "wasm")]
+    let dir = home(".config")?.join(APP);
 
     Some(dir)
 }
@@ -126,8 +144,11 @@ pub fn state() -> Option<PathBuf> {
     #[cfg(windows)]
     let dir = from_env("LOCALAPPDATA")?.join(APP);
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    #[cfg(all(not(any(target_os = "linux", target_os = "macos", windows)), not(target_family = "wasm")))]
     let dir = from_env("XDG_STATE_HOME").or_else(|| home(".local/state"))?.join(APP);
+
+    #[cfg(target_family = "wasm")]
+    let dir = home(".local/state")?.join(APP);
 
     Some(dir)
 }
@@ -185,8 +206,11 @@ pub fn cache() -> Option<PathBuf> {
     #[cfg(windows)]
     let dir = from_env("LOCALAPPDATA")?.join(APP).join("cache");
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    #[cfg(all(not(any(target_os = "linux", target_os = "macos", windows)), not(target_family = "wasm")))]
     let dir = from_env("XDG_CACHE_HOME").or_else(|| home(".cache"))?.join(APP);
+
+    #[cfg(target_family = "wasm")]
+    let dir = home(".cache")?.join(APP);
 
     Some(dir)
 }

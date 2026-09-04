@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  mbrd's icon, and the source every other size is rendered from. See
+  `scripts/icons.sh`.
+
+  Three tilted cards joined by ropes, on the ground colour the app actually
+  draws. Every colour here is lifted from `crates/app/src/theme.rs` rather than
+  invented: `ground` #14150f behind it, the `image`, `note` and `audio` card
+  tints on the three cards, `text` #e8e2d0 for the hairlines and the marks
+  inside them, and `accent` #b4553a for the ropes. If the theme is ever
+  recoloured, this is the second place to change.
+
+  ## Why it is built the way it is
+
+  **No filters.** No drop shadows, no blurs, no gradients. This file is
+  rasterised by whatever is to hand — `rsvg-convert`, ImageMagick, Inkscape,
+  resvg — and filter support is the first thing to differ between them. A flat
+  mark renders identically everywhere, and an icon that is subtly wrong on one
+  platform is worse than one that is plain on all three.
+
+  **It has to survive 16 pixels.** That is the constraint the composition is
+  built around: three large shapes with clear gaps, one accent colour, and
+  nothing load-bearing smaller than the ropes. The marks inside the cards are
+  deliberately low-contrast — at 512 they are a photograph, a note and a
+  waveform, and at 16 they blur into the tint without turning it to mud, which
+  is the job.
+
+  **The cards do not overlap.** A stack of overlapping cards is the more
+  obvious moodboard icon and it is the wrong one here, because the ropes are
+  the thing this app has that a pile of images does not. The gaps exist so the
+  ropes have somewhere to be.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>mbrd</title>
+
+  <defs>
+    <!-- The endless canvas, hinted. Faint enough to be texture at 512 and to
+         vanish entirely by 32, which is the point: it should never compete
+         with the cards for what the icon is *of*. -->
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <circle cx="20" cy="20" r="2.4" fill="#e8e2d0" opacity="0.07"/>
+    </pattern>
+    <!-- Everything is clipped to the tile, so a rope or a card can run to the
+         edge without deciding how it ends. -->
+    <clipPath id="tile">
+      <rect x="0" y="0" width="512" height="512" rx="112" ry="112"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#tile)">
+    <rect x="0" y="0" width="512" height="512" fill="#14150f"/>
+    <rect x="0" y="0" width="512" height="512" fill="url(#grid)"/>
+
+    <!-- Everything below is scaled about the centre of the tile rather than
+         drawn at its final size, so the composition above can be reasoned
+         about in round numbers and the margin tuned in one place. 1.16 puts
+         the mark at roughly 80% of the tile, which is the usual safe area. -->
+    <g transform="translate(256 256) scale(1.16) translate(-256 -256)">
+
+    <!-- The ropes, under the cards, so they read as running between them
+         rather than lying on top. Round caps because the app's own connection
+         lines have them. -->
+    <g fill="none" stroke="#b4553a" stroke-width="9" stroke-linecap="round">
+      <path d="M236,172 C252,156 270,150 287,164"/>
+      <path d="M168,232 C176,258 190,282 212,300"/>
+      <path d="M344,224 C340,250 326,278 306,300"/>
+    </g>
+
+    <!-- Card one: an image. -->
+    <g transform="rotate(-8 162 176)">
+      <rect x="88" y="120" width="148" height="112" rx="14"
+            fill="#2c3a3d" stroke="#e8e2d0" stroke-opacity="0.14" stroke-width="3"/>
+      <g fill="#e8e2d0" opacity="0.18">
+        <circle cx="119" cy="151" r="10"/>
+        <path d="M98,214 L130,172 L154,198 L176,178 L226,214 Z"/>
+      </g>
+    </g>
+
+    <!-- Card two: a note. -->
+    <g transform="rotate(7 352 158)">
+      <rect x="287" y="93" width="130" height="130" rx="14"
+            fill="#4a422a" stroke="#e8e2d0" stroke-opacity="0.14" stroke-width="3"/>
+      <g fill="#e8e2d0" opacity="0.18">
+        <rect x="308" y="128" width="88" height="9" rx="4.5"/>
+        <rect x="308" y="151" width="66" height="9" rx="4.5"/>
+        <rect x="308" y="174" width="80" height="9" rx="4.5"/>
+      </g>
+    </g>
+
+    <!-- Card three: something that plays. -->
+    <g transform="rotate(-4 256 358)">
+      <rect x="172" y="300" width="168" height="116" rx="14"
+            fill="#2c3d33" stroke="#e8e2d0" stroke-opacity="0.14" stroke-width="3"/>
+      <g fill="#e8e2d0" opacity="0.18">
+        <rect x="196" y="344" width="8" height="28" rx="4"/>
+        <rect x="212" y="334" width="8" height="48" rx="4"/>
+        <rect x="228" y="324" width="8" height="68" rx="4"/>
+        <rect x="244" y="338" width="8" height="40" rx="4"/>
+        <rect x="260" y="330" width="8" height="56" rx="4"/>
+        <rect x="276" y="343" width="8" height="30" rx="4"/>
+        <rect x="292" y="336" width="8" height="44" rx="4"/>
+        <rect x="308" y="346" width="8" height="24" rx="4"/>
+      </g>
+    </g>
+
+    <!-- The anchors, on top of the cards, because in the app that is where
+         they are: a rope is fixed to a card's edge, not tucked behind it. -->
+    <g fill="#b4553a">
+      <circle cx="236" cy="172" r="6"/>
+      <circle cx="287" cy="164" r="6"/>
+      <circle cx="168" cy="232" r="6"/>
+      <circle cx="212" cy="300" r="6"/>
+      <circle cx="344" cy="224" r="6"/>
+      <circle cx="306" cy="300" r="6"/>
+    </g>
+
+    </g>
+  </g>
+</svg>

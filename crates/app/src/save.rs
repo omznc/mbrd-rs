@@ -4,8 +4,13 @@
 //! pointer is doing, and a file write is the one thing in this app that can
 //! lose work. It is easier to be careful about in a module that does nothing else.
 
+// The atomic write is the native path's alone; a browser's store has no second
+// step to order against the first. See `through`, below.
+#[cfg(not(target_family = "wasm"))]
 use std::fs::File;
-use std::io::{Cursor, Write};
+use std::io::Cursor;
+#[cfg(not(target_family = "wasm"))]
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -40,7 +45,7 @@ pub fn write(path: &Path, doc: &Document) -> Result<()> {
         // Best effort, and the same rule `spill::write_through` follows: a part
         // file left beside the board is megabytes nothing will ever come back
         // for, and this write is already being reported as having failed.
-        let _ = std::fs::remove_file(&temp);
+        let _ = crate::store::remove_file(&temp);
     })
 }
 
@@ -48,18 +53,41 @@ pub fn write(path: &Path, doc: &Document) -> Result<()> {
 /// order is argued. Split out only so that a failure anywhere in it has one
 /// place to be cleaned up after.
 fn through(temp: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = File::create(temp).with_context(|| format!("writing {}", temp.display()))?;
-    file.write_all(bytes).with_context(|| format!("writing {}", temp.display()))?;
-    file.sync_all().with_context(|| format!("flushing {}", temp.display()))?;
-    drop(file);
+    // A browser's store has no second step to order against the first: a write
+    // there either stores the whole value or throws, which is the property the
+    // temporary file and the rename below exist to buy. So the web build takes
+    // the write and stops — see `webfs.rs`.
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = temp;
+        return crate::store::write(path, bytes)
+            .with_context(|| format!("writing {}", path.display()));
+    }
 
-    std::fs::rename(temp, path).with_context(|| format!("replacing {}", path.display()))?;
+    #[cfg(target_family = "wasm")]
+    #[allow(unreachable_code)]
+    {
+        unreachable!()
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    let mut file = File::create(temp).with_context(|| format!("writing {}", temp.display()))?;
+    #[cfg(not(target_family = "wasm"))]
+    {
+        file.write_all(bytes).with_context(|| format!("writing {}", temp.display()))?;
+        file.sync_all().with_context(|| format!("flushing {}", temp.display()))?;
+        drop(file);
+
+        crate::store::rename(temp, path)
+            .with_context(|| format!("replacing {}", path.display()))?;
+    }
 
     // And the rename, which is a change to the *directory* and needs the same
     // treatment for the same reason. Best effort rather than checked: Windows
     // will not open a directory as a file at all, and the failure here is
     // benign in a way the one above is not — a board whose rename is not yet
     // durable is still the old board on disk, which is a board.
+    #[cfg(not(target_family = "wasm"))]
     if let Some(dir) = path.parent() {
         let _ = File::open(dir).and_then(|dir| dir.sync_all());
     }
@@ -84,7 +112,7 @@ fn through(temp: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
 /// `BoardView::open_board`, which calls this rather than a bare, unwatched
 /// read, so there has only ever needed to be the one function here.
 pub fn read_watched(path: &Path, watch: impl FnMut(u64, u64)) -> Result<Document> {
-    let bytes = std::fs::read(path).context("reading the file")?;
+    let bytes = crate::store::read(path).context("reading the file")?;
     mbrd_core::mbrd::read_watched(Cursor::new(bytes), watch).context("reading the board")
 }
 

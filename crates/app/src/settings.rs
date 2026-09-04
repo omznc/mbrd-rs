@@ -818,7 +818,11 @@ fn header(page: &Page, view: &BoardView, cx: &mut Context<BoardView>) -> AnyElem
                 // app and is no less there for somebody currently looking at
                 // the grid step. A door that comes and goes as you move around
                 // the page is a door nobody remembers is there.
-                .child(
+                // Not on the web: the button hands `settings.json` to whatever
+                // opens a `.json` on the computer, and a page may not start a
+                // program. The file is still there — `webfs.rs` keeps it — and
+                // every setting in it is on this page.
+                .when(!cfg!(target_family = "wasm"), |d| d.child(
                     div()
                         .id("settings-edit-json")
                         .px(px(9.0))
@@ -838,7 +842,7 @@ fn header(page: &Page, view: &BoardView, cx: &mut Context<BoardView>) -> AnyElem
                             }),
                         )
                         .child("Edit in settings.json"),
-                )
+                ))
                 .child(
                     div()
                         .id("settings-close")
@@ -1355,15 +1359,38 @@ fn general_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
             view,
             cx,
         ),
-        spec(
-            Section::General,
-            "Boards folder",
-            format!("{boards_note} Boards you already have stay where they are."),
-            button("settings-boards-folder", "Browse…", true, theme, cx, |this, cx| {
-                this.browse_for_boards(cx);
-            }),
-        )
-        .does(Does::Press(|this, cx| this.browse_for_boards(cx))),
+        // The web has no folder to browse to: a page is not allowed to name a
+        // place on the disk, and everything this build writes lives in the
+        // store the tab is given. So the row still says where boards go and
+        // does not offer to change it — a button that opened nothing would be
+        // worse than no button. See `webfs.rs`.
+        {
+            #[cfg(target_family = "wasm")]
+            {
+                spec(
+                    Section::General,
+                    "Boards folder",
+                    format!(
+                        "{boards_note} In this build they are kept by the browser, on this \
+                         device, and this cannot be moved."
+                    ),
+                    gpui::div().into_any_element(),
+                )
+            }
+
+            #[cfg(not(target_family = "wasm"))]
+            {
+                spec(
+                    Section::General,
+                    "Boards folder",
+                    format!("{boards_note} Boards you already have stay where they are."),
+                    button("settings-boards-folder", "Browse…", true, theme, cx, |this, cx| {
+                        this.browse_for_boards(cx);
+                    }),
+                )
+                .does(Does::Press(|this, cx| this.browse_for_boards(cx)))
+            }
+        },
         spec(
             Section::General,
             "Snap new boards to the grid",

@@ -35,7 +35,10 @@
 //! back out at the end.
 
 use std::collections::VecDeque;
+#[cfg(not(target_family = "wasm"))]
 use std::time::Instant;
+#[cfg(target_family = "wasm")]
+use web_time::Instant;
 
 use mbrd_core::geometry::{point, Point as WorldPoint};
 use mbrd_core::motion::{self, Spring, Sprung};

@@ -245,20 +245,19 @@ impl Registry {
         }
 
         let Some(dir) = dir else { return registry };
-        let Ok(entries) = std::fs::read_dir(dir) else { return registry };
-        // Sorted, because `read_dir` is in whatever order the filesystem feels
-        // like and a settings list that reshuffles itself between launches is
-        // one nobody can learn the shape of.
-        let mut files: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
+        // Sorted, because a directory lists in whatever order the filesystem
+        // feels like and a settings list that reshuffles itself between
+        // launches is one nobody can learn the shape of. `read_dir_paths`
+        // sorts on both platforms, which is where that now happens.
+        let Ok(paths) = crate::store::read_dir_paths(dir) else { return registry };
+        let files: Vec<PathBuf> = paths
+            .into_iter()
             .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("json")))
             .collect();
-        files.sort();
 
         for path in files {
             let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into());
-            match std::fs::read_to_string(&path) {
+            match crate::store::read_to_string(&path) {
                 Ok(text) => registry.read(&name, &text, true),
                 Err(_) => registry.complain(true, &name, "could not be opened".into()),
             }

@@ -166,3 +166,10 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# The web backend, which cannot be compiled as published: the crate
+# `include_bytes!`s eight fonts from a path outside its own tarball. `vendor/`
+# is the same source with the fonts beside it, and its README is the whole of
+# the argument. Nothing else about the dependency changes.
+[patch.crates-io]
+gpui_ce_web = { path = "vendor/gpui_ce_web" }

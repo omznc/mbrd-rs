@@ -28,6 +28,27 @@ cargo run -p mbrd -- some-board.mbrd    # a real one
 Building from source on Linux needs a handful of system packages — see
 [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
+## In a browser
+
+[**mbrd.omarzunic.com**](https://mbrd.omarzunic.com) is the same application,
+compiled to WebAssembly. Not a viewer and not a cut-down one: the same board
+model, the same canvas, the same commands.
+
+Boards live in the browser's own database, on the machine you opened it on —
+there is no account and nothing is uploaded. A board you want to keep, or open
+in the desktop app, comes out with **Download board**, which hands you the same
+`.mbrd` file every other platform writes.
+
+It needs WebGPU, which means Chrome, Edge, or Safari 26 — Firefox needs
+`dom.webgpu.enabled`. Three things a browser will not do are missing rather
+than pretending: video and audio do not play, a pasted link is not followed,
+and there is no updater, because reloading the page is the update.
+
+```
+scripts/build-web.sh            # into dist/, ready to serve
+python3 -m http.server -d dist  # and look at it
+```
+
 ## Themes
 
 *Settings → Application → Appearance* — a light theme and a dark one, and

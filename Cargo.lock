@@ -2075,9 +2075,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2548,8 +2550,6 @@ dependencies = [
 [[package]]
 name = "gpui_ce_web"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac03c593fc6ee1957a7a55594b506ff6218662ea4a20523407252c2b5d570c01"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -3626,12 +3626,18 @@ dependencies = [
  "anyhow",
  "embed-resource",
  "flate2",
+ "futures",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "gpui-ce",
  "gpui_ce_platform",
  "gstreamer",
  "gstreamer-app",
  "gstreamer-video",
  "image",
+ "js-sys",
+ "log",
  "lopdf",
  "mbrd-core",
  "minisign-verify",
@@ -3648,6 +3654,10 @@ dependencies = [
  "trash",
  "ttf-parser",
  "ureq",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
  "windows 0.62.2",
  "windows-core 0.62.2",
 ]
@@ -3663,6 +3673,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tar",
+ "web-time",
  "zip",
 ]
 

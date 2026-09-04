@@ -23,7 +23,13 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// WASM EXPERIMENT: std's clock panics on wasm32-unknown-unknown; `web-time`
+// is the same API over `performance.now()`.
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
+#[cfg(target_family = "wasm")]
+use web_time::Instant;
 
 use mbrd_core::align::Axis;
 use mbrd_core::arrange::{self as arranging, Arrangement};
@@ -1089,7 +1095,7 @@ struct Importing {
     /// landed, times cards left. Crude, and honestly so — it is prefixed with
     /// a tilde and it is there to answer "seconds or minutes", not to be
     /// right.
-    began: std::time::Instant,
+    began: Instant,
     /// Where the cards not yet read are going to land, one row per drop.
     ///
     /// A place held open is the difference between a folder that is arriving
@@ -2896,6 +2902,43 @@ impl BoardView {
     /// command is still for is the second in between — somebody who has just
     /// typed something and wants to know it is safe before shutting the lid —
     /// and saying so out loud is most of its value.
+    /// Hand the board to the person using the browser, as a file.
+    ///
+    /// The web only, and it is the answer to the one thing that platform takes
+    /// away: a `.mbrd` is a file that travels — to the desktop app, to another
+    /// machine, to somebody else — and a page is not allowed to put one on a
+    /// disk. It can only *offer* one, which is what a download is.
+    ///
+    /// The board is saved first, so what leaves is what is on screen rather
+    /// than what was last written. Packed on this thread rather than the
+    /// background executor, unlike `write_board`: the file has to exist before
+    /// the click that asks for it has finished being handled, or the browser
+    /// treats the download as one nobody asked for and blocks it.
+    #[cfg(target_family = "wasm")]
+    pub fn download_board(&mut self, cx: &mut Context<Self>) {
+        self.stop_editing(true, cx);
+        self.capture_view();
+
+        let name = self
+            .path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| {
+                mbrd_core::naming::file_name_for(&self.doc.board).to_string_lossy().to_string()
+            });
+
+        let packed = mbrd_core::mbrd::to_bytes(&self.doc, &mbrd_core::naming::now_iso8601());
+        match packed.map_err(anyhow::Error::from).and_then(|bytes| {
+            let size = bytes.len();
+            crate::webfiles::download(&name, &bytes).map(|()| size)
+        }) {
+            Ok(size) => self.tell(format!("{name} — {} KB", size / 1024)),
+            Err(error) => self.warn(format!("could not make a file of that board: {error}")),
+        }
+        cx.notify();
+    }
+
     pub fn save(&mut self, cx: &mut Context<Self>) {
         // `Ctrl S` reaches here from inside a note, so what is on the card has
         // to be what is written rather than what was there before typing. The
@@ -5827,7 +5870,7 @@ impl BoardView {
             cx.notify();
             return;
         }
-        match std::fs::rename(&from, &to) {
+        match crate::store::rename(&from, &to) {
             Ok(()) => {
                 // The row keeps its place and `recent.json` keeps its order:
                 // a move is filing, not a visit.
@@ -5881,10 +5924,15 @@ impl BoardView {
         // when that fails — a network mount or a sandbox with nowhere to put
         // a trashed file — and a permanent delete stays the fallback of last
         // resort rather than the plan.
+        #[cfg(not(target_family = "wasm"))]
         let (result, trashed) = match trash::delete(board) {
             Ok(()) => (Ok(()), true),
-            Err(_) => (std::fs::remove_file(board), false),
+            Err(_) => (crate::store::remove_file(board), false),
         };
+        // A browser has no system trash, and the store a board lives in
+        // there has no second copy to put it in. The delete is the delete.
+        #[cfg(target_family = "wasm")]
+        let (result, trashed) = (crate::store::remove_file(board), false);
         match result {
             Ok(()) => {
                 crate::recent::forget(board);
@@ -7862,12 +7910,43 @@ impl BoardView {
     /// dialog is, and says so — on Linux that is a desktop with no portal
     /// running, which is a real state and one nothing else in the app would
     /// otherwise mention.
+    /// Ask for a folder, and take what is directly in it.
+    ///
+    /// The web only. A browser's file input picks files or folders and never
+    /// both, so what is one dialog on every other platform has to be two rows
+    /// here — see `Command::AddFolder`, which is offered nowhere else, and
+    /// `webfiles::pick_folder`.
+    #[cfg(target_family = "wasm")]
+    pub fn pick_folder(&mut self, cx: &mut Context<Self>) {
+        // Decided now, before the dialog opens, for the reason below.
+        let at = self.viewport.pan;
+        let asked = crate::webfiles::pick_folder();
+        cx.spawn(async move |view, cx| {
+            let answer = asked.await;
+            view.update(cx, |view, cx| match answer {
+                Ok(Ok(Some(paths))) if !paths.is_empty() => view.take_files(&paths, at, cx),
+                Ok(Ok(_)) | Err(_) => {}
+                Ok(Err(e)) => view.warn(format!("no file picker: {e}")),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub fn pick_files(&mut self, cx: &mut Context<Self>) {
         // Where the cards land is decided *now*, before the dialog opens, for
         // the same reason a drop uses the middle of the view: the board may be
         // panned while the picker is up, and files chosen for the view somebody
         // was looking at should not follow the view they left it in.
         let at = self.viewport.pan;
+        // The web has no path dialog and no folders to offer: a browser hands
+        // over bytes and a name. `webfiles::pick_files` answers in the same
+        // shape this does — failed, cancelled, or paths — so what follows is
+        // one arm rather than two. See `webfiles.rs`.
+        #[cfg(target_family = "wasm")]
+        let asked = crate::webfiles::pick_files(true);
+
+        #[cfg(not(target_family = "wasm"))]
         let asked = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: true,
             directories: true,
@@ -7908,6 +7987,18 @@ impl BoardView {
     /// practice by the drain below keeping up, and the ceiling is the one this
     /// has always had: every file in the drop, which is what ends up in the
     /// archive regardless.
+    /// Files the page caught — a drop, or a paste — laid out where a drop
+    /// lands.
+    ///
+    /// `main.rs` drains the queue these arrive in and calls this; the middle of
+    /// the view is the same answer the native drop gives, and for the same
+    /// reason. See `webfiles.rs`.
+    #[cfg(target_family = "wasm")]
+    pub fn take_arrivals(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        let at = self.viewport.pan;
+        self.take_files(paths, at, cx);
+    }
+
     pub fn take_files(&mut self, paths: &[PathBuf], at: WorldPoint, cx: &mut Context<Self>) {
         let paths = paths.to_vec();
         let token = self.imports;
@@ -7927,7 +8018,7 @@ impl BoardView {
             None => {
                 self.importing = Some(Importing {
                     named,
-                    began: std::time::Instant::now(),
+                    began: Instant::now(),
                     ghosts: vec![Vec::new()],
                     open: self.doc.board.start(),
                     token,
@@ -7961,7 +8052,7 @@ impl BoardView {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    let message = match std::fs::read(path) {
+                    let message = match crate::store::read(path) {
                         Ok(bytes) => {
                             let file = import::ready(&name, bytes);
                             // The ceiling reports; this is the layer that
@@ -14753,7 +14844,7 @@ fn fresh_board_path(board: &mbrd_core::Board, prefs: &crate::prefs::Prefs) -> Op
     // there this morning, fails here exactly as a missing home directory does
     // — and the caller's message is the right one for both: there is nowhere
     // to put a board.
-    std::fs::create_dir_all(&dir).ok()?;
+    crate::store::create_dir_all(&dir).ok()?;
     Some(unused_in(&dir, &mbrd_core::naming::file_name_for(board)))
 }
 
@@ -14765,7 +14856,7 @@ fn fresh_board_path(board: &mbrd_core::Board, prefs: &crate::prefs::Prefs) -> Op
 /// millisecond, and the loser would overwrite a board that is empty.
 fn unused_in(dir: &Path, name: &Path) -> PathBuf {
     let taken = dir.join(name);
-    if !taken.exists() {
+    if !crate::store::exists(&taken) {
         return taken;
     }
     let stem = name.file_stem().unwrap_or_default().to_string_lossy().to_string();
@@ -14775,7 +14866,7 @@ fn unused_in(dir: &Path, name: &Path) -> PathBuf {
     // well past the point where the name was doing anybody any good.
     (2..100)
         .map(|n| dir.join(format!("{stem}-{n}.mbrd")))
-        .find(|candidate| !candidate.exists())
+        .find(|candidate| !crate::store::exists(candidate))
         .unwrap_or(taken)
 }
 
@@ -16420,6 +16511,22 @@ fn said_line(said: &Said, theme: Theme) -> gpui::AnyElement {
 
 impl Render for BoardView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Files the page caught since the last frame — a drop, or a paste.
+        //
+        // Here rather than on a timer, and the reason is the web's run loop
+        // rather than taste: gpui borrows the application for the whole of a
+        // frame, so a timer that woke up inside one and asked to update this
+        // view would find it already borrowed and fail, every tick, forever.
+        // Drawing is the one moment the view is already in hand. The cost of
+        // asking is one `Vec` check per frame. See `webfiles.rs`.
+        #[cfg(target_family = "wasm")]
+        {
+            let arrived = crate::webfiles::take();
+            if !arrived.is_empty() {
+                self.take_arrivals(&arrived, cx);
+            }
+        }
+
         // Everything that is moving, moved on by one frame — and if anything
         // still is, an ask for another frame.
         //
@@ -17577,7 +17684,7 @@ mod import_pill_tests {
     fn arriving(done: usize, found: usize, ago: Duration) -> Importing {
         Importing {
             named: "Tiles & stone".into(),
-            began: std::time::Instant::now() - ago,
+            began: Instant::now() - ago,
             ghosts: Vec::new(),
             open: Pending,
             token: 0,

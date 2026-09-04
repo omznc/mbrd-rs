@@ -46,9 +46,57 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tar.workspace = true
-trash.workspace = true
 ttf-parser.workspace = true
+
+# WASM EXPERIMENT: native-only deps
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+trash.workspace = true
 ureq.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+wasm-bindgen-futures = "0.4"
+futures = "0.3"
+web-sys = { version = "0.3", features = [
+    "Blob",
+    "ClipboardEvent",
+    "CssStyleDeclaration",
+    "DataTransfer",
+    "DataTransferItem",
+    "DataTransferItemList",
+    "Document",
+    "DragEvent",
+    "Element",
+    "ErrorCallback",
+    "Event",
+    "EventTarget",
+    "File",
+    "FileList",
+    "FileSystemDirectoryEntry",
+    "FileSystemDirectoryReader",
+    "FileSystemEntry",
+    "FileSystemFileEntry",
+    "HtmlAnchorElement",
+    "HtmlElement",
+    "HtmlInputElement",
+    "Node",
+    "Url",
+    "IdbDatabase",
+    "IdbFactory",
+    "IdbObjectStore",
+    "IdbOpenDbRequest",
+    "IdbRequest",
+    "IdbTransaction",
+    "IdbTransactionMode",
+    "DomStringList",
+    "Window",
+] }
+web-time = "1"
+log = "0.4"
 
 # One media backend per platform, and none of them shared. See `main.rs`, which
 # is where the three files behind `mod pipeline` are chosen between, and the

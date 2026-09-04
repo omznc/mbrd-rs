@@ -37,10 +37,18 @@
 //! each be a second request to a place the paste never named, and a link card
 //! that quietly fetched three things is not a link card anybody asked for.
 
+// The reading and the measuring belong to the `ureq` half of this module,
+// which a browser has no use for: see `asked` and `pull`, whose web arms
+// answer without a network. What is left — sniffing a name and a type out of a
+// URL — is the same on both.
+#[cfg(not(target_family = "wasm"))]
 use std::io::Read;
+#[cfg(not(target_family = "wasm"))]
 use std::time::Duration;
 
-use anyhow::{bail, ensure, Context as _, Result};
+#[cfg(not(target_family = "wasm"))]
+use anyhow::ensure;
+use anyhow::{bail, Context as _, Result};
 
 /// The most this will pull down for one card.
 ///
@@ -49,18 +57,21 @@ use anyhow::{bail, ensure, Context as _, Result};
 /// the disk is one somebody chose byte by byte and the app only has to ask
 /// whether they meant it; a URL is a promise, and the honest thing to do with
 /// a promise this large is decline it and leave the address on the board.
+#[cfg(not(target_family = "wasm"))]
 const CEILING: u64 = crate::import::WORTH_ASKING as u64;
 
 /// How long to wait on the `HEAD` that decides whether to bother.
 ///
 /// Short. Nothing has been placed on the board yet, somebody is watching the
 /// status line, and the fallback — a link card — is one they can live with.
+#[cfg(not(target_family = "wasm"))]
 const ASK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long to give the download itself.
 ///
 /// Long enough for a video on a bad connection, short enough that a stalled
 /// socket does not hold a pool thread for the rest of the session.
+#[cfg(not(target_family = "wasm"))]
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// A file pulled off the web, ready for `import::ready`.
@@ -123,6 +134,12 @@ pub fn embed(url: &str) -> Result<Fetched> {
 }
 
 /// What a `HEAD` had to say about an address whose path said nothing.
+///
+/// Two of the three are unreachable in a build with no `HEAD` to send — the
+/// web one, where `asked` is always `Unsure` and the `GET` decides. Kept whole
+/// rather than split per platform: this is what the *protocol* can say, and it
+/// does not change with who is asking.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 enum Says {
     /// A media type worth having, and what to call the file.
     Embed(String),
@@ -138,6 +155,13 @@ enum Says {
 /// once, beside the link card the failure leaves behind — so they say what
 /// happened and not which URL it happened to. The address is right there on
 /// the board.
+#[cfg(target_family = "wasm")]
+fn asked(_url: &str) -> Result<Says> {
+    // WASM EXPERIMENT: no blocking HTTP in a browser. See `net.rs`.
+    Ok(Says::Unsure)
+}
+
+#[cfg(not(target_family = "wasm"))]
 fn asked(url: &str) -> Result<Says> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .user_agent(concat!("mbrd/", env!("CARGO_PKG_VERSION")))
@@ -175,6 +199,12 @@ fn asked(url: &str) -> Result<Says> {
 ///
 /// `check` asks for the response's own `Content-Type` to be believed before
 /// the body is read — the arm for a server that would not answer a `HEAD`.
+#[cfg(target_family = "wasm")]
+fn pull(_url: &str, _check: bool) -> Result<Vec<u8>> {
+    bail!("this build cannot download that")
+}
+
+#[cfg(not(target_family = "wasm"))]
 fn pull(url: &str, check: bool) -> Result<Vec<u8>> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .user_agent(concat!("mbrd/", env!("CARGO_PKG_VERSION")))
@@ -215,6 +245,7 @@ fn pull(url: &str, check: bool) -> Result<Vec<u8>> {
 }
 
 /// A header, lowercased name, as a `String`.
+#[cfg(not(target_family = "wasm"))]
 fn header(response: &ureq::http::Response<ureq::Body>, name: &str) -> Option<String> {
     response.headers().get(name)?.to_str().ok().map(str::to_string)
 }
@@ -262,6 +293,7 @@ pub fn worth_fetching(ext: &str) -> bool {
 /// somebody pointing at a text file; a link that merely comes back as text is
 /// usually an API saying no. So text is not sniffed into — only pictures,
 /// video, sound, meshes, documents and fonts, all of which mean what they say.
+#[cfg(not(target_family = "wasm"))]
 fn from_mime(kind: &str) -> Option<String> {
     // `image/png; charset=binary` and friends. The parameters are never the
     // answer here.

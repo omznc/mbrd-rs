@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+    <title>mbrd</title>
+    <meta name="description" content="A moodboard on an endless canvas. Pan, zoom, drop images, notes and connections onto a board that has no edges." />
+
+    <!-- The colour the browser paints around the page: the same one the canvas
+         starts on, so a phone's status bar and the board are one surface
+         rather than two. Both halves, because the app follows the desktop. -->
+    <meta name="theme-color" content="#faf9f5" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#1b1b17" media="(prefers-color-scheme: dark)" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="mobile-web-app-capable" content="yes" />
+
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="icon" href="icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="icon-192.png" />
+
+    <style>
+      /* The page is a frame for one canvas and nothing else. `overscroll` and
+         `touch-action` are the two that matter on a phone: without them a drag
+         on the board is a pull-to-refresh and a pinch is the browser's zoom
+         rather than the canvas's. */
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        overscroll-behavior: none;
+        touch-action: none;
+        background: #1b1b17;
+        color: #e7e2d4;
+        font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      @media (prefers-color-scheme: light) {
+        html,
+        body {
+          background: #faf9f5;
+          color: #2c2a24;
+        }
+      }
+      canvas {
+        display: block;
+      }
+
+      /* Everything below is the loading screen, and it is all removed once the
+         board is up. It is written here rather than fetched because it has to
+         be on screen before anything else has arrived. */
+      #boot {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 18px;
+        padding: 24px;
+        text-align: center;
+      }
+      #boot h1 {
+        margin: 0;
+        font-size: 28px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+      }
+      #boot p {
+        margin: 0;
+        max-width: 34ch;
+        opacity: 0.62;
+      }
+      #bar {
+        width: min(260px, 70vw);
+        height: 3px;
+        border-radius: 3px;
+        background: currentColor;
+        opacity: 0.16;
+        overflow: hidden;
+      }
+      #bar > i {
+        display: block;
+        height: 100%;
+        width: 0;
+        border-radius: 3px;
+        background: #c4713a;
+        transition: width 0.2s ease-out;
+      }
+      #boot a {
+        color: #c4713a;
+      }
+      .gone {
+        display: none !important;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="boot">
+      <h1>mbrd</h1>
+      <div id="bar"><i></i></div>
+      <p id="say">Loading the board…</p>
+    </div>
+
+    <script type="module">
+      const boot = document.getElementById("boot");
+      const fill = document.querySelector("#bar > i");
+      const say = document.getElementById("say");
+
+      const stop = (message, detail) => {
+        document.getElementById("bar").classList.add("gone");
+        say.innerHTML = message + (detail ? `<br /><small>${detail}</small>` : "");
+      };
+
+      // WebGPU is the whole renderer, not an enhancement: without it there is
+      // nothing to draw into and the app cannot start. Said here, plainly,
+      // rather than left to a stack trace in a console nobody has open.
+      if (!navigator.gpu) {
+        stop(
+          "This browser cannot run mbrd yet.",
+          'It needs WebGPU — Chrome, Edge or Safari 26, or Firefox with <code>dom.webgpu.enabled</code>. There are native builds on <a href="https://github.com/omznc/mbrd-rs/releases">the releases page</a>.',
+        );
+      } else {
+        try {
+          // Streamed and compiled as it arrives rather than downloaded and
+          // then compiled, which is most of the difference between a blank
+          // page for ten seconds and one that starts while it loads. The
+          // counting stream is what makes the bar honest — it measures the
+          // bytes actually delivered, compressed or not.
+          const response = await fetch(new URL("./mbrd_bg.wasm", import.meta.url));
+          if (!response.ok) throw new Error(`the app is not on the server (${response.status})`);
+
+          const total = Number(response.headers.get("content-length")) || 0;
+          let read = 0;
+          const counted = new Response(
+            response.body.pipeThrough(
+              new TransformStream({
+                transform(chunk, controller) {
+                  read += chunk.byteLength;
+                  if (total) fill.style.width = `${Math.min(100, (read / total) * 100)}%`;
+                  controller.enqueue(chunk);
+                },
+              }),
+            ),
+            // The type has to survive the pipe or streaming compilation is
+            // refused and the browser falls back to buffering the lot.
+            { headers: { "content-type": "application/wasm" } },
+          );
+
+          const init = (await import(new URL("./mbrd.js", import.meta.url))).default;
+          await init({ module_or_path: counted });
+          boot.remove();
+        } catch (error) {
+          stop("mbrd could not start.", String(error));
+        }
+      }
+
+      // Offline, and a second visit that does not fetch fifteen megabytes
+      // again. Registered after the app is up so it never competes with it
+      // for the connection.
+      if ("serviceWorker" in navigator && location.protocol === "https:") {
+        addEventListener("load", () => navigator.serviceWorker.register("./sw.js").catch(() => {}));
+      }
+    </script>
+  </body>
+</html>

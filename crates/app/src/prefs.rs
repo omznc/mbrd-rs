@@ -359,7 +359,7 @@ pub fn load() -> Prefs {
     let mut prefs = Prefs::default();
 
     if let Some(path) = store() {
-        if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Ok(text) = crate::store::read_to_string(&path) {
             if let Ok(value) = serde_json::from_str::<Value>(&text) {
                 if let Some(motion) = value.get("motion").and_then(Value::as_bool) {
                     prefs.motion = motion;
@@ -490,7 +490,7 @@ pub fn save(prefs: &Prefs) {
     let Some(path) = store() else { return };
 
     // Read first, so that keys this build does not know about survive.
-    let mut out = match std::fs::read_to_string(&path)
+    let mut out = match crate::store::read_to_string(&path)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
     {
@@ -520,7 +520,7 @@ pub fn save(prefs: &Prefs) {
     }
 
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        let _ = crate::store::create_dir_all(dir);
     }
     // Indented, with a newline at the end. It was one long line until the
     // settings page grew a button that opens this file in a text editor, at
@@ -536,7 +536,7 @@ pub fn save(prefs: &Prefs) {
     // settings are gone".
     let value = Value::Object(out);
     let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
-    let _ = std::fs::write(&path, text + "\n");
+    let _ = crate::store::write(&path, (text + "\n").as_bytes());
 }
 
 /// Whether an environment variable is saying no.

@@ -47,6 +47,8 @@ pub enum Command {
     /// different noun — and a second file dialog on a near-miss of that chord
     /// would be the worst of both.
     AddFiles,
+    AddFolder,
+    Download,
     Tint,
     BringToFront,
     SendToBack,
@@ -373,6 +375,8 @@ impl Command {
             Self::AddNote => "Add note",
             Self::AddSwatch => "Add color",
             Self::AddFiles => "Add files…",
+            Self::AddFolder => "Add folder…",
+            Self::Download => "Download board",
             Self::Tint => "Next tint",
             Self::BringToFront => "Bring to front",
             Self::SendToBack => "Send to back",
@@ -521,6 +525,8 @@ impl Command {
             Self::AddNote => Icon::Write,
             Self::AddSwatch => Icon::Colour,
             Self::AddFiles => Icon::Drop,
+            Self::AddFolder => Icon::Folder,
+            Self::Download => Icon::Save,
             // The pad rather than a paintbrush: what this changes is which of
             // the four colours the note is torn off, and the grid beside it on
             // the same menu shows the pad itself.
@@ -626,6 +632,8 @@ impl Command {
             // No key: see the variant's own note. `Ctrl O` is taken by the
             // board switcher and this is not worth a letter of its own.
             Self::AddFiles => "",
+            Self::AddFolder => "",
+            Self::Download => "",
             Self::Tint => "T",
             Self::BringToFront => "]",
             Self::SendToBack => "[",
@@ -893,6 +901,19 @@ impl Command {
             // depending on how the binary was compiled is a menu that changes
             // shape for reasons nobody watching it can see.
             Self::CheckForUpdates => crate::update::possible(),
+            // Hidden rather than dimmed, which is the opposite of the row
+            // above and is right for the opposite reason: this is not a
+            // command that cannot run here, it is a *second door onto the one
+            // above*. On every platform with a real file dialog, "Add files…"
+            // already takes a folder, so this would be a row that does what
+            // the row before it does. Only a browser needs the two, because
+            // its input picks files or folders and never both.
+            Self::AddFolder => cfg!(target_family = "wasm"),
+            // The same shape as the row above and the same reason: on a
+            // desktop the board is already a file, sitting where somebody put
+            // it, and a "download" of it would mean copying a file to beside
+            // itself. In a browser it is the only way one gets out.
+            Self::Download => cfg!(target_family = "wasm"),
             // Only where there is something to filter by. A list of no tags
             // is a list that can only say "there are none", and the way
             // somebody finds out tags exist is the row above it on the card
@@ -974,6 +995,16 @@ impl Command {
             Self::AddNote => view.add_note(cx),
             Self::AddSwatch => view.add_swatch(cx),
             Self::AddFiles => view.pick_files(cx),
+            #[cfg(target_family = "wasm")]
+            Self::AddFolder => view.pick_folder(cx),
+            #[cfg(target_family = "wasm")]
+            Self::Download => view.download_board(cx),
+            // Never reached: not offered here — see `available`.
+            #[cfg(not(target_family = "wasm"))]
+            Self::Download => view.save(cx),
+            // Never reached: the row is not offered here — see `available`.
+            #[cfg(not(target_family = "wasm"))]
+            Self::AddFolder => view.pick_files(cx),
             Self::Tint => view.cycle_tint(cx),
             Self::BringToFront => view.raise_selection(true, cx),
             Self::SendToBack => view.raise_selection(false, cx),
@@ -1076,6 +1107,8 @@ impl Command {
             Self::Delete => "remove trash",
             Self::AddSwatch => "colour swatch",
             Self::AddFiles => "import open picture photo browse folder upload",
+            Self::AddFolder => "import folder directory pictures browse upload",
+            Self::Download => "export save file out mbrd copy backup",
             Self::Tint => "colour recolour",
             Self::AddFence => "group frame",
             Self::Connect => "rope line link join",
@@ -1146,6 +1179,8 @@ impl Command {
             Self::AddNote,
             Self::AddSwatch,
             Self::AddFiles,
+            Self::AddFolder,
+            Self::Download,
             Self::AddFence,
             Self::Ungroup,
             Self::Connect,
@@ -1405,10 +1440,14 @@ impl Entry {
 /// Three verbs that were three rows on every list; one row now, on all of
 /// them. Adding is a thing you do occasionally and read past constantly, which
 /// is exactly what a submenu is for.
-const ADD: [Entry; 3] = [
+const ADD: [Entry; 4] = [
     Entry::Does(Command::AddNote),
     Entry::Does(Command::AddSwatch),
     Entry::Does(Command::AddFiles),
+    // Offered on the web and nowhere else, and dropped from every list that
+    // draws it by `Command::available` on the platforms where "Add files…"
+    // already takes a folder.
+    Entry::Does(Command::AddFolder),
 ];
 
 /// Everything the one card in hand *is*, as opposed to everything you can do
@@ -1788,6 +1827,8 @@ mod tests {
                 Command::AddNote
                 | Command::AddSwatch
                 | Command::AddFiles
+                | Command::AddFolder
+                | Command::Download
                 | Command::Tint
                 | Command::BringToFront
                 | Command::SendToBack
@@ -1861,12 +1902,16 @@ mod tests {
                 }
             }
         }
-        // 64 nullary, plus the eight that carry values mapped over their own
+        // 66 nullary, plus the eight that carry values mapped over their own
         // modules' lists: 8 arrangements, 8 paper sizes, 6 edges, 2 axes, 5
         // colours, 4 arrows, 3 styles, 3 weights.
+        //
+        // The count is of the *enum*, not of what a platform offers:
+        // `AddFolder` is in here and is drawn on the web only, exactly as
+        // `CheckForUpdates` is in here and is dimmed in an unsigned build.
         assert_eq!(
             Command::all().len(),
-            64 + 8 + 8 + 6 + 2 + 5 + 4 + 3 + 3,
+            66 + 8 + 8 + 6 + 2 + 5 + 4 + 3 + 3,
             "a command was added to the enum and not to Command::all",
         );
     }

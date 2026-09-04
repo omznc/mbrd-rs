@@ -198,14 +198,12 @@ fn font_family(bytes: &[u8]) -> Option<String> {
 pub fn walk(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = Vec::new();
     for path in paths {
-        if path.is_dir() {
+        if crate::store::is_dir(path) {
             files.extend(
-                std::fs::read_dir(path)
+                crate::store::read_dir_paths(path)
                     .into_iter()
                     .flatten()
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.is_file()),
+                    .filter(|p| crate::store::is_file(p)),
             );
         } else {
             files.push(path.clone());
@@ -636,7 +634,7 @@ mod tests {
         db.load_system_fonts();
         let agree = db.faces().find_map(|face| {
             let resvg::usvg::fontdb::Source::File(path) = &face.source else { return None };
-            let bytes = std::fs::read(path).ok()?;
+            let bytes = crate::store::read(path).ok()?;
             let ours = font_family(&bytes)?;
             Some((ours, face.families.first()?.0.clone()))
         });

@@ -37,7 +37,7 @@ fn store() -> Option<PathBuf> {
 /// be the wrong lesson to learn.
 pub fn load() -> Vec<PathBuf> {
     let Some(path) = store() else { return Vec::new() };
-    let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
+    let Ok(text) = crate::store::read_to_string(&path) else { return Vec::new() };
     let Ok(value) = serde_json::from_str::<Value>(&text) else { return Vec::new() };
     value
         .get("boards")
@@ -46,7 +46,7 @@ pub fn load() -> Vec<PathBuf> {
             list.iter()
                 .filter_map(Value::as_str)
                 .map(PathBuf::from)
-                .filter(|p| p.exists())
+                .filter(|p| crate::store::exists(p))
                 .take(KEEP)
                 .collect()
         })
@@ -124,9 +124,9 @@ pub fn rename(old: &Path, new: &Path) {
 fn write_all(path: &Path, boards: &[PathBuf]) {
     let out = serde_json::json!({ "boards": boards });
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        let _ = crate::store::create_dir_all(dir);
     }
-    let _ = std::fs::write(path, out.to_string());
+    let _ = crate::store::write(path, out.to_string().as_bytes());
 }
 
 /// The stored list without the does-it-exist filter, so that writing back does
@@ -151,12 +151,6 @@ fn read_all() -> Vec<PathBuf> {
 /// it lives in. Not recursive: a walk of somebody's home directory is not
 /// something a keystroke should start.
 pub fn beside(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
-    let mut out: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "mbrd"))
-        .collect();
-    out.sort();
-    out
+    let Ok(paths) = crate::store::read_dir_paths(dir) else { return Vec::new() };
+    paths.into_iter().filter(|p| p.extension().is_some_and(|e| e == "mbrd")).collect()
 }

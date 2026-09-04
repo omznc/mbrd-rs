@@ -5,7 +5,10 @@
 //! one no test can reach without opening a window.
 
 use std::path::PathBuf;
+#[cfg(not(target_family = "wasm"))]
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(target_family = "wasm")]
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::Board;
 

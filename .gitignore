@@ -3,3 +3,10 @@
 # ...except the one the README's screenshots are taken of, which is committed
 # so that a retake is the same picture rather than a new one.
 !docs/screenshots/studio.mbrd
+
+# The web build's output and the scratch directory the browser tests are driven
+# from. `dist/` is produced by `scripts/build-web.sh` and published by the Pages
+# workflow; neither belongs in the history.
+/dist
+/target-wasm
+/wasm-scratch
