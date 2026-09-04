@@ -681,6 +681,14 @@ impl Command {
             Self::Paste => "Ctrl V",
             Self::PasteRaw => "Ctrl Shift V",
             Self::Save => "Ctrl S",
+            // The one key in this table a browser will not hand over. `Ctrl
+            // N` is Chrome's own — it opens a window, and unlike `Ctrl P` or
+            // `Ctrl S` a page never sees the press at all, so there is nothing
+            // to intercept and no `prevent_default` that could take it back.
+            // Advertising it there would be the app naming a key that cannot
+            // work. The switcher's `+` and the palette are what the web has
+            // instead, and `switcher.rs` says so in its own footer.
+            Self::NewBoard if cfg!(target_family = "wasm") => "",
             Self::NewBoard => "Ctrl N",
             Self::Recentre => "0",
             Self::FitBoard => "F",

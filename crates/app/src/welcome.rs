@@ -930,7 +930,10 @@ fn boards(screen: &Welcome, view: &BoardView, cx: &mut Context<BoardView>) -> An
         .gap(px(12.0))
         .child(asked(
             "Where your boards live",
-            "Ctrl N makes a board here, and the switcher looks here first.",
+            // Not "Ctrl N makes a board here", which this said until a
+            // browser read it out: that key is Chrome's own and the web build
+            // does not advertise it. See `Command::hint`.
+            "A new board is made here, and the switcher looks here first.",
             theme,
         ))
         .child(

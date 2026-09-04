@@ -822,8 +822,14 @@ pub fn render(
                                 // between wrapped lines that a status line
                                 // does not.
                                 .line_height(gpui::relative(1.45))
+                                // The `+` above rather than only "save one":
+                                // somebody who opens this and finds it empty
+                                // is somebody who wants a board, and the
+                                // button that makes one is 28 pixels wide and
+                                // in the corner. See `new_board_button`.
                                 .child(if switcher.query.text().is_empty() {
-                                    "no boards yet \u{2014} save one and it will be here"
+                                    "no boards yet \u{2014} the + above makes one, and every \
+                                     board you save lands here"
                                 } else {
                                     "no board by that name"
                                 })
@@ -850,9 +856,24 @@ pub fn render(
                             .text_size(px(10.0))
                             .text_color(theme.muted)
                             .child(match switcher.renaming().is_some() {
-                                true => "enter rename · esc keep the old name",
+                                true => "enter rename \u{00b7} esc keep the old name".to_string(),
+                                // Making one belongs on this line as much as
+                                // opening one does, and it was the one thing
+                                // this panel could do that the panel never
+                                // said. Named by its key where a key reaches
+                                // it and by the button where none does — which
+                                // is every browser, because Chrome keeps `Ctrl
+                                // N` for itself. See `Command::hint`.
                                 false => {
-                                    "\u{2191}\u{2193} move · enter open · f2 rename · del remove · esc close"
+                                    let new = match Command::NewBoard.hint() {
+                                        "" => "+ new".to_string(),
+                                        key => format!("{} new", key.to_lowercase()),
+                                    };
+                                    format!(
+                                        "\u{2191}\u{2193} move \u{00b7} enter open \u{00b7} \
+                                         {new} \u{00b7} f2 rename \u{00b7} del remove \u{00b7} \
+                                         esc close"
+                                    )
                                 }
                             }),
                     )
