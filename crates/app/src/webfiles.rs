@@ -192,16 +192,27 @@ async fn land(files: Vec<web_sys::File>) {
 /// other platform: a drop of a folder is a drop of what is *in* it, and a walk
 /// of somebody's whole tree is not something a gesture should start.
 async fn walk(entry: &web_sys::FileSystemEntry) -> Vec<web_sys::File> {
+    // **`isFile` decides, and the cast is unchecked on purpose.** A checked
+    // cast is an `instanceof` test, and a dropped entry does not reliably pass
+    // one: the object a browser hands over here can report its constructor as
+    // plain `Object`, so `dyn_into` fails on an entry that answers `isFile`,
+    // `name` and `file()` perfectly well. That failure was silent and it was
+    // the whole of the web build's broken file drop — every drop walked to
+    // nothing. The two flags are what the entries API is specified around, so
+    // they are what this trusts.
     if entry.is_file() {
-        let Ok(file) = entry.clone().dyn_into::<web_sys::FileSystemFileEntry>() else {
-            return Vec::new();
-        };
+        let file: web_sys::FileSystemFileEntry = entry.clone().unchecked_into();
         return one(&file).await.into_iter().collect();
     }
 
-    let Ok(directory) = entry.clone().dyn_into::<web_sys::FileSystemDirectoryEntry>() else {
+    // Neither a file nor a folder. Nothing to walk and nothing to call, and
+    // *not* something to cast anyway: an unchecked call on an object with no
+    // `createReader` throws, and a throw here is a panic in the drop.
+    if !entry.is_directory() {
+        log::warn!("files: {} is neither a file nor a folder", entry.name());
         return Vec::new();
-    };
+    }
+    let directory: web_sys::FileSystemDirectoryEntry = entry.clone().unchecked_into();
     let reader = directory.create_reader();
     let mut files = Vec::new();
     // A reader hands back a hundred entries at a time and answers with an
@@ -217,10 +228,9 @@ async fn walk(entry: &web_sys::FileSystemEntry) -> Vec<web_sys::File> {
             if !entry.is_file() {
                 continue;
             }
-            if let Ok(file) = entry.dyn_into::<web_sys::FileSystemFileEntry>() {
-                if let Some(file) = one(&file).await {
-                    files.push(file);
-                }
+            let file: web_sys::FileSystemFileEntry = entry.unchecked_into();
+            if let Some(file) = one(&file).await {
+                files.push(file);
             }
         }
     }
@@ -242,7 +252,20 @@ async fn one(entry: &web_sys::FileSystemFileEntry) -> Option<web_sys::File> {
         });
         entry.file_with_callback_and_error_callback(ok.unchecked_ref(), failed.unchecked_ref());
     });
-    JsFuture::from(promise).await.ok().and_then(|file| file.dyn_into().ok())
+    match JsFuture::from(promise).await {
+        // Unchecked, as in [`walk`] and for the same reason: what a `file()`
+        // hands back is a `File` by the specification, and testing it with
+        // `instanceof` is how this path lost every dropped file.
+        Ok(file) if file.is_object() => Some(file.unchecked_into()),
+        Ok(_) => {
+            log::warn!("files: {} gave back nothing to read", entry.name());
+            None
+        }
+        Err(error) => {
+            log::warn!("files: {} could not be opened ({error:?})", entry.name());
+            None
+        }
+    }
 }
 
 /// One reader's worth of entries.
@@ -262,7 +285,9 @@ async fn batch(reader: &web_sys::FileSystemDirectoryReader) -> Vec<web_sys::File
     });
     let Ok(entries) = JsFuture::from(promise).await else { return Vec::new() };
     let entries: js_sys::Array = entries.unchecked_into();
-    entries.iter().filter_map(|entry| entry.dyn_into().ok()).collect()
+    // Unchecked again, and again because `instanceof` is not what says whether
+    // one of these is an entry. See [`walk`].
+    entries.iter().filter(JsValue::is_object).map(JsCast::unchecked_into).collect()
 }
 
 /// Write one `File` into the store and answer where it went.
