@@ -6265,7 +6265,7 @@ impl BoardView {
     /// Only the line, and not the rest of the bar: the counts, the scale and the
     /// zoom are facts about a board that is not on screen. `None` whenever the
     /// bar is doing its own job, so this cannot draw twice.
-    fn covered_status(&self) -> Option<impl IntoElement> {
+    fn covered_status(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         if !self.covered() {
             return None;
         }
@@ -6278,9 +6278,10 @@ impl BoardView {
                 .right_0()
                 .flex()
                 .justify_center()
-                // The press goes nowhere. This floats over a page whose own
-                // ground already answers for presses, and a line that swallowed
-                // one would be a hole in that page the width of a sentence.
+                // A press goes nowhere but the cross. This floats over a page
+                // whose own ground already answers for presses, and a line
+                // that swallowed one would be a hole in that page the width
+                // of a sentence.
                 .occlude()
                 .child(
                     div()
@@ -6296,7 +6297,15 @@ impl BoardView {
                         .shadow(self.theme.shadow_medium())
                         .text_size(px(11.0))
                         .text_color(self.theme.muted)
-                        .child(said_line(said, self.theme)),
+                        .child(said_line(
+                            said,
+                            self.theme,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.hush();
+                                cx.notify();
+                                cx.stop_propagation();
+                            }),
+                        )),
                 ),
         )
     }
@@ -14602,7 +14611,7 @@ impl BoardView {
         )
     }
 
-    fn status_bar(&self) -> impl IntoElement {
+    fn status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let board = &self.doc.board;
 
@@ -14706,7 +14715,15 @@ impl BoardView {
             // failure is cut rather than pushing the zoom off the edge.
             .child(
                 div().flex().flex_1().min_w_0().items_center().child(match &line {
-                    Some(said) => said_line(said, theme),
+                    Some(said) => said_line(
+                        said,
+                        theme,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.hush();
+                            cx.notify();
+                            cx.stop_propagation();
+                        }),
+                    ),
                     None => div()
                         .flex()
                         .items_center()
@@ -16689,7 +16706,17 @@ impl Focusable for BoardView {
 /// line is drawn over them by `BoardView::covered_status`, and it has to be the
 /// *same* line: two of these would be two places for a tone to stop meaning
 /// what it means.
-fn said_line(said: &Said, theme: Theme) -> gpui::AnyElement {
+///
+/// `dismiss` is what the cross at the end of a timed line does — `hush`, at
+/// both call sites. Only a *timed* line gets the cross: a warning that sits
+/// for ten seconds over the readout is worth a way out before the timer
+/// takes it, but a mode is a state the window is in, and a cross on it would
+/// promise to end the mode while only hiding the label that says so.
+fn said_line(
+    said: &Said,
+    theme: Theme,
+    dismiss: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> gpui::AnyElement {
     let words = said.tone.colour(&theme);
     let mode = said.tone == Tone::Mode;
     div()
@@ -16736,6 +16763,20 @@ fn said_line(said: &Said, theme: Theme) -> gpui::AnyElement {
                         .child(said.text.clone()),
                 ),
         )
+        .when(said.until.is_some(), |d| {
+            d.child(
+                div()
+                    .id("said-close")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(18.0))
+                    .rounded(px(crate::theme::RADIUS_SM))
+                    .hover(|s| s.bg(theme.accent.opacity(0.16)))
+                    .on_mouse_down(MouseButton::Left, dismiss)
+                    .child(icon(Icon::Close, ICON_SM, theme.muted)),
+            )
+        })
         .into_any_element()
 }
 
@@ -16969,7 +17010,7 @@ impl Render for BoardView {
                     .children(self.tour_bar(cx))
                     .children(self.measure_bar(cx))
                     .children(self.name_bar(cx))
-                    .child(self.status_bar())
+                    .child(self.status_bar(cx))
                     // Above the strip as well as the board: a menu opened near
                     // the bottom of the window flips upward, but one opened on
                     // a short window may still reach it. There is only ever
@@ -16981,7 +17022,7 @@ impl Render for BoardView {
                     // rest of the app reports on is under it. See
                     // `covered_status`, and `status_bar` above, which is the
                     // same line in its ordinary place.
-                    .children(self.covered_status())
+                    .children(self.covered_status(cx))
                     // Last, and above everything: while a board is being read
                     // it is the only thing on screen that is still happening.
                     .children(self.loader()),
