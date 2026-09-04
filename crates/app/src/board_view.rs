@@ -11464,6 +11464,21 @@ impl BoardView {
         if let Some(command) = Command::for_key(key, mods) {
             self.close_menu();
             command.run(self, window, cx);
+            // A browser has its own meaning for half of that table — `Ctrl S`
+            // saves the page, `Ctrl P` prints it, `Ctrl F` opens its find bar,
+            // `Ctrl D` bookmarks it — and it acts on every one of them unless
+            // the page says the press was handled. Stopping here is how it
+            // says so: the web backend calls `prevent_default` exactly when
+            // the app did not let a press propagate. Without this line `Ctrl
+            // S` saves the board *and* offers to save the page, and `Ctrl P`
+            // opens the switcher behind a print preview.
+            //
+            // Web only. On a desktop nothing downstream wants a press the
+            // board has just spent, and gpui feeds the installed input handler
+            // only on presses that propagate — see the `EntityInputHandler`
+            // impl, which is the one path this must not close.
+            #[cfg(target_family = "wasm")]
+            cx.stop_propagation();
             return;
         }
 
