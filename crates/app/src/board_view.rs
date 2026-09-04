@@ -6470,7 +6470,12 @@ impl BoardView {
         let names: Vec<String> =
             self.themes.of(appearance).iter().map(|t| t.name.clone()).collect();
         if let Overlay::Welcome(screen) = &mut self.overlay {
-            screen.picking = Some(crate::settings::Picker::open(appearance, was, &names));
+            screen.picking = Some(crate::settings::Picker::open(appearance, was.clone(), &names));
+            // Same as `pick_theme`: previewing the other slot means wearing
+            // it, and the wearing starts when the picker does.
+            if appearance != self.appearance() {
+                self.preview_from_picker(appearance, &was, cx);
+            }
             cx.notify();
         }
     }
@@ -6696,12 +6701,13 @@ impl BoardView {
     /// Try on a theme from a picker, if it is a theme this app could be wearing.
     ///
     /// **The slot being filled is not necessarily the one on screen.** Somebody
-    /// pinned to dark can be choosing what their light theme will be, and
-    /// painting the window in it would be answering a question nobody asked:
-    /// the app would go light, snap back to dark on the press that commits, and
-    /// the preview would have shown a state the setting cannot produce. So a
-    /// preview of the half that is not being worn changes nothing, and the
-    /// picker's own rows are where that choice is read instead.
+    /// pinned to dark can be choosing what their light theme will be, and a
+    /// preview that changed nothing would leave them picking colours they
+    /// cannot see — a swatch is a hint, not a window wearing the thing. So the
+    /// window wears the previewed palette even when it belongs to the other
+    /// half. The appearance itself is untouched: the mode, the desktop and the
+    /// saved names all still say dark, and both ways out put the worn half
+    /// back — Escape through `cancel_preview`, a choice through `retheme`.
     ///
     /// The one door for previewing off a picker, so the mouse and the arrows
     /// cannot end up disagreeing about what a highlight means — which they did:
@@ -6712,9 +6718,6 @@ impl BoardView {
         name: &str,
         cx: &mut Context<Self>,
     ) {
-        if appearance != self.appearance() {
-            return;
-        }
         let theme = self.themes.resolve(name, appearance);
         self.preview_theme(theme, cx);
     }
@@ -6827,6 +6830,12 @@ impl BoardView {
             self.themes.of(appearance).iter().map(|t| t.name.clone()).collect();
         if let Overlay::Settings(page) = &mut self.overlay {
             page.pick_theme(appearance, &was, &names);
+            // Filling the slot the app is not wearing: put that slot's own
+            // theme on straight away, so the flip belongs to opening the
+            // picker rather than to the first arrow key onto it.
+            if appearance != self.appearance() {
+                self.preview_from_picker(appearance, &was, cx);
+            }
             cx.notify();
         }
     }
