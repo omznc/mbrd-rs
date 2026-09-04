@@ -73,7 +73,16 @@ pub struct Raster {
 /// by accident.
 pub fn is_stl(bytes: &[u8]) -> bool {
     let Some(count) = triangle_count(bytes) else { return false };
-    bytes.len() == 84 + count as usize * 50
+    // In `u64`, not in `usize`, and that is not tidiness. `usize` is 32 bits on
+    // wasm, where a declared count of four billion times fifty does not fit —
+    // and this is asked of *every* file that is imported, because `classify`
+    // sniffs for a mesh before it looks at a name. Four arbitrary bytes at
+    // offset 80 are all it takes: in a debug build the multiplication panics
+    // and takes the whole page down mid-import, and in a release build it
+    // wraps and can call a text file an STL. Sixty-four bits cannot overflow
+    // on either kind of machine, and the comparison needs no word size of its
+    // own.
+    bytes.len() as u64 == 84 + count as u64 * 50
 }
 
 /// The triangle count alone, off the four bytes that carry it — cheap enough
@@ -775,6 +784,22 @@ mod tests {
         // accident.
         assert!(!is_stl(b"solid cube\nfacet normal 0 0 0\nendfacet\nendsolid\n"));
         assert!(!is_stl(b"too short"));
+    }
+
+    #[test]
+    fn a_file_that_declares_four_billion_triangles_is_answered_rather_than_believed() {
+        // Every import asks this question of every file, so the four bytes at
+        // offset 80 are whatever somebody's prose happened to put there. On a
+        // 32-bit target — which the web build is — multiplying such a count by
+        // fifty in `usize` overflows: it panicked mid-drop and took the page
+        // with it. The answer is `false`, and getting an answer at all is the
+        // point of the test.
+        let mut text =
+            b"# a note long enough to reach offset eighty, which most notes are".to_vec();
+        text.resize(200, b'.');
+        text[80..84].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(!is_stl(&text));
+        assert_eq!(triangle_count(&text), Some(u32::MAX));
     }
 
     #[test]
