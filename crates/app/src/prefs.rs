@@ -153,14 +153,16 @@ pub struct Prefs {
     /// getting it wrong by also removing the feedback is the usual way of
     /// making the accessible path the worse one.
     ///
-    /// **Off by default.** It was on, on the usual reasoning that motion is
-    /// what tells you a camera travelled rather than teleported, and the
-    /// default was changed because that reasoning is about the *first* time
-    /// somebody sees a transition rather than the ten-thousandth. A board is a
-    /// tool somebody is inside all day, and every settle is a wait between
-    /// having decided something and being able to act on it. The switch is
-    /// still here, and on is still a good answer — it is just no longer the
-    /// one nobody chose.
+    /// **On by default.** It was off for a while, on the reasoning that a
+    /// board is a tool somebody is inside all day and every settle is a wait
+    /// between deciding something and being able to act on it. That is a real
+    /// cost and it is the smaller one: with the motion gone the camera
+    /// *teleports*, and a view that arrives somewhere else with no travel in
+    /// between is one you have to re-read to find out where you are. The
+    /// first jump costs less than a settle; the tenth costs more. So it is on,
+    /// and the switch is still here for anybody the other side of that
+    /// trade — and for anybody who needs it off, which is the reason the
+    /// switch existed before it was ever a default.
     pub motion: bool,
 
     /// Whether to find out that a new version exists.
@@ -250,7 +252,7 @@ pub struct Prefs {
 impl Default for Prefs {
     fn default() -> Self {
         Self {
-            motion: false,
+            motion: true,
             update: true,
             mode: Mode::Dark,
             theme: DEFAULT_DARK.into(),
@@ -559,8 +561,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_interface_holds_still_until_somebody_asks_it_not_to() {
-        assert!(!Prefs::default().motion);
+    fn the_interface_moves_until_somebody_asks_it_not_to() {
+        assert!(Prefs::default().motion);
     }
 
     #[test]

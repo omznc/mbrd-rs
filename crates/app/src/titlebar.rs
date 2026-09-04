@@ -66,6 +66,14 @@ const _: () = assert!(!cfg!(target_os = "macos") || LEFT_INSET > 60.0);
 /// See the module note: never on macOS, always on Windows, and on Linux only
 /// where the compositor said it was leaving them to us.
 fn buttons_are_ours(window: &Window) -> bool {
+    // Never in a browser, where there is no window for any of the three to
+    // act on: the tab is the window. Minimise and zoom have nothing to do,
+    // and a close that removed the gpui window would leave a blank page with
+    // no way to bring a board back into it. The browser's own three are an
+    // inch above ours and they work.
+    if cfg!(target_family = "wasm") {
+        return false;
+    }
     if cfg!(target_os = "macos") {
         return false;
     }
@@ -181,40 +189,40 @@ pub fn render(view: &BoardView, window: &Window, cx: &mut Context<BoardView>) ->
         // they are ours. The badge sits before the buttons on Linux and
         // Windows and is simply the rightmost thing on a Mac, which is the
         // same sentence both ways: as far right as this app's own chrome goes.
-        .child(div().flex().items_center().gap(px(10.0)).children(update_badge(view, cx)).when(
-            ours,
-            |d| {
-                d.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .when(controls.minimize, |d| {
-                            d.child(control(
-                                "minimise",
-                                Icon::Minimise,
-                                theme.muted,
-                                theme.muted,
-                                cx,
-                                |_view, window, _cx| window.minimize_window(),
-                            ))
-                        })
-                        .when(controls.maximize, |d| {
-                            d.child(control(
-                                "maximise",
-                                Icon::Maximise,
-                                theme.muted,
-                                theme.muted,
-                                cx,
-                                |_view, window, _cx| window.zoom_window(),
-                            ))
-                        })
-                        // Not on the web, where there is no window to close:
-                        // the tab is the window, closing it is the browser's
-                        // own button, and a control here that removed the
-                        // gpui window would leave a blank page nothing could
-                        // bring a board back into.
-                        .when(!cfg!(target_family = "wasm"), |d| {
-                            d.child(control(
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .children(update_badge(view, cx))
+                .children(download_badge(view, cx))
+                .children(source_button(view, cx))
+                .when(ours, |d| {
+                    d.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .when(controls.minimize, |d| {
+                                d.child(control(
+                                    "minimise",
+                                    Icon::Minimise,
+                                    theme.muted,
+                                    theme.muted,
+                                    cx,
+                                    |_view, window, _cx| window.minimize_window(),
+                                ))
+                            })
+                            .when(controls.maximize, |d| {
+                                d.child(control(
+                                    "maximise",
+                                    Icon::Maximise,
+                                    theme.muted,
+                                    theme.muted,
+                                    cx,
+                                    |_view, window, _cx| window.zoom_window(),
+                                ))
+                            })
+                            .child(control(
                                 "close",
                                 Icon::Close,
                                 theme.muted,
@@ -230,11 +238,10 @@ pub fn render(view: &BoardView, window: &Window, cx: &mut Context<BoardView>) ->
                                     view.flush(cx);
                                     window.remove_window();
                                 },
-                            ))
-                        }),
-                )
-            },
-        ))
+                            )),
+                    )
+                }),
+        )
         // Last, and painted over everything above it, which is the point: gpui
         // answers a Windows hit test with the *first* region marked under the
         // pointer, in paint order, so a caption declared here can never take a
@@ -408,6 +415,123 @@ fn reach(
             }),
         )
         .child(icon(mark, crate::icons::ICON_MD, theme.muted))
+}
+
+/// The chip that leads out of the browser and onto a desktop.
+///
+/// `None` everywhere but the web, where the same slot holds the update badge —
+/// which is the point of them sharing it. A native build can update itself and
+/// has nowhere to send you; a page cannot update anything and has one thing
+/// worth pointing at. Neither platform draws both, so the corner of the bar
+/// holds one chip either way.
+#[cfg(not(target_family = "wasm"))]
+fn download_badge(_view: &BoardView, _cx: &mut Context<BoardView>) -> Option<gpui::AnyElement> {
+    None
+}
+
+/// See the note on its twin above.
+///
+/// Two faces rather than four, unlike the update badge: *quiet*, which is
+/// every state where the file has not been named yet and the press goes to the
+/// releases page, and *offered*, which is a build for this machine that one
+/// press downloads. Asking has no face of its own on purpose — it takes a
+/// moment and a chip that flickered on every launch is one nobody reads.
+#[cfg(target_family = "wasm")]
+fn download_badge(view: &BoardView, cx: &mut Context<BoardView>) -> Option<gpui::AnyElement> {
+    use crate::webget::Getting;
+    let theme = view.theme;
+
+    let pill = div()
+        .id("download")
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .px(px(9.0))
+        .h(px(22.0))
+        .rounded(px(crate::theme::RADIUS_XS))
+        .text_size(px(11.0))
+        // Mouse-down and claimed, for the reason every button on this bar
+        // gives: the bar starts a window move on press.
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _event, _window, cx| {
+                cx.stop_propagation();
+                this.get_the_app(cx);
+            }),
+        );
+
+    Some(match view.getting() {
+        Getting::Found(build) => pill
+            .text_color(theme.accent_text)
+            .bg(theme.accent.opacity(0.10))
+            .border_1()
+            .border_color(theme.accent.opacity(0.35))
+            .hover(|s| s.bg(theme.accent.opacity(0.18)))
+            .active(|s| s.bg(theme.accent.opacity(0.26)))
+            .tooltip(tip(
+                theme,
+                format!(
+                    "mbrd {} for {} \u{00b7} {}",
+                    build.version,
+                    build.desk.label(),
+                    crate::webget::size(build.bytes)
+                ),
+                build.desk.caveat(),
+            ))
+            .child(icon(Icon::Drop, crate::icons::ICON_SM, theme.accent_text))
+            .child(format!("Get for {}", build.desk.label()))
+            .into_any_element(),
+
+        // Cold, asking, or nothing to name. One face, because from the outside
+        // they are one thing: the file has not been named and the press goes
+        // to the page that names all of them.
+        _ => pill
+            .text_color(theme.tertiary)
+            .hover(|s| s.text_color(theme.muted).bg(theme.text.opacity(0.06)))
+            .tooltip(tip(theme, "mbrd on your desktop", "opens the releases page"))
+            .child(icon(Icon::Drop, crate::icons::ICON_SM, theme.tertiary))
+            .child("Get the app")
+            .into_any_element(),
+    })
+}
+
+/// Where this came from. `None` off the web.
+///
+/// Only in a browser, and the reason is what a browser is: somebody who
+/// downloaded a build chose it from a page that had the repository on it, and
+/// somebody who opened a link has been shown a whole application by a stranger
+/// with no way to see what it is. One press is that way.
+#[cfg(not(target_family = "wasm"))]
+fn source_button(_view: &BoardView, _cx: &mut Context<BoardView>) -> Option<gpui::AnyElement> {
+    None
+}
+
+/// See the note on its twin above.
+#[cfg(target_family = "wasm")]
+fn source_button(view: &BoardView, cx: &mut Context<BoardView>) -> Option<gpui::AnyElement> {
+    let theme = view.theme;
+    Some(
+        div()
+            .id("source")
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(24.0))
+            .h(px(22.0))
+            .rounded(px(crate::theme::RADIUS_XS))
+            .hover(|s| s.bg(theme.text.opacity(0.08)))
+            .active(|s| s.bg(theme.text.opacity(0.14)))
+            .tooltip(tip(theme, "Source", "every line of this, on GitHub"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_this, _event, _window, cx| {
+                    cx.stop_propagation();
+                    crate::webget::go(crate::webget::SOURCE);
+                }),
+            )
+            .child(icon(Icon::OpenOut, crate::icons::ICON_MD, theme.muted))
+            .into_any_element(),
+    )
 }
 
 /// How wide the download's progress track is.

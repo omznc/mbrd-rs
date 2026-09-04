@@ -53,7 +53,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui::RenderImage;
+use gpui::{RenderImage, Window};
 use image::{Frame, RgbaImage};
 
 use objc2::rc::Retained;
@@ -183,6 +183,9 @@ pub struct Stack {
     /// is no `AVPlayer` that means "nothing", and inventing one to hold the
     /// shape of the struct would be a player that could be told to play.
     broken: HashMap<String, String>,
+    /// Pictures nothing will draw again, waiting for a window to hand their
+    /// atlas tiles back. See [`Stack::sweep`].
+    dropped: Vec<Arc<RenderImage>>,
 }
 
 impl Default for Stack {
@@ -193,7 +196,13 @@ impl Default for Stack {
 
 impl Stack {
     pub fn new() -> Self {
-        Self { started: None, spill: None, reels: HashMap::new(), broken: HashMap::new() }
+        Self {
+            started: None,
+            spill: None,
+            reels: HashMap::new(),
+            broken: HashMap::new(),
+            dropped: Vec::new(),
+        }
     }
 
     /// Open the spill directory, once, and answer whether this can play at all.
@@ -325,6 +334,11 @@ impl Stack {
             return Some(Beat { trouble: Some(why), ..Beat::default() });
         }
 
+        // The picture this frame replaces, if it replaces one. Held here rather
+        // than pushed straight onto `dropped`, because the reel is borrowed out
+        // of the same struct for the whole of the body below. See
+        // [`Stack::sweep`] for what it is owed.
+        let mut retire = None;
         let reel = self.reels.get_mut(id)?;
         if let Some(why) = &reel.broken {
             // Once. A card that says "no decoder for this" every frame would
@@ -390,7 +404,7 @@ impl Stack {
                 // displayed at this time", which is an answer rather than a
                 // failure — the card keeps the frame it has.
                 if let Some(picture) = copied.and_then(|buffer| frame_of(&buffer)) {
-                    reel.picture = Some(picture);
+                    retire = reel.picture.replace(picture);
                     beat.fresh = true;
                 }
             }
@@ -420,6 +434,7 @@ impl Stack {
             }
         }
 
+        self.dropped.extend(retire);
         Some(beat)
     }
 
@@ -443,6 +458,28 @@ impl Stack {
             // its audio unit with it whenever the runtime notices; pausing
             // first is what makes the sound end when the card does.
             unsafe { reel.player.pause() };
+            self.dropped.extend(reel.picture);
+        }
+    }
+
+    /// Release the atlas tiles of every picture retired since the last call.
+    ///
+    /// **A video is a new picture thirty times a second, and every one of them
+    /// takes a tile in the sprite atlas that nothing else ever gives back.**
+    /// The atlas is a cache keyed by image id with no eviction in it —
+    /// `Window::drop_image` is the only door out — so a clip left playing would
+    /// otherwise grow the texture it draws from until the GPU refused another.
+    ///
+    /// Call once a frame from somewhere with a window, beside
+    /// [`Images::sweep`](crate::images::Images::sweep) and
+    /// [`Live::sweep`](crate::live::Live::sweep), which exist for the same
+    /// reason and are swept in the same breath.
+    pub fn sweep(&mut self, window: &mut Window) {
+        for image in self.dropped.drain(..) {
+            // Best effort, for the reason `images.rs` gives: a tile that was
+            // never uploaded has nothing to drop, and a window on its way out
+            // will not take instructions.
+            let _ = window.drop_image(image);
         }
     }
 

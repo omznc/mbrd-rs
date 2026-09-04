@@ -39,10 +39,15 @@ there is no account and nothing is uploaded. A board you want to keep, or open
 in the desktop app, comes out with **Download board**, which hands you the same
 `.mbrd` file every other platform writes.
 
+Video and audio play, out of the browser's own decoders. Anything a browser
+will not open — Matroska, most `.avi` — says so on the card rather than
+failing quietly, which is what a desktop without the right codec already does.
+
 It needs WebGPU, which means Chrome, Edge, or Safari 26 — Firefox needs
-`dom.webgpu.enabled`. Three things a browser will not do are missing rather
-than pretending: video and audio do not play, a pasted link is not followed,
-and there is no updater, because reloading the page is the update.
+`dom.webgpu.enabled`. Two things are missing rather than pretending: a pasted
+link is not followed, and there is no updater, because reloading the page is
+the update. The bar carries a button that hands you the desktop build for
+whatever you are on instead.
 
 ```
 scripts/build-web.sh            # into dist/, ready to serve

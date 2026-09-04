@@ -58,7 +58,10 @@ use gpui::{
     div, prelude::*, px, AnyElement, Context, FontWeight, Modifiers, MouseButton, SharedString,
 };
 
-use crate::board_view::{BoardView, UpdateBadge};
+use crate::board_view::BoardView;
+// Only the update row reads it, and only a build that can update has one.
+#[cfg(not(target_family = "wasm"))]
+use crate::board_view::UpdateBadge;
 use crate::color::Tint;
 use crate::command::Command;
 use crate::editor::{self, Editor};
@@ -96,6 +99,14 @@ impl Group {
     fn sections(self) -> &'static [Section] {
         match self {
             Self::Board => &[Section::Canvas, Section::Arranging, Section::Media],
+            // No Updates in a browser. A page has no version of itself on a
+            // disk to replace, so a section about replacing one is a section
+            // whose every row would have to explain why it does nothing. See
+            // `Command::available`, which hides the same two rows everywhere
+            // else they are reachable from.
+            #[cfg(target_family = "wasm")]
+            Self::Application => &[Section::General, Section::Appearance],
+            #[cfg(not(target_family = "wasm"))]
             Self::Application => &[Section::General, Section::Appearance, Section::Updates],
         }
     }
@@ -103,6 +114,7 @@ impl Group {
 
 /// One of the sidebar's pages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 pub enum Section {
     Canvas,
     Arranging,
@@ -1238,6 +1250,9 @@ fn rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
     all.extend(media_rows(view, cx));
     all.extend(general_rows(view, cx));
     all.extend(appearance_rows(view, cx));
+    // See `Group::sections`, which leaves the section itself out of the sidebar
+    // on the same platform and for the same reason.
+    #[cfg(not(target_family = "wasm"))]
     all.extend(update_rows(view, cx));
     all
 }
@@ -1453,6 +1468,7 @@ fn general_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
     ]
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn update_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
     let update_note = crate::prefs::Prefs::forced(crate::prefs::Setting::Update)
         .map(|var| format!("Set by {var} at startup. Changing it here holds until you quit."));
@@ -2066,6 +2082,7 @@ pub(crate) fn button(
 /// The one row that is a verb rather than a state, so its control is a
 /// button — and the button's word follows how far the last press got, the
 /// same stepper the titlebar badge walks.
+#[cfg(not(target_family = "wasm"))]
 fn update_row(view: &BoardView, cx: &mut Context<BoardView>) -> Spec {
     let theme = view.theme;
     // **Not `Command::available`, which answers a different question.** That one

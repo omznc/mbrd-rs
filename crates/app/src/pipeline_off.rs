@@ -27,7 +27,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui::RenderImage;
+use gpui::{RenderImage, Window};
 
 /// What one frame of the clock says about a card that is playing. The real
 /// one's twin — see [`crate::pipeline`] — kept in step by the fact that
@@ -118,4 +118,9 @@ impl Stack {
     }
 
     pub fn trim(&mut self, _keep: usize) {}
+
+    /// Nothing to hand back: there is no picture on this platform, so there is
+    /// no atlas tile behind one either. See [`crate::pipeline::Stack::sweep`],
+    /// which is the method this one is the shape of.
+    pub fn sweep(&mut self, _window: &mut Window) {}
 }

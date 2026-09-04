@@ -79,7 +79,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use gpui::RenderImage;
+use gpui::{RenderImage, Window};
 use image::{Frame, RgbaImage};
 
 use windows::core::{implement, BSTR};
@@ -248,6 +248,11 @@ struct Shared {
     /// what makes "the board deleted a card" and "the board trimmed a card"
     /// one case instead of two.
     cards: HashMap<String, Card>,
+    /// Pictures nothing will draw again, waiting for a window to hand their
+    /// atlas tiles back. Filled by the worker as it replaces frames and by
+    /// every path that drops a card; emptied by [`Stack::sweep`], which is the
+    /// only one of the two sides that has a window.
+    dropped: Vec<Arc<RenderImage>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -501,14 +506,44 @@ impl Stack {
     /// That is the point of the reconciliation: this call cannot hang.
     pub fn forget(&mut self, id: &str) {
         if let Ok(mut shared) = self.shared.lock() {
-            shared.cards.remove(id);
+            let gone = shared.cards.remove(id).and_then(|card| card.news.picture);
+            shared.dropped.extend(gone);
+        }
+    }
+
+    /// Release the atlas tiles of every picture retired since the last call.
+    ///
+    /// **A video is a new picture thirty times a second, and every one of them
+    /// takes a tile in the sprite atlas that nothing else ever gives back.**
+    /// The atlas is a cache keyed by image id with no eviction in it —
+    /// `Window::drop_image` is the only door out — so a clip left playing would
+    /// otherwise grow the texture it draws from until the GPU refused another.
+    ///
+    /// Call once a frame from somewhere with a window, beside
+    /// [`Images::sweep`](crate::images::Images::sweep) and
+    /// [`Live::sweep`](crate::live::Live::sweep), which exist for the same
+    /// reason and are swept in the same breath.
+    pub fn sweep(&mut self, window: &mut Window) {
+        // Taken out from under the lock and dropped outside it: the worker
+        // wants this mutex sixty times a second, and a frame handed back to the
+        // GPU is not something to hold it across.
+        let Ok(mut shared) = self.shared.lock() else { return };
+        let dropped = std::mem::take(&mut shared.dropped);
+        drop(shared);
+        for image in dropped {
+            // Best effort, for the reason `images.rs` gives: a tile that was
+            // never uploaded has nothing to drop, and a window on its way out
+            // will not take instructions.
+            let _ = window.drop_image(image);
         }
     }
 
     /// Everything, for a board being closed.
     pub fn forget_all(&mut self) {
         if let Ok(mut shared) = self.shared.lock() {
-            shared.cards.clear();
+            let gone: Vec<_> =
+                shared.cards.drain().filter_map(|(_, card)| card.news.picture).collect();
+            shared.dropped.extend(gone);
         }
     }
 
@@ -526,9 +561,13 @@ impl Stack {
         }
         resting.sort_by_key(|(_, at)| *at);
         let over = resting.len() - keep;
-        for (id, _) in resting.into_iter().take(over) {
-            shared.cards.remove(&id);
-        }
+        let gone: Vec<_> = resting
+            .into_iter()
+            .take(over)
+            .filter_map(|(id, _)| shared.cards.remove(&id))
+            .filter_map(|card| card.news.picture)
+            .collect();
+        shared.dropped.extend(gone);
     }
 }
 
@@ -743,6 +782,9 @@ fn tick(
 
     // ---- 4. And what was found, handed back.
     let Ok(mut lock) = shared.lock() else { return busy };
+    // The pictures this pass replaced, gathered while the cards are borrowed
+    // and handed over once they are not. See [`Stack::sweep`].
+    let mut retired: Vec<Arc<RenderImage>> = Vec::new();
     for (id, found) in news {
         let Some(card) = lock.cards.get_mut(&id) else { continue };
         card.news.live = found.live;
@@ -754,13 +796,14 @@ fn tick(
         // last tick, and an end that happened then is still an end.
         card.news.ended |= found.ended;
         if let Some(picture) = found.picture {
-            card.news.picture = Some(picture);
+            retired.extend(card.news.picture.replace(picture));
             card.news.fresh = true;
         }
         if card.news.trouble.is_none() {
             card.news.trouble = found.trouble;
         }
     }
+    lock.dropped.append(&mut retired);
     busy
 }
 

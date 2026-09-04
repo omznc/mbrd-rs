@@ -986,7 +986,20 @@ impl Tone {
             // Blue rather than muted, and it is the app's only blue mark: an
             // outline `i` that is the same colour as the sentence beside it is
             // punctuation, not a signal.
-            Tone::Done | Tone::Told => theme.link,
+            //
+            // **`theme.link`'s hue, and `theme.tertiary`'s lightness.** Not
+            // `theme.link` itself, which is what this was and which drew
+            // nothing at all: that field is a *card tint* — the ground a link
+            // card is filled with — so it is pale on a light theme and dark on
+            // a dark one, which is to say invisible against the chrome under
+            // this mark in both. Borrowing the lightness of a colour the theme
+            // guarantees is readable on that chrome fixes it for every theme
+            // rather than for the two that ship, including one somebody wrote.
+            Tone::Done | Tone::Told => {
+                let mut mark = theme.link;
+                mark.color.lightness = theme.tertiary.lightness;
+                mark
+            }
         }
     }
 }
@@ -1451,6 +1464,12 @@ pub struct BoardView {
     imports: u64,
     /// How far along the update is. See [`Updating`].
     updating: Updating,
+    /// Which desktop build this browser would be handed, and how far along
+    /// finding that out is. See [`crate::webget`]. The web's answer to the
+    /// update badge, in the same corner of the same bar: there is nothing to
+    /// update here, and there is somewhere to go.
+    #[cfg(target_family = "wasm")]
+    getting: crate::webget::Getting,
     /// Which revision of the board was last written to disk.
     ///
     /// A comparison against `revision()` rather than a flag set on every
@@ -1879,6 +1898,8 @@ impl BoardView {
             importing: None,
             imports: 0,
             updating: Updating::default(),
+            #[cfg(target_family = "wasm")]
+            getting: crate::webget::Getting::default(),
             // A board just read off disk is a board that agrees with disk. A
             // new one has never been saved and is dirty from its first edit,
             // which `revision()` already reflects.
@@ -2088,6 +2109,63 @@ impl BoardView {
                 Some(UpdateBadge::Installing { version: version.to_string() })
             }
         }
+    }
+
+    /// What the chip at the end of the bar says, in a browser. `None`
+    /// everywhere else, where the same slot holds the update badge.
+    #[cfg(target_family = "wasm")]
+    pub fn getting(&self) -> &crate::webget::Getting {
+        &self.getting
+    }
+
+    /// Find out which desktop build this machine wants. Once a session.
+    ///
+    /// Called from `render` rather than from `new`, because the first frame is
+    /// the earliest moment the board is a thing somebody is looking at. Not
+    /// behind a switch: see [`crate::webget`], where the reason there is
+    /// nothing to switch off is written down.
+    #[cfg(target_family = "wasm")]
+    fn look_for_build(&mut self, cx: &mut Context<Self>) {
+        use crate::webget::Getting;
+        if !matches!(self.getting, Getting::Cold) {
+            return;
+        }
+        self.getting = Getting::Asking;
+        cx.spawn(async move |view, cx| {
+            let found = crate::webget::look().await;
+            view.update(cx, |view, cx| {
+                view.getting = match found {
+                    Some(build) => Getting::Found(build),
+                    None => Getting::Page,
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Go and get the app, or go to where every build of it is listed.
+    ///
+    /// One door for both, the way `update_step` is one door for the five states
+    /// beside it: the chip cannot drift from what it is showing, because the
+    /// showing and the press read the same field.
+    #[cfg(target_family = "wasm")]
+    pub fn get_the_app(&mut self, cx: &mut Context<Self>) {
+        use crate::webget::Getting;
+        // Read out first, so the status line can be written to. What is being
+        // pressed cannot change under this — there is one thread here and no
+        // frame between the two lines — so a copy of two strings is the whole
+        // cost of not holding the field across them.
+        let going = match &self.getting {
+            Getting::Found(build) => (build.url.clone(), Some(build.name.clone())),
+            _ => (crate::webget::RELEASES.to_string(), None),
+        };
+        if let Some(name) = going.1 {
+            self.tell(format!("downloading {name}"));
+        }
+        crate::webget::go(&going.0);
+        cx.notify();
     }
 
     pub fn update_step(&mut self, cx: &mut Context<Self>) {
@@ -5082,6 +5160,120 @@ impl BoardView {
                 self.press_control(&id, transport::Hit::PlayPause, cx);
             }
         }
+    }
+
+    /// Every video on the board, whether it is on screen or not.
+    ///
+    /// Not `drawn_controls`, which is what [`Self::press_control`] works from:
+    /// that list is built by the *draw*, so it holds the cards inside the
+    /// viewport and nothing else — and "all" said over a board somebody has
+    /// zoomed into would mean the three clips they can see.
+    fn every_video(&self) -> Vec<String> {
+        self.doc
+            .board
+            .items
+            .iter()
+            .filter(|item| item.kind == ItemType::Video)
+            .map(|item| item.id.clone())
+            .collect()
+    }
+
+    /// Start every video on the board.
+    ///
+    /// One undo step for the whole thing, which is the only real difference
+    /// from pressing each card's own play button in turn: the flags are
+    /// written inside a single `edit`, so a board that started playing is put
+    /// back by one `Ctrl Z` rather than by twelve.
+    ///
+    /// **Four of them will actually run**, and the message says so rather than
+    /// leaving somebody to count. `playback::AT_ONCE` is the cap and it stops
+    /// the oldest to make room — see `Media::make_room` — so a board of twenty
+    /// clips is not twenty decoders, here or anywhere else.
+    pub fn play_every_video(&mut self, cx: &mut Context<Self>) {
+        let ids = self.every_video();
+        if ids.is_empty() {
+            return;
+        }
+        self.doc.board.edit("Play all", |board| {
+            for id in &ids {
+                if let Some(item) = board.item_mut(id) {
+                    mbrd_core::media::set_wants_to_play(item, true);
+                }
+            }
+        });
+
+        // The decoder before the playhead, exactly as a press does: a file
+        // this build cannot open leaves its card alone rather than running a
+        // scrubber across silence.
+        let mut started = 0;
+        for id in &ids {
+            let looping =
+                self.doc.board.item(id).map(mbrd_core::media::playback).is_some_and(|p| p.looping);
+            if self.start_reel(id) == crate::pipeline::Opening::Refused {
+                continue;
+            }
+            // No length: the pipeline reports the real one on its first poll,
+            // and `Media::play` keeps whatever it already knew.
+            self.media.play(id, None, looping);
+            started += 1;
+        }
+
+        let at_once = crate::playback::AT_ONCE;
+        self.tell(match started > at_once {
+            true => format!("playing {at_once} of {started} — that is as many as run at once"),
+            false => format!("playing {}", plural(started, "video")),
+        });
+        cx.notify();
+    }
+
+    /// Stop every video that is running.
+    pub fn pause_every_video(&mut self, cx: &mut Context<Self>) {
+        let ids = self.every_video();
+        if ids.is_empty() {
+            return;
+        }
+        let playing = ids.iter().filter(|id| self.media.is_playing(id)).count();
+        self.doc.board.edit("Pause all", |board| {
+            for id in &ids {
+                if let Some(item) = board.item_mut(id) {
+                    mbrd_core::media::set_wants_to_play(item, false);
+                }
+            }
+        });
+        for id in &ids {
+            self.media.pause(id);
+        }
+        self.tell(match playing {
+            0 => "nothing was playing".to_string(),
+            n => format!("paused {}", plural(n, "video")),
+        });
+        cx.notify();
+    }
+
+    /// Turn looping on, or off, for every video on the board.
+    ///
+    /// Nothing is told about it here, and nothing needs to be: the flag lives
+    /// on the card, and both the playhead and the decoder read it back off the
+    /// board on every frame — see `Media::observe` and `pipeline::Stack::poll`,
+    /// which is handed it as an argument rather than remembering it. So a clip
+    /// halfway through starts looping without being restarted.
+    pub fn loop_every_video(&mut self, looping: bool, cx: &mut Context<Self>) {
+        let ids = self.every_video();
+        if ids.is_empty() {
+            return;
+        }
+        self.doc.board.edit(if looping { "Loop all" } else { "Stop looping" }, |board| {
+            for id in &ids {
+                if let Some(item) = board.item_mut(id) {
+                    mbrd_core::media::set_looping(item, looping);
+                }
+            }
+        });
+        self.tell(match looping {
+            true => format!("{} will loop", plural(ids.len(), "video")),
+            false => format!("{} will play once", plural(ids.len(), "video")),
+        });
+        cx.notify();
     }
 
     /// Mute or unmute every selected card with a mute button.
@@ -16511,6 +16703,14 @@ fn said_line(said: &Said, theme: Theme) -> gpui::AnyElement {
 
 impl Render for BoardView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Before anything else, including the frame's own bookkeeping. A window
+        // too small to hold a board is not a board to advance, autosave or draw
+        // — and the moment it is big enough it is all of those again, because
+        // nothing below this was torn down to get here. See `room.rs`.
+        if let Some(panel) = crate::room::cramped(window, &self.theme) {
+            return panel;
+        }
+
         // Files the page caught since the last frame — a drop, or a paste.
         //
         // Here rather than on a timer, and the reason is the web's run loop
@@ -16525,6 +16725,10 @@ impl Render for BoardView {
             if !arrived.is_empty() {
                 self.take_arrivals(&arrived, cx);
             }
+            // And which desktop build this machine would be handed, asked once
+            // and from here for the same reason: the first frame is the first
+            // moment there is a board for the answer to land on.
+            self.look_for_build(cx);
         }
 
         // Everything that is moving, moved on by one frame — and if anything
@@ -16571,6 +16775,11 @@ impl Render for BoardView {
         // And the frames of anything moving, which turn over thirty times a
         // second rather than once a session. See `live.rs`.
         self.live.sweep(window);
+        // And the frames of anything *playing*, which turn over at the same
+        // rate and are the largest of the three. See
+        // `pipeline::Stack::sweep`, which is the one of these that has to exist
+        // in four files.
+        self.stack.sweep(window);
 
         // The face labels are drawn in. Read once, here, because the paint
         // closure runs without a style stack to ask.
@@ -16741,6 +16950,7 @@ impl Render for BoardView {
             )
             // Last, so the grab strips sit above everything they overlap.
             .children(crate::titlebar::resize_handles(window))
+            .into_any_element()
     }
 }
 

@@ -47,26 +47,41 @@ mod mesh_cache;
 mod metrics;
 mod opened;
 mod palette;
-// Sound and video. Four files behind one name, and the swap is here rather
+// Sound and video. Five files behind one name, and the swap is here rather
 // than as a `cfg` at every call site: GStreamer on Linux, AVFoundation on
-// macOS, the Media Foundation Media Engine on Windows, and a stand-in
-// elsewhere that answers "not in this build" to every question.
+// macOS, the Media Foundation Media Engine on Windows, the page's own media
+// elements in a browser, and a stand-in elsewhere that answers "not in this
+// build" to every question.
 //
-// Three backends rather than one because the one — GStreamer — is a link-time
-// dependency, and satisfying it on the other two would cost Windows its
+// Four backends rather than one because the first — GStreamer — is a link-time
+// dependency, and satisfying it on the others would cost Windows its
 // single-file portable `.exe` and macOS a bundled framework. AVFoundation and
-// Media Foundation are already in those operating systems. Each file is the
-// same `Stack`, and `board_view.rs` cannot tell which it holds.
+// Media Foundation are already in those operating systems, and a browser is
+// nothing but one. Each file is the same `Stack`, and `board_view.rs` cannot
+// tell which it holds.
 #[cfg_attr(target_os = "macos", path = "pipeline_mac.rs")]
 #[cfg_attr(target_os = "windows", path = "pipeline_win.rs")]
+// The browser is the fourth, and it links against nothing at all: a page has a
+// decoder for everything the machine has, behind an element. See
+// `pipeline_web.rs`, which is the only one of the five that has to draw a
+// frame into a canvas to get a look at it.
+#[cfg_attr(target_family = "wasm", path = "pipeline_web.rs")]
 #[cfg_attr(
-    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows",
+        target_family = "wasm"
+    )),
     path = "pipeline_off.rs"
 )]
 mod pipeline;
 mod playback;
 mod prefs;
 mod recent;
+// Whether the window is big enough to hold a board at all. The web's own
+// version of the floor `MIN_SIZE` gives every other platform.
+mod room;
 mod save;
 mod settings;
 mod shrink;
@@ -90,8 +105,12 @@ mod transport;
 mod update;
 #[cfg(target_family = "wasm")]
 mod webfiles;
+// The way out: which desktop build this browser wants, and where it is. Only
+// on the web, which is the one platform that has somewhere to send anybody.
 #[cfg(target_family = "wasm")]
 mod webfs;
+#[cfg(target_family = "wasm")]
+mod webget;
 mod welcome;
 mod wires;
 
@@ -134,7 +153,7 @@ fn appearance(window: &Window) -> Appearance {
 /// Handed to the compositor rather than enforced by us: on Wayland it becomes
 /// `xdg_toplevel.set_min_size` and on X11 a `WM_SIZE_HINTS`, so the drag stops
 /// at the edge instead of the window snapping back after it.
-const MIN_SIZE: Size<gpui::Pixels> = Size { width: px(640.0), height: px(420.0) };
+pub const MIN_SIZE: Size<gpui::Pixels> = Size { width: px(640.0), height: px(420.0) };
 
 /// How often to look for a board the Finder has handed over. See the note at
 /// the call site for why this is a poll and why the interval is not tighter.
@@ -186,6 +205,18 @@ fn launch() {
     #[cfg(target_os = "macos")]
     mac::teach_the_dock_icon();
 
+    // What this launch is *about*, where it is about anything.
+    //
+    // On a desktop that is a path in `argv`: a board double-clicked, or one
+    // named at a shell. A browser has neither — there is no command line and
+    // nothing to double-click — so what a tab being opened means there is "the
+    // board I had open last time", which is the same question `mac::reopen`
+    // answers for a Dock click and is answered out of the same list. Without
+    // this a reload lands on the welcome board every time, and a board that is
+    // saved and not shown reads exactly like a board that was not saved.
+    #[cfg(target_family = "wasm")]
+    let path = recent::load().into_iter().next();
+    #[cfg(not(target_family = "wasm"))]
     let path = std::env::args().nth(1).map(PathBuf::from);
 
     // The window always opens on the demonstration board, whatever was asked
@@ -361,10 +392,10 @@ fn launch() {
         cx.activate(true);
     };
 
-    // WASM EXPERIMENT: on the web the browser owns the run loop, so `run`
-    // returns at once and drops the whole application with it — window,
-    // canvas and board. `run_embedded` is gpui's answer: it hands back a
-    // handle that keeps the app alive for as long as the page does.
+    // On the web the browser owns the run loop, so `run` returns at once and
+    // drops the whole application with it — window, canvas and board.
+    // `run_embedded` is gpui's answer: it hands back a handle that keeps the
+    // app alive for as long as the page does.
     #[cfg(target_family = "wasm")]
     std::mem::forget(app.run_embedded(launch));
     #[cfg(not(target_family = "wasm"))]

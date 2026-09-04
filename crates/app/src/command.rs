@@ -306,6 +306,30 @@ pub enum Command {
     /// see [`Self::hint`] — because the letters worth spending are gone and
     /// this is reached through the palette or a card's own menu instead.
     ToggleMute,
+
+    /// Start every video on the board.
+    ///
+    /// The four below are the board's own transport, reached by right-clicking
+    /// the paper rather than a card — a moodboard of clips is a thing somebody
+    /// wants *running*, and pressing twelve play buttons to get there is
+    /// twelve presses on a board that already knows which cards those are.
+    ///
+    /// **Videos and not sound.** The name is the rule: `playback::AT_ONCE`
+    /// caps what plays at four and stops the oldest to make room, which is a
+    /// sensible thing to do to pictures and a strange thing to do to a
+    /// recording somebody is listening to — and every audio card that started
+    /// would be talking over the last one. Sound keeps its own button.
+    PlayAll,
+    /// Stop every video that is running. The one of the four that is never
+    /// surprising, and the reason all four are here rather than only the loop
+    /// pair: a board that starts playing needs one press to stop.
+    PauseAll,
+    /// Set every video to loop, which is what a moodboard's clips almost
+    /// always want to be doing.
+    LoopAll,
+    /// And take it off all of them again.
+    UnloopAll,
+
     /// Turn a mesh card's camera over to the drag that would otherwise move
     /// the card.
     ///
@@ -435,6 +459,10 @@ impl Command {
             Self::FitText => "Dynamic size",
             Self::PlayPause => "Play / pause",
             Self::ToggleMute => "Mute",
+            Self::PlayAll => "Play all",
+            Self::PauseAll => "Pause all",
+            Self::LoopAll => "Loop all",
+            Self::UnloopAll => "Stop looping",
             Self::Position => "Position",
             Self::Align(edge) => match edge {
                 Edge::Left => "Align left",
@@ -581,6 +609,9 @@ impl Command {
             Self::TourStop => Icon::Pin,
             Self::DontScaleText | Self::FitText => Icon::Text,
             Self::PlayPause => Icon::Play,
+            Self::PlayAll => Icon::Play,
+            Self::PauseAll => Icon::Pause,
+            Self::LoopAll | Self::UnloopAll => Icon::Loop,
             Self::ToggleMute => Icon::Muted,
             // Both are "put this somewhere else by hand", which is what the
             // four arrows out of a point say.
@@ -677,6 +708,11 @@ impl Command {
             Self::Ungroup => "Ctrl Shift G",
             Self::ToggleLock => "L",
             Self::PlayPause => "Space",
+            // No keys, and four of them at once is the reason: these are the
+            // board's transport rather than a card's, they are reached by
+            // right-clicking the paper, and a chord each would be four spent
+            // on something nobody does twice in a row.
+            Self::PlayAll | Self::PauseAll | Self::LoopAll | Self::UnloopAll => "",
             // No key: the letters worth spending are gone, and unlike play or
             // pause this is not the one control every media player binds a
             // key to — reached through the palette or a card's own menu
@@ -891,11 +927,28 @@ impl Command {
             // offered a play button on one would be a menu that did nothing
             // when pressed.
             Self::PlayPause | Self::ToggleMute => view.has_media_selected(),
+            // Only where there is one. A board of photographs offering to play
+            // all of its videos is a submenu whose every row does nothing, and
+            // the whole `Videos` row goes with them — see `Entry::available`,
+            // which hides a submenu none of whose children are available.
+            Self::PlayAll | Self::PauseAll | Self::LoopAll | Self::UnloopAll => {
+                view.doc.board.items.iter().any(|i| i.kind == mbrd_core::ItemType::Video)
+            }
             // One card, and a mesh — see `BoardView::positionable`.
             Self::Position => view.positionable().is_some(),
             Self::Undo => view.undo_step().is_some(),
             Self::Redo => view.redo_step().is_some(),
             Self::SelectAll => view.doc.board.items.iter().any(|i| i.kind.is_content()),
+            // Hidden outright in a browser, both of them, and this is the one
+            // place in the app where a *whole* subject goes away rather than
+            // going quiet. A page is whatever was last deployed to it: there
+            // is no version of it sitting on a disk to replace, no download to
+            // stage, and nothing a check could tell anybody that a reload does
+            // not already do. Dimming them would be two rows that can never
+            // come back. See `webget.rs`, which is what the bar offers instead.
+            Self::CheckForUpdates | Self::ToggleUpdateChecks if cfg!(target_family = "wasm") => {
+                false
+            }
             // Dimmed rather than hidden in a build that has no update key —
             // which is every build except a released one. A row that vanishes
             // depending on how the binary was compiled is a menu that changes
@@ -1059,6 +1112,10 @@ impl Command {
             Self::DontScaleText => view.toggle_text_scaling(cx),
             Self::FitText => view.toggle_fit_text(cx),
             Self::PlayPause => view.play_pause_selection(cx),
+            Self::PlayAll => view.play_every_video(cx),
+            Self::PauseAll => view.pause_every_video(cx),
+            Self::LoopAll => view.loop_every_video(true, cx),
+            Self::UnloopAll => view.loop_every_video(false, cx),
             Self::ToggleMute => view.toggle_mute_selection(cx),
             Self::Position => view.toggle_positioning(cx),
             Self::Align(edge) => view.arrange(Self::Align(edge), cx),
@@ -1103,6 +1160,9 @@ impl Command {
             Self::ZoomIn => "enlarge magnify closer",
             Self::ZoomOut => "shrink magnify further",
             Self::PlayPause => "video audio play pause stop",
+            Self::PlayAll => "videos every all start",
+            Self::PauseAll => "videos every all stop",
+            Self::LoopAll | Self::UnloopAll => "videos every all repeat",
             Self::ToggleMute => "video audio sound unmute silence",
             Self::Delete => "remove trash",
             Self::AddSwatch => "colour swatch",
@@ -1204,6 +1264,10 @@ impl Command {
             Self::DontScaleText,
             Self::FitText,
             Self::PlayPause,
+            Self::PlayAll,
+            Self::PauseAll,
+            Self::LoopAll,
+            Self::UnloopAll,
             Self::ToggleMute,
             Self::Position,
             Self::BringToFront,
@@ -1328,6 +1392,7 @@ impl Entry {
             Self::Does(command) => Some(command.mark()),
             Self::More(name, _) => match name {
                 "Add" => Some(Icon::New),
+                "Videos" => Some(Icon::Video),
                 "Layout" => Some(Icon::Align),
                 "View" => Some(Icon::Eye),
                 "Paper" => Some(Icon::Paper),
@@ -1630,6 +1695,17 @@ const WEIGHTS: [Entry; 3] = [
     Entry::Does(Command::ConnWeightAs(ConnWeight::Bold)),
 ];
 
+/// The board's own transport. See [`Command::PlayAll`], which is where the
+/// argument for these being about videos rather than about everything that
+/// plays is written down.
+const VIDEOS: [Entry; 5] = [
+    Entry::Does(Command::PlayAll),
+    Entry::Does(Command::PauseAll),
+    Entry::Rule,
+    Entry::Does(Command::LoopAll),
+    Entry::Does(Command::UnloopAll),
+];
+
 /// What a right-click offers when **nothing** is in hand.
 ///
 /// A fourth list rather than the card list with two thirds of it dimmed. A
@@ -1640,7 +1716,7 @@ const WEIGHTS: [Entry; 3] = [
 /// Reaching it *lets go* of whatever was selected — see `on_mouse_down` —
 /// because a menu about the board over a board with three cards selected would
 /// be a menu whose every entry meant something other than what it said.
-pub const BOARD_MENU: [Entry; 12] = [
+pub const BOARD_MENU: [Entry; 13] = [
     Entry::More("Add", &ADD),
     // With nothing in hand this fences off an empty space, which is the way
     // round somebody who wants to lay a board out before filling it works.
@@ -1656,6 +1732,10 @@ pub const BOARD_MENU: [Entry; 12] = [
     // the readout.
     Entry::More("Layout", &LAYOUTS),
     Entry::Does(Command::Rearrange),
+    // Beside the layouts rather than up with `Add`, because it is the same
+    // kind of row: something done to everything on the board at once. Absent
+    // entirely on a board with no video on it.
+    Entry::More("Videos", &VIDEOS),
     Entry::Does(Command::Undo),
     Entry::Does(Command::Redo),
     Entry::Rule,
@@ -1682,7 +1762,7 @@ pub const BOARD_MENU: [Entry; 12] = [
 /// choice the last time this list was too long, and a double-click being the
 /// gesture people try first is not a reason for the menu to stay silent about
 /// it.
-pub const CARD_MENU: [Entry; 25] = [
+pub const CARD_MENU: [Entry; 26] = [
     Entry::Does(Command::Open),
     Entry::Does(Command::Rename),
     Entry::Does(Command::Duplicate),
@@ -1720,11 +1800,12 @@ pub const CARD_MENU: [Entry; 25] = [
     Entry::Does(Command::Undo),
     Entry::Does(Command::Redo),
     Entry::Rule,
-    // The two that are about the board the card is on rather than the card,
-    // last and together — the same two rows, in the same place, on the board's
-    // own list. The invariant the tests hold is that bare paper offers nothing
-    // a card does not.
+    // The rows that are about the board the card is on rather than the card,
+    // last and together — the same rows, in the same place, on the board's own
+    // list. The invariant the tests hold is that bare paper offers nothing a
+    // card does not.
     Entry::More("Layout", &LAYOUT_MENU),
+    Entry::More("Videos", &VIDEOS),
     Entry::More("View", &VIEW),
     Entry::More("Paper", &PAPER),
 ];
@@ -1882,6 +1963,10 @@ mod tests {
                 | Command::DontScaleText
                 | Command::FitText
                 | Command::PlayPause
+                | Command::PlayAll
+                | Command::PauseAll
+                | Command::LoopAll
+                | Command::UnloopAll
                 | Command::ToggleMute
                 | Command::Position
                 | Command::Align(_)
@@ -1902,7 +1987,7 @@ mod tests {
                 }
             }
         }
-        // 66 nullary, plus the eight that carry values mapped over their own
+        // 70 nullary, plus the eight that carry values mapped over their own
         // modules' lists: 8 arrangements, 8 paper sizes, 6 edges, 2 axes, 5
         // colours, 4 arrows, 3 styles, 3 weights.
         //
@@ -1911,7 +1996,7 @@ mod tests {
         // `CheckForUpdates` is in here and is dimmed in an unsigned build.
         assert_eq!(
             Command::all().len(),
-            66 + 8 + 8 + 6 + 2 + 5 + 4 + 3 + 3,
+            70 + 8 + 8 + 6 + 2 + 5 + 4 + 3 + 3,
             "a command was added to the enum and not to Command::all",
         );
     }

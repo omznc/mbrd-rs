@@ -3,168 +3,82 @@
 //! Built through [`mbrd_core::schema::normalize`] rather than by assembling
 //! structs by hand, and deliberately so: it means the thing the app shows on a
 //! cold start has been through exactly the same door as a file off a disk. A
-//! demonstration board built by hand would be the one board in existence that
-//! never exercises the reader.
+//! board built by hand would be the one board in existence that never
+//! exercises the reader.
 //!
-//! Its pictures are drawn here rather than shipped as files, for the same
-//! reason: an asset invented at runtime still has to be content-hashed, still
-//! has to be found by the hash a card names, and still has to survive a save —
-//! so a cold start exercises the whole asset path rather than the half of it
-//! that does not need bytes.
+//! ## One note, and nothing else
+//!
+//! This used to be a dozen cards: photographs drawn at runtime, a fence, a
+//! rope with a label on it, a card of a type no build has ever heard of. All
+//! of it was a demonstration, and that was the problem — the first thing
+//! anybody saw was somebody else's board, and the first thing they had to do
+//! was clear it off.
+//!
+//! What is left says the one thing worth saying on an empty canvas and then
+//! gets out of the way. Everything the old board showed off is still in the
+//! app and still tested, in the tests that were always the real check on it:
+//! `schema`, `fence` and `mbrd` in the core, and the round-trip tests here.
 
 use serde_json::json;
-use sha2::{Digest, Sha256};
 
-use mbrd_core::mbrd::Asset;
 use mbrd_core::{schema, BoardState, Document};
 
-pub fn board() -> Document {
-    // The pictures first, because the cards below have to name their hashes.
-    let mut assets = std::collections::HashMap::new();
-    let mut add = |w: u32, h: u32, hue: f32, label: &str| -> String {
-        let bytes = swatch(w, h, hue);
-        let hash = format!("{:x}", Sha256::digest(&bytes));
-        assets.insert(hash.clone(), Asset { bytes, ext: "png".into(), label: label.into() });
-        hash
-    };
-    let kitchen = add(1200, 800, 26.0, "kitchen-window");
-    let shelf = add(900, 1200, 168.0, "shelf");
-    let poster = add(1280, 720, 292.0, "walkthrough-poster");
-    let sleeve = add(600, 600, 348.0, "reference-sleeve");
+/// What the note says.
+///
+/// Lower case and short on purpose. It is a first sentence, not a manual:
+/// there is a command palette two keys away and a whole settings page behind
+/// it, and neither of them is something to read before touching anything.
+const HELLO: &str =
+    "# mbrd\n\nyou'll figure it out as you go along, try dragging things into this window";
 
+/// How big the note is, and therefore where it goes.
+///
+/// Centred on the origin — which is where the camera starts, so the first
+/// thing drawn is in the middle of the window rather than off in a corner
+/// somebody has to find.
+const WIDE: f64 = 380.0;
+const TALL: f64 = 200.0;
+
+pub fn board() -> Document {
     let value = json!({
         "title": "welcome",
         "view": { "pan": { "x": 0, "y": 0 }, "zoom": 1 },
         "settings": { "grid": true, "axes": true, "snap": false, "gridStep": 64 },
-        "mediaFit": "cover",
         "items": [
-            { "id": "hello", "type": "note", "x": -260, "y": 150, "w": 260, "h": 190, "z": 3,
+            { "id": "hello", "type": "note", "z": 1,
+              "x": -WIDE / 2.0, "y": -TALL / 2.0, "w": WIDE, "h": TALL,
               "name": "hello",
-              "meta": { "text": "# mbrd\n\ndrag empty space to pan, wheel to zoom.\npress n for a note, right-click for the rest.\ndouble-click to open a card.\nctrl z takes anything back. shift shift for everything else." } },
-            { "id": "photo1", "type": "image", "x": 90, "y": 170, "w": 300, "h": 220, "z": 2,
-              "name": "kitchen-window.jpg",
-              "asset": { "hash": kitchen, "embedded": true } },
-            // `contain` against the board's `cover`, so one card on this board
-            // is always taking the per-item override path.
-            { "id": "photo2", "type": "image", "x": 130, "y": -110, "w": 240, "h": 300, "z": 1,
-              "name": "shelf.jpg",
-              "asset": { "hash": shelf, "embedded": true },
-              "meta": { "fit": "contain" } },
-            // A video draws its poster, not its own bytes. There are no bytes
-            // here at all, which is the point: the card is complete without them.
-            { "id": "clip", "type": "video", "x": -240, "y": -140, "w": 280, "h": 170, "z": 4,
-              "name": "walkthrough.mp4",
-              "meta": { "cover": poster } },
-            { "id": "track", "type": "audio", "x": -250, "y": -360, "w": 300, "h": 96, "z": 5,
-              "name": "reference.mp3",
-              "meta": { "cover": sleeve } },
-            { "id": "warm", "type": "swatch", "x": 470, "y": 220, "w": 130, "h": 130, "z": 8,
-              "name": "#C4713A", "meta": { "hex": "#c4713a" } },
-            { "id": "cool", "type": "swatch", "x": 470, "y": 76, "w": 130, "h": 130, "z": 8,
-              "name": "#3A6EC4", "meta": { "hex": "#3a6ec4" } },
-            { "id": "ref", "type": "link", "x": 120, "y": -400, "w": 260, "h": 90, "z": 6,
-              "name": "the smaller one",
-              "meta": { "url": "https://example.invalid/shelf" } },
-            // Turned, so that the tilted bounding box in `geometry` is exercised
-            // by looking at the app rather than only by its tests.
-            { "id": "tilted", "type": "note", "x": 470, "y": -260, "w": 200, "h": 140, "z": 7,
-              "rot": -12, "name": "tilted",
-              "meta": { "tint": 3, "text": "cards can be turned. pressing one still lands where it looks like it should." } },
-            // A type this build has never heard of, on purpose: it should draw
-            // as a plain named card and survive a save untouched. If this one
-            // ever disappears from the demo board, the extension point broke.
-            { "id": "future", "type": "hologram", "x": 420, "y": 20, "w": 180, "h": 180, "z": 0,
-              "name": "from a newer build" },
-            // A fence, and nothing anywhere says what is inside it. Membership
-            // is measured from where the cards are — see `core::fence` — so
-            // dragging this rectangle takes the two photographs with it and
-            // dragging a photograph out of it leaves.
-            { "id": "pen", "type": "fence", "x": -60, "y": 140, "w": 700, "h": 460, "z": -1,
-              "name": "the shelf" },
-            // Locked, so the demonstration board has one of those on it: it
-            // wears a padlock, refuses every drag and every handle, and a
-            // whole-board relayout lays the rest out around it. `meta.locked`
-            // is the whole of the feature — see `Command::ToggleLock`.
-            { "id": "caption", "type": "note", "x": -170, "y": 60, "w": 180, "h": 90, "z": 9,
-              "meta": { "tint": 2, "locked": true,
-                        "text": "**locked** — press `L` to let it go" } }
+              "meta": { "text": HELLO } }
         ],
-        "connections": [
-            ["hello", "photo1"],
-            ["photo1", "photo2", { "dir": "fwd", "color": "leaf", "label": "same shelf" }]
-        ]
+        "connections": []
     });
 
-    Document { board: BoardState::new(schema::normalize(&value)), assets, ..Document::default() }
+    Document { board: BoardState::new(schema::normalize(&value)), ..Document::default() }
 }
 
-/// A PNG of a soft two-tone wash, so the cards have something in them.
-///
-/// Deliberately not a flat colour: a gradient makes it obvious at a glance
-/// whether a picture is being drawn at its own shape or stretched to the card,
-/// which is the one thing about the fit path that is easy to get wrong and
-/// impossible to see in a solid block.
-fn swatch(w: u32, h: u32, hue: f32) -> Vec<u8> {
-    let img = image::RgbaImage::from_fn(w, h, |x, y| {
-        let across = x as f32 / w.max(1) as f32;
-        let down = y as f32 / h.max(1) as f32;
-        let (r, g, b) = from_hsl(hue + across * 34.0, 0.42, 0.28 + down * 0.34);
-        image::Rgba([r, g, b, 255])
-    });
-    let mut out = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(img)
-        .write_to(&mut out, image::ImageFormat::Png)
-        .expect("a png of our own making");
-    out.into_inner()
-}
-
-/// Hue in degrees, saturation and lightness in `0..=1`, to eight-bit RGB.
-fn from_hsl(hue: f32, sat: f32, light: f32) -> (u8, u8, u8) {
-    let hue = hue.rem_euclid(360.0) / 60.0;
-    let chroma = (1.0 - (2.0 * light - 1.0).abs()) * sat;
-    let second = chroma * (1.0 - (hue % 2.0 - 1.0).abs());
-    let (r, g, b) = match hue as u32 {
-        0 => (chroma, second, 0.0),
-        1 => (second, chroma, 0.0),
-        2 => (0.0, chroma, second),
-        3 => (0.0, second, chroma),
-        4 => (second, 0.0, chroma),
-        _ => (chroma, 0.0, second),
-    };
-    let m = light - chroma / 2.0;
-    let to_byte = |v: f32| ((v + m).clamp(0.0, 1.0) * 255.0).round() as u8;
-    (to_byte(r), to_byte(g), to_byte(b))
-}
-
-/// Cards name assets by hash, and a hash that names nothing is a card that
-/// never draws. Worth a test, because the two halves are written apart.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mbrd_core::model::ItemAsset;
-    use serde_json::Value;
 
     #[test]
-    fn every_picture_the_demo_board_names_is_a_picture_it_carries() {
+    fn the_board_somebody_opens_first_is_one_note_saying_hello() {
         let doc = board();
-        let mut named = 0;
-        for item in &doc.board.items {
-            let hashes = [
-                item.asset.as_ref().and_then(ItemAsset::hash),
-                item.meta.get("cover").and_then(Value::as_str),
-            ];
-            for hash in hashes.into_iter().flatten() {
-                named += 1;
-                let asset = doc.assets.get(hash).unwrap_or_else(|| {
-                    panic!("{} names {hash}, which is not in the archive", item.id)
-                });
-                assert!(
-                    crate::images::decode(&asset.bytes).is_some(),
-                    "{} names bytes that are not a picture",
-                    item.id
-                );
-            }
-        }
-        assert_eq!(named, 4, "the demo board should be exercising the asset path");
+        assert_eq!(doc.board.items.len(), 1, "one card, and it is the note");
+        assert!(doc.assets.is_empty(), "nothing to carry");
+
+        let note = &doc.board.items[0];
+        assert_eq!(note.kind, mbrd_core::ItemType::Note);
+        assert_eq!(note.meta.get("text").and_then(serde_json::Value::as_str), Some(HELLO));
+    }
+
+    /// The whole reason this is built out of JSON rather than out of structs:
+    /// the first board anybody sees has been read by the same code a file off
+    /// a disk is read by, so a reader that broke would break here first.
+    #[test]
+    fn it_is_centred_on_where_the_camera_starts() {
+        let doc = board();
+        let note = &doc.board.items[0];
+        assert!((note.x + note.w / 2.0).abs() < 1.0, "off centre across: {}", note.x);
+        assert!((note.y + note.h / 2.0).abs() < 1.0, "off centre down: {}", note.y);
     }
 }
