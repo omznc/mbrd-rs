@@ -255,8 +255,10 @@ async fn batch(reader: &web_sys::FileSystemDirectoryReader) -> Vec<web_sys::File
         let failed = Closure::once_into_js(move |error: JsValue| {
             let _ = reject.call1(&JsValue::NULL, &error);
         });
-        let _ = reader
-            .read_entries_with_callback_and_error_callback(ok.unchecked_ref(), failed.unchecked_ref());
+        let _ = reader.read_entries_with_callback_and_error_callback(
+            ok.unchecked_ref(),
+            failed.unchecked_ref(),
+        );
     });
     let Ok(entries) = JsFuture::from(promise).await else { return Vec::new() };
     let entries: js_sys::Array = entries.unchecked_into();
@@ -370,7 +372,10 @@ pub fn pick_folder() -> oneshot::Receiver<anyhow::Result<Option<Vec<PathBuf>>>> 
 }
 
 /// The picker both of the above are.
-fn pick(multiple: bool, directory: bool) -> oneshot::Receiver<anyhow::Result<Option<Vec<PathBuf>>>> {
+fn pick(
+    multiple: bool,
+    directory: bool,
+) -> oneshot::Receiver<anyhow::Result<Option<Vec<PathBuf>>>> {
     let (send, receive) = oneshot::channel();
 
     let Some(document) = web_sys::window().and_then(|window| window.document()) else {

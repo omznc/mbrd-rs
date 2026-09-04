@@ -111,7 +111,10 @@ pub fn config() -> Option<PathBuf> {
 
     // Every other Unix — the BSDs — follows the XDG layout, and landing there
     // is better than returning nothing.
-    #[cfg(all(not(any(target_os = "linux", target_os = "macos", windows)), not(target_family = "wasm")))]
+    #[cfg(all(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        not(target_family = "wasm")
+    ))]
     let dir = from_env("XDG_CONFIG_HOME").or_else(|| home(".config"))?.join(APP);
 
     #[cfg(target_family = "wasm")]
@@ -144,7 +147,10 @@ pub fn state() -> Option<PathBuf> {
     #[cfg(windows)]
     let dir = from_env("LOCALAPPDATA")?.join(APP);
 
-    #[cfg(all(not(any(target_os = "linux", target_os = "macos", windows)), not(target_family = "wasm")))]
+    #[cfg(all(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        not(target_family = "wasm")
+    ))]
     let dir = from_env("XDG_STATE_HOME").or_else(|| home(".local/state"))?.join(APP);
 
     #[cfg(target_family = "wasm")]
@@ -206,7 +212,10 @@ pub fn cache() -> Option<PathBuf> {
     #[cfg(windows)]
     let dir = from_env("LOCALAPPDATA")?.join(APP).join("cache");
 
-    #[cfg(all(not(any(target_os = "linux", target_os = "macos", windows)), not(target_family = "wasm")))]
+    #[cfg(all(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        not(target_family = "wasm")
+    ))]
     let dir = from_env("XDG_CACHE_HOME").or_else(|| home(".cache"))?.join(APP);
 
     #[cfg(target_family = "wasm")]

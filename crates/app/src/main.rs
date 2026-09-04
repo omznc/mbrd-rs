@@ -379,57 +379,56 @@ fn launch() {
 /// which is why it reads as a sequence rather than as a constructor.
 fn open_window(cx: &mut App, doc: Document, title: String) -> Option<Entity<BoardView>> {
     let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
-    let window = cx
-        .open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(MIN_SIZE),
-                // Ask for client-side decorations rather than leaving it to
-                // the default, which is `Server`.
-                //
-                // The reason is that `Server` is not a question the compositor
-                // reliably answers. gpui sets the state to `Server` optimistically
-                // and only corrects it if an `xdg-decoration` Configure event
-                // arrives saying otherwise — so a compositor that implements the
-                // protocol and a compositor that has never heard of it are
-                // *indistinguishable* from inside the app. Both report `Server`.
-                //
-                // GNOME's mutter is the second kind, and has been for its whole
-                // life: it does not implement `xdg-decoration` at all, on the
-                // position that clients should draw their own. So asking for
-                // `Server` there means asking for a titlebar nobody draws, and
-                // the window arrives with no way to move, resize or close it.
-                //
-                // Asking for `Client` is answerable: we draw the titlebar in
-                // `titlebar.rs`, and a compositor that insists on decorating
-                // anyway sends a Configure that flips us back to `Server`, at
-                // which point that module keeps its bar and leaves the three
-                // window buttons to the compositor that claimed them.
-                window_decorations: Some(WindowDecorations::Client),
-                titlebar: Some(TitlebarOptions {
-                    title: Some(title.into()),
-                    // The same request, spelled the way macOS and Windows
-                    // take it: hide the system caption, we are drawing our
-                    // own. `titlebar.rs` says why this app insists on that
-                    // rather than wearing three different sets of chrome on
-                    // three desks.
-                    appears_transparent: true,
-                    // macOS hides the *bar* and keeps the traffic lights,
-                    // which are real buttons it draws over ours — so they
-                    // have to be told where our bar is. Centred in its
-                    // height, and `titlebar::LEFT_INSET` is the matching
-                    // half of this: the room left for them before anything
-                    // of ours starts. Ignored everywhere else.
-                    traffic_light_position: Some(point(px(12.0), px(11.0))),
-                }),
-                ..Default::default()
-            },
-            // Always the demo, and always with no path — see the note on
-            // `doc` in `main`. Whatever `argv` or the Finder actually meant is
-            // opened by the caller, once there is a window and a `warn()` for
-            // it to fail into.
-            |_window, cx| cx.new(|cx| BoardView::new(doc, None, cx)),
-        );
+    let window = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(MIN_SIZE),
+            // Ask for client-side decorations rather than leaving it to
+            // the default, which is `Server`.
+            //
+            // The reason is that `Server` is not a question the compositor
+            // reliably answers. gpui sets the state to `Server` optimistically
+            // and only corrects it if an `xdg-decoration` Configure event
+            // arrives saying otherwise — so a compositor that implements the
+            // protocol and a compositor that has never heard of it are
+            // *indistinguishable* from inside the app. Both report `Server`.
+            //
+            // GNOME's mutter is the second kind, and has been for its whole
+            // life: it does not implement `xdg-decoration` at all, on the
+            // position that clients should draw their own. So asking for
+            // `Server` there means asking for a titlebar nobody draws, and
+            // the window arrives with no way to move, resize or close it.
+            //
+            // Asking for `Client` is answerable: we draw the titlebar in
+            // `titlebar.rs`, and a compositor that insists on decorating
+            // anyway sends a Configure that flips us back to `Server`, at
+            // which point that module keeps its bar and leaves the three
+            // window buttons to the compositor that claimed them.
+            window_decorations: Some(WindowDecorations::Client),
+            titlebar: Some(TitlebarOptions {
+                title: Some(title.into()),
+                // The same request, spelled the way macOS and Windows
+                // take it: hide the system caption, we are drawing our
+                // own. `titlebar.rs` says why this app insists on that
+                // rather than wearing three different sets of chrome on
+                // three desks.
+                appears_transparent: true,
+                // macOS hides the *bar* and keeps the traffic lights,
+                // which are real buttons it draws over ours — so they
+                // have to be told where our bar is. Centred in its
+                // height, and `titlebar::LEFT_INSET` is the matching
+                // half of this: the room left for them before anything
+                // of ours starts. Ignored everywhere else.
+                traffic_light_position: Some(point(px(12.0), px(11.0))),
+            }),
+            ..Default::default()
+        },
+        // Always the demo, and always with no path — see the note on
+        // `doc` in `main`. Whatever `argv` or the Finder actually meant is
+        // opened by the caller, once there is a window and a `warn()` for
+        // it to fail into.
+        |_window, cx| cx.new(|cx| BoardView::new(doc, None, cx)),
+    );
     // A window that will not open is otherwise silent on the web, where there
     // is no terminal for the failure to reach.
     #[cfg(target_family = "wasm")]

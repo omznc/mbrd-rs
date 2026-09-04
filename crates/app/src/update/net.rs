@@ -22,9 +22,9 @@ use std::io::Read;
 #[cfg(not(target_family = "wasm"))]
 use std::time::Duration;
 
+use anyhow::{bail, Result};
 #[cfg(not(target_family = "wasm"))]
 use anyhow::{ensure, Context as _};
-use anyhow::{bail, Result};
 
 /// How long to wait on the manifest.
 ///

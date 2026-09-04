@@ -213,23 +213,25 @@ pub fn render(view: &BoardView, window: &Window, cx: &mut Context<BoardView>) ->
                         // own button, and a control here that removed the
                         // gpui window would leave a blank page nothing could
                         // bring a board back into.
-                        .when(!cfg!(target_family = "wasm"), |d| d.child(control(
-                            "close",
-                            Icon::Close,
-                            theme.muted,
-                            theme.accent,
-                            cx,
-                            // The board goes to disk before the window goes away.
-                            // This button does not route through the compositor, so
-                            // the `on_window_should_close` hook `main.rs` registers
-                            // never sees it — see `BoardView::flush`, which both
-                            // paths call and which is a no-op when the autosave
-                            // timer has already been round.
-                            |view, window, cx| {
-                                view.flush(cx);
-                                window.remove_window();
-                            },
-                        ))),
+                        .when(!cfg!(target_family = "wasm"), |d| {
+                            d.child(control(
+                                "close",
+                                Icon::Close,
+                                theme.muted,
+                                theme.accent,
+                                cx,
+                                // The board goes to disk before the window goes away.
+                                // This button does not route through the compositor, so
+                                // the `on_window_should_close` hook `main.rs` registers
+                                // never sees it — see `BoardView::flush`, which both
+                                // paths call and which is a no-op when the autosave
+                                // timer has already been round.
+                                |view, window, cx| {
+                                    view.flush(cx);
+                                    window.remove_window();
+                                },
+                            ))
+                        }),
                 )
             },
         ))

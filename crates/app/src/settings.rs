@@ -822,27 +822,29 @@ fn header(page: &Page, view: &BoardView, cx: &mut Context<BoardView>) -> AnyElem
                 // opens a `.json` on the computer, and a page may not start a
                 // program. The file is still there — `webfs.rs` keeps it — and
                 // every setting in it is on this page.
-                .when(!cfg!(target_family = "wasm"), |d| d.child(
-                    div()
-                        .id("settings-edit-json")
-                        .px(px(9.0))
-                        .py(px(4.0))
-                        .rounded(px(crate::theme::RADIUS_SM))
-                        .text_size(px(11.0))
-                        .text_color(theme.muted)
-                        .border_1()
-                        .border_color(theme.chrome_edge)
-                        .bg(theme.chrome)
-                        .hover(|s| s.bg(theme.accent.opacity(0.10)).text_color(theme.text))
-                        .active(|s| s.bg(theme.accent.opacity(0.18)))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _event, _window, cx| {
-                                this.edit_settings_file(cx);
-                            }),
-                        )
-                        .child("Edit in settings.json"),
-                ))
+                .when(!cfg!(target_family = "wasm"), |d| {
+                    d.child(
+                        div()
+                            .id("settings-edit-json")
+                            .px(px(9.0))
+                            .py(px(4.0))
+                            .rounded(px(crate::theme::RADIUS_SM))
+                            .text_size(px(11.0))
+                            .text_color(theme.muted)
+                            .border_1()
+                            .border_color(theme.chrome_edge)
+                            .bg(theme.chrome)
+                            .hover(|s| s.bg(theme.accent.opacity(0.10)).text_color(theme.text))
+                            .active(|s| s.bg(theme.accent.opacity(0.18)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _event, _window, cx| {
+                                    this.edit_settings_file(cx);
+                                }),
+                            )
+                            .child("Edit in settings.json"),
+                    )
+                })
                 .child(
                     div()
                         .id("settings-close")

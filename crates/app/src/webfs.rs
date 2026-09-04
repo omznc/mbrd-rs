@@ -106,7 +106,8 @@ async fn load() -> std::result::Result<(), JsValue> {
     // browser allows the schema to change, and it fires before the open
     // succeeds.
     let upgrade = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
-        let Some(request) = event.target().and_then(|t| t.dyn_into::<web_sys::IdbOpenDbRequest>().ok())
+        let Some(request) =
+            event.target().and_then(|t| t.dyn_into::<web_sys::IdbOpenDbRequest>().ok())
         else {
             return;
         };
@@ -190,7 +191,8 @@ fn persist(path: &Path, node: Option<&Node>) {
     let queued = DATABASE.with(|slot| -> std::result::Result<(), JsValue> {
         let borrow = slot.borrow();
         let Some(db) = borrow.as_ref() else { return Ok(()) };
-        let transaction = db.transaction_with_str_and_mode(STORE, web_sys::IdbTransactionMode::Readwrite)?;
+        let transaction =
+            db.transaction_with_str_and_mode(STORE, web_sys::IdbTransactionMode::Readwrite)?;
         let store = transaction.object_store(STORE)?;
         if node.is_none() {
             store.delete(&key)?;
