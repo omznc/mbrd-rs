@@ -611,6 +611,18 @@ fn body(item: &Item, ready: &Ready, view: &BoardView, cx: &mut Context<BoardView
             .min_h_0()
             .flex()
             .justify_center()
+            // **The one line that makes the page scroll at all.** A flex row
+            // aligns its items to the cross axis, and the default is `stretch`:
+            // the column below was being given the *window's* height rather
+            // than its words', so what the scroll container measured as its
+            // contents was exactly its own size. A container whose contents
+            // are never taller than it is has nowhere to scroll to, and the
+            // wheel did nothing on a page of any length — the text ran off the
+            // bottom of the window and stayed there. Aligned to the start, the
+            // column is as tall as what is written in it, which is the number
+            // this needs. It changes nothing about how a short page is drawn:
+            // the words were at the top of that stretched column anyway.
+            .items_start()
             .overflow_y_scroll()
             // A column rather than the default row, so what is in it stretches
             // to the width instead of shrinking to its own contents — which for
