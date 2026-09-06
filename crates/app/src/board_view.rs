@@ -9476,8 +9476,12 @@ impl BoardView {
             // reason a mode earns its place: it says what a press means before
             // you make one.
             Tool::Pan => return CursorStyle::OpenHand,
-            Tool::Note | Tool::Connect => return CursorStyle::Crosshair,
-            Tool::Select => {}
+            Tool::Connect => return CursorStyle::Crosshair,
+            // Note is not a promise made over everything, because the press is
+            // not one either — over a card it selects, over a grip it resizes.
+            // Its crosshair is at the bottom of this function, on the paper
+            // where a press really would put a note down.
+            Tool::Note | Tool::Select => {}
         }
 
         // A handle before the card it is on, and an anchor after the handle.
@@ -9542,6 +9546,11 @@ impl BoardView {
         }
         if self.rope_at(world).is_some() {
             return CursorStyle::PointingHand;
+        }
+        // Paper, with nothing on it. The only place the Note tool would
+        // actually put a note, so the only place it says so.
+        if self.tool == Tool::Note {
+            return CursorStyle::Crosshair;
         }
         CursorStyle::Arrow
     }
@@ -9697,14 +9706,20 @@ impl BoardView {
         //
         // Select is not in here, because Select is what the rest of this
         // function already was.
+        //
+        // Note is not in here either, and that is the point of it being a tool
+        // rather than a stamp. It used to be, and a press in Note mode put a
+        // note down wherever it landed — on top of a card, on a grip, on a
+        // rope mark — because it returned before any of the tests below ran.
+        // So nothing could be selected, moved, resized, joined or opened while
+        // the tool was in hand, and a person who had just made a note could not
+        // even press it to get back to it. It now waits at the one place a
+        // press is *known* to have landed on nothing: the `None` arm of the hit
+        // test below.
         match self.tool {
             Tool::Pan => {
                 self.gesture = Gesture::Panning { from: world, moved: false, clearing: false };
                 cx.notify();
-                return;
-            }
-            Tool::Note => {
-                self.add_note_at(world, cx);
                 return;
             }
             Tool::Connect => {
@@ -9720,7 +9735,8 @@ impl BoardView {
                     }
                 }
             }
-            Tool::Select => {}
+            // Note and Select both fall through — see the note above.
+            Tool::Note | Tool::Select => {}
         }
 
         // A handle before the card it is on: the handles stick out past the
@@ -9936,6 +9952,14 @@ impl BoardView {
                 // passes behind a card must not steal a press meant for it.
                 if let Some((a, b)) = self.rope_at(world) {
                     self.select_rope(&a, &b, cx);
+                    return;
+                }
+                // Nothing at all is here, so the Note tool has its answer: this
+                // is the press it exists for. Everything a press could have
+                // meant instead has already been asked and said no — see the
+                // note on the tool match above.
+                if self.tool == Tool::Note {
+                    self.add_note_at(world, cx);
                     return;
                 }
                 // Empty space. A plain drag pans; a modified one sweeps out a
