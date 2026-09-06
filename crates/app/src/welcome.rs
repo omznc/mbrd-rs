@@ -1,7 +1,7 @@
 //! The first run.
 //!
-//! Four questions, asked once, on the surface every other page in this app
-//! uses — see `settings.rs` and `stock.rs` for the shape and `Overlay` in
+//! Four doors and up to three questions, asked once, on the surface every
+//! other page in this app uses — see `settings.rs` and `stock.rs` for the shape and `Overlay` in
 //! `board_view.rs` for why there can only ever be one of them up at a time.
 //!
 //! ## What it is allowed to ask
@@ -37,9 +37,12 @@
 //! Escape at any point, from any page, and the answers already given are
 //! kept — every control writes through to `prefs::save` the moment it is
 //! pressed, exactly as it would on the settings page. There is no *Finish*
-//! that commits and therefore no way to lose four answers by leaving before
-//! it. The last page has no Next for the same reason: it is not a summary to
-//! be confirmed, it is four doors out.
+//! that commits and therefore no way to lose an answer by leaving before it.
+//!
+//! The doors are the *first* page rather than the last, so Escape is not even
+//! the shortest way through: a bare Enter on the page this screen opens on
+//! takes the accented door and lands on a board. See [`Step::ALL`] for what
+//! that swap fixed.
 
 use gpui::{
     div, prelude::*, px, AnyElement, Context, FontWeight, Modifiers, MouseButton, SharedString,
@@ -54,6 +57,20 @@ use crate::prefs::Mode;
 use crate::settings::{self, Picker};
 use crate::theme::Theme;
 use crate::themes::Appearance;
+
+/// Whether this build has questions about the disk worth asking.
+///
+/// A browser has no folder to keep boards in and no version sitting on a disk
+/// to replace. `command.rs` already says so for the two update commands —
+/// `Command::available` returns false for both on wasm, and the comment there
+/// calls them "hidden outright in a browser" — and `dirs.rs` says so for the
+/// folder. This screen was the one place in the app that asked anyway: it drew
+/// a path field for a machine with no paths, and `command_switch` runs a
+/// `Command` without ever asking `Command::available`, so it drew the update
+/// switch too. First run, first screen, two questions that cannot mean
+/// anything. Both are dropped here rather than dimmed, for the reason
+/// `command.rs` gives: a row that can never come back should not be drawn.
+const ON_DISK: bool = !cfg!(target_family = "wasm");
 
 /// The longest a boards folder may be typed to.
 ///
@@ -81,7 +98,28 @@ pub enum Step {
 }
 
 impl Step {
-    pub const ALL: [Self; 4] = [Self::Appearance, Self::Boards, Self::Behaviour, Self::Started];
+    /// **The doors come first, and the questions after them.**
+    ///
+    /// They used to come last, which made the screen a form with a reward at
+    /// the end of it: three pages of preferences stood between somebody who
+    /// had just opened the app and the board they opened it for, and the one
+    /// page that actually let them in was the one page they had to earn. A
+    /// first run that reads as complicated is a first run that gates.
+    ///
+    /// Nothing is lost by the swap. Every answer on the three pages behind it
+    /// has a working default, all of them are in Settings, and the rail is
+    /// still there in full — so this is the difference between an offer and a
+    /// toll gate, and not between asking and not asking.
+    pub const ALL: [Self; 4] = [Self::Started, Self::Appearance, Self::Boards, Self::Behaviour];
+
+    /// Whether this page asks something, as opposed to offering a way out.
+    ///
+    /// Read in three places that would otherwise each have to remember which
+    /// page the doors are: the count in the heading, the number in the rail,
+    /// and the tick that says a question is behind you.
+    fn asks(self) -> bool {
+        !matches!(self, Self::Started)
+    }
 
     /// The word in the rail, which is deliberately shorter than the heading
     /// over the page it leads to: a rail is read sideways at a glance and a
@@ -91,7 +129,7 @@ impl Step {
             Self::Appearance => "Appearance",
             Self::Boards => "Boards folder",
             Self::Behaviour => "Behaviour",
-            Self::Started => "Get started",
+            Self::Started => "Ways in",
         }
     }
 }
@@ -150,8 +188,11 @@ impl Welcome {
         // The appearance page only if there is an appearance left to choose.
         let decided = crate::prefs::Prefs::forced(crate::prefs::Setting::Appearance).is_some()
             || crate::prefs::Prefs::forced(crate::prefs::Setting::Theme).is_some();
-        let steps: Vec<Step> =
-            Step::ALL.into_iter().filter(|step| !(decided && *step == Step::Appearance)).collect();
+        let steps: Vec<Step> = Step::ALL
+            .into_iter()
+            .filter(|step| !(decided && *step == Step::Appearance))
+            .filter(|step| ON_DISK || *step != Step::Boards)
+            .collect();
         Self {
             step: steps[0],
             steps,
@@ -265,14 +306,18 @@ impl Welcome {
                 self.focus = Some(settings::step_focus(self.focus, by, controls));
                 return settings::Reply::Held;
             }
-            // Enter answers the ring where there is one. Where there is not, it
-            // is Next — except on the last page, which has no next and whose
-            // first door is drawn as the default answer. So a bare Enter there
-            // takes it, which is what the accent has been promising all along.
+            // Enter answers the ring where there is one. Where there is not,
+            // it is Next — except on the doors page, whose first door is drawn
+            // as the default answer. A bare Enter there takes it, which is what
+            // the accent has been promising all along, and which is now the
+            // very first thing Enter does on a first run: one press, one board.
+            //
+            // Tested on the page rather than on its position, because the page
+            // has moved once already — see `Step::ALL`.
             "enter" if self.focus.is_some() => {
                 return settings::Reply::Press(self.focus.unwrap_or(0))
             }
-            "enter" if self.at() + 1 == self.steps.len() && controls > 0 => {
+            "enter" if self.step == Step::Started && controls > 0 => {
                 return settings::Reply::Press(0)
             }
             "enter" | "right" | "tab" => self.go(1),
@@ -326,18 +371,23 @@ pub fn controls(screen: &Welcome, view: &BoardView) -> Vec<settings::Does> {
                 .iter()
                 .position(|s| (*s - view.prefs.new_board.grid_step).abs() < 0.5)
                 .unwrap_or(0);
-            vec![
-                Does::Flip(Command::ToggleMotion),
-                Does::Flip(Command::ToggleUpdateChecks),
-                Does::Press(|this, cx| {
-                    this.set_new_board_snap(!this.prefs.new_board.snap, cx);
-                }),
-                Does::Step {
-                    pick: |this, at, cx| this.set_new_board_step(settings::GRID_STEPS[at], cx),
-                    count: settings::GRID_STEPS.len(),
-                    at,
-                },
-            ]
+            // Built rather than written out, because the update row is not
+            // there in a browser and this list is what the focus ring counts
+            // rows with — a fixed four here and three drawn below would light
+            // the ring on a row that is not on the screen. See `ON_DISK`.
+            let mut out = vec![Does::Flip(Command::ToggleMotion)];
+            if ON_DISK {
+                out.push(Does::Flip(Command::ToggleUpdateChecks));
+            }
+            out.push(Does::Press(|this, cx| {
+                this.set_new_board_snap(!this.prefs.new_board.snap, cx);
+            }));
+            out.push(Does::Step {
+                pick: |this, at, cx| this.set_new_board_step(settings::GRID_STEPS[at], cx),
+                count: settings::GRID_STEPS.len(),
+                at,
+            });
+            out
         }
         // The four doors, in the order they are drawn. The first is the one
         // drawn accented, so a bare Enter on this page now answers with the
@@ -367,7 +417,9 @@ pub fn controls(screen: &Welcome, view: &BoardView) -> Vec<settings::Does> {
 pub fn render(screen: &Welcome, view: &BoardView, cx: &mut Context<BoardView>) -> impl IntoElement {
     let theme = view.theme;
     let arriving = crate::board_view::arrival(view.overlay_presence.value());
-    let last = screen.step == Step::Started;
+    let doors = screen.step == Step::Started;
+    // The doors are a way out rather than a question, so they are not counted.
+    let asked = screen.steps.iter().filter(|step| step.asks()).count();
 
     div()
         .absolute()
@@ -397,7 +449,7 @@ pub fn render(screen: &Welcome, view: &BoardView, cx: &mut Context<BoardView>) -
                 .px(px(24.0))
                 .opacity(arriving.content)
                 .mt(px(arriving.rise))
-                .child(heading(last, theme, cx))
+                .child(heading(doors, asked, theme, cx))
                 .child(rail(screen, view, cx))
                 .child(
                     div()
@@ -415,18 +467,38 @@ pub fn render(screen: &Welcome, view: &BoardView, cx: &mut Context<BoardView>) -
 
 /// The title, and the way out.
 ///
-/// The heading changes on the last page and the way out changes with it:
-/// "Skip setup" is honest while there are questions left and a lie once there
-/// are none, at which point the same button is simply Close. Both are the same
-/// key, which is what the chip says out loud.
-fn heading(last: bool, theme: Theme, cx: &mut Context<BoardView>) -> AnyElement {
-    let (title, blurb, word) = match last {
-        false => (
-            "Set up mbrd",
-            "Four short questions. Everything here can be changed later in Settings.",
-            "Skip setup",
+/// The heading changes on the doors page and the way out changes with it:
+/// "Skip setup" is honest on a page of questions and a lie on the page that is
+/// already the way past them, where the same button is simply Close. Both are
+/// the same key, which is what the chip says out loud.
+/// The line under the title, which has to count rather than promise.
+///
+/// This screen is between one and three questions long depending on the build
+/// and on what a launcher has already pinned — see [`Welcome::open`],
+/// [`Step::asks`] and [`ON_DISK`] — and a heading that said four on a page with
+/// two would be the first thing the app got wrong in front of somebody who had
+/// never seen it.
+fn blurb(asked: usize) -> String {
+    let counted = match asked {
+        0 => "",
+        1 => "One short question. ",
+        2 => "Two short questions. ",
+        3 => "Three short questions. ",
+        _ => "A few short questions. ",
+    };
+    format!("{counted}Everything here can be changed later in Settings.")
+}
+
+fn heading(doors: bool, asked: usize, theme: Theme, cx: &mut Context<BoardView>) -> AnyElement {
+    let (title, blurb, word) = match doors {
+        false => ("Set up mbrd", blurb(asked), "Skip setup"),
+        true => (
+            "Welcome to mbrd",
+            "Open a board now, or answer a few short questions first. Neither one is a \
+             commitment."
+                .to_string(),
+            "Close",
         ),
-        true => ("You’re set up", "All of it is in Settings if you change your mind.", "Close"),
     };
     div()
         .flex_none()
@@ -472,7 +544,7 @@ fn heading(last: bool, theme: Theme, cx: &mut Context<BoardView>) -> AnyElement 
         .into_any_element()
 }
 
-/// The four steps, and the two buttons that walk them.
+/// The steps, and the two buttons that walk them.
 ///
 /// Every step is pressable, not just the next one. A rail that only went
 /// forwards would make "what did I say to the first question" a thing you
@@ -483,12 +555,24 @@ fn rail(screen: &Welcome, view: &BoardView, cx: &mut Context<BoardView>) -> AnyE
     let at = screen.at();
     let mut row = div().flex_none().flex().items_center().gap(px(8.0));
 
+    // Counted apart from `i`, because the doors are on the rail and are not a
+    // question: numbering them would make four out of a screen that asks
+    // three. See `Step::asks`.
+    let mut number = 0usize;
+
     for (i, step) in screen.steps.iter().copied().enumerate() {
         if i > 0 {
             row = row.child(div().w(px(16.0)).h(px(1.0)).bg(theme.chrome_edge));
         }
         let here = i == at;
-        let done = i < at;
+        // A page walked past, and only a page that asked something: the doors
+        // are never behind you in that sense, and a tick on them would claim
+        // an answer nobody gave.
+        let done = i < at && step.asks();
+        if step.asks() {
+            number += 1;
+        }
+        let numbered = step.asks().then_some(number);
         row = row.child(
             div()
                 .id(SharedString::from(format!("welcome-step-{i}")))
@@ -522,9 +606,17 @@ fn rail(screen: &Welcome, view: &BoardView, cx: &mut Context<BoardView>) -> AnyE
                         // number: the number is only useful while it is still
                         // telling you how far there is to go.
                         .when(done, |d| d.child(icon(Icon::Check, 9.0, theme.accent_text)))
-                        .when(!done, |d| {
-                            d.text_color(if here { theme.ground } else { theme.muted })
-                                .child(format!("{}", i + 1))
+                        .when(!done, |d| match numbered {
+                            Some(n) => d
+                                .text_color(if here { theme.ground } else { theme.muted })
+                                .child(format!("{n}")),
+                            // The way out, which has no place in a count. It
+                            // wears the same mark its own door does.
+                            None => d.child(icon(
+                                Icon::Explore,
+                                9.0,
+                                if here { theme.accent_text } else { theme.muted },
+                            )),
                         }),
                 )
                 .child(
@@ -1046,11 +1138,16 @@ fn behaviour(focus: Option<usize>, view: &BoardView, cx: &mut Context<BoardView>
     let chosen =
         settings::GRID_STEPS.iter().position(|s| (*s - view.prefs.new_board.grid_step).abs() < 0.5);
 
+    // Counted rather than written out, for the reason `controls` gives: the
+    // update row is not drawn in a browser, and these numbers are the same
+    // numbers the focus ring is handing down. See `ON_DISK`.
+    let snap_at = if ON_DISK { 2 } else { 1 };
+
     div()
         .flex()
         .flex_col()
         .child(asked(
-            "How it should behave",
+            "Motion and new boards",
             "The same rows as Settings, with the same words. Nothing here is a second \
              implementation.",
             theme,
@@ -1065,15 +1162,17 @@ fn behaviour(focus: Option<usize>, view: &BoardView, cx: &mut Context<BoardView>
             focus == Some(0),
             theme,
         ))
-        .child(row(
-            Command::ToggleUpdateChecks.label(),
-            update_note.unwrap_or_else(|| {
-                "Check quietly at startup and say so in the top bar when one exists.".into()
-            }),
-            command_switch(Command::ToggleUpdateChecks, view, cx),
-            focus == Some(1),
-            theme,
-        ))
+        .when(ON_DISK, |d| {
+            d.child(row(
+                Command::ToggleUpdateChecks.label(),
+                update_note.unwrap_or_else(|| {
+                    "Check quietly at startup and say so in the top bar when one exists.".into()
+                }),
+                command_switch(Command::ToggleUpdateChecks, view, cx),
+                focus == Some(1),
+                theme,
+            ))
+        })
         // The heading is load-bearing rather than decorative: it is the whole
         // of what stops the two rows under it reading as a change to the board
         // that is open. See the module note, and `prefs::NewBoard`.
@@ -1095,7 +1194,7 @@ fn behaviour(focus: Option<usize>, view: &BoardView, cx: &mut Context<BoardView>
                 cx,
                 |this, _window, cx| this.set_new_board_snap(!this.prefs.new_board.snap, cx),
             ),
-            focus == Some(2),
+            focus == Some(snap_at),
             theme,
         ))
         .child(row(
@@ -1109,7 +1208,7 @@ fn behaviour(focus: Option<usize>, view: &BoardView, cx: &mut Context<BoardView>
                 view,
                 cx,
             ),
-            focus == Some(3),
+            focus == Some(snap_at + 1),
             theme,
         ))
         .into_any_element()
@@ -1186,7 +1285,12 @@ fn started(focus: Option<usize>, view: &BoardView, cx: &mut Context<BoardView>) 
         .flex()
         .flex_col()
         .gap(px(14.0))
-        .child(div().text_size(px(15.0)).font_weight(FontWeight::SEMIBOLD).child("Get started"))
+        .child(asked(
+            "Pick a way in",
+            "Any of these opens a board. The pages beside this one are optional, and every \
+             answer on them is in Settings too.",
+            theme,
+        ))
         .child(
             div()
                 .flex()
@@ -1324,19 +1428,88 @@ mod tests {
         // Wrapping would make Next on the last page look like the screen had
         // restarted itself.
         let mut w = screen();
+        let first = w.steps[0];
+        let last = *w.steps.last().unwrap();
         w.go(-1);
-        assert_eq!(w.step, Step::Appearance);
+        assert_eq!(w.step, first);
         for _ in 0..10 {
             w.go(1);
         }
-        assert_eq!(w.step, Step::Started);
+        assert_eq!(w.step, last);
+    }
+
+    #[test]
+    fn the_screen_opens_on_the_way_out_rather_than_on_a_question() {
+        // The whole of the doors-first change, and the one assertion that
+        // fails if `Step::ALL` is ever put back the way it was: nobody should
+        // have to answer anything to reach a board.
+        assert_eq!(screen().step, Step::Started);
+        assert_eq!(Step::ALL[0], Step::Started);
+    }
+
+    #[test]
+    fn a_bare_enter_on_the_first_page_opens_a_board() {
+        // One press, from a standing start, with nothing focused. This used to
+        // need three Nexts to get to the page it now starts on.
+        let mut w = screen();
+        assert_eq!(w.focus, None);
+        assert_eq!(w.key("enter", Modifiers::default(), None, &[], 4), settings::Reply::Press(0));
+    }
+
+    #[test]
+    fn the_doors_are_not_counted_as_a_question() {
+        // `Step::asks` is read by the heading, by the number in the rail and
+        // by the tick, and all three would be one out without it.
+        assert!(!Step::Started.asks());
+        for step in [Step::Appearance, Step::Boards, Step::Behaviour] {
+            assert!(step.asks(), "{step:?}");
+        }
+        let w = screen();
+        assert_eq!(w.steps.iter().filter(|s| s.asks()).count(), w.steps.len() - 1);
+    }
+
+    #[test]
+    fn a_browser_is_not_asked_where_its_boards_go() {
+        // There is no disk to put them on. `dirs.rs` says so and `command.rs`
+        // says the same about the update rows; this screen used to be the one
+        // place in the app that asked anyway, on the first page anybody sees.
+        let w = screen();
+        assert_eq!(
+            w.steps.contains(&Step::Boards),
+            ON_DISK,
+            "the folder page is asked exactly where there is a folder",
+        );
+    }
+
+    #[test]
+    fn the_heading_counts_the_questions_rather_than_promising_four() {
+        // The doors are not a question, so a four-step rail asks three.
+        assert!(blurb(3).starts_with("Three short questions."), "{}", blurb(3));
+        assert!(blurb(2).starts_with("Two short questions."), "{}", blurb(2));
+        assert!(blurb(1).starts_with("One short question."), "{}", blurb(1));
+        // And a rail with nothing left to ask says nothing about a count.
+        assert!(!blurb(0).contains("question"), "{}", blurb(0));
+        for asked in 0..=4 {
+            assert!(blurb(asked).contains("Settings"), "{}", blurb(asked));
+        }
+    }
+
+    #[test]
+    fn the_blurb_matches_the_rail_it_is_drawn_over() {
+        // The two are worked out in different places — `render` counts the
+        // steps, `blurb` names the number — and this is what holds them
+        // together across a build that drops a page.
+        let w = screen();
+        let asked = w.steps.iter().filter(|s| s.asks()).count();
+        assert_eq!(blurb(asked), blurb(w.steps.len() - 1));
+        assert!(asked >= 1, "there is always something left to ask");
     }
 
     #[test]
     fn escape_leaves_from_every_page() {
         // The promise the module note makes: there is no page you can get
         // stuck on and no answer that is lost by leaving.
-        for step in Step::ALL {
+        for step in screen().steps {
             let mut w = screen();
             w.show(step);
             assert_eq!(
@@ -1353,6 +1526,9 @@ mod tests {
         // anybody would type, and a rail that took it would move the page out
         // from under the field mid-word.
         let mut w = screen();
+        if !w.steps.contains(&Step::Boards) {
+            return;
+        }
         w.show(Step::Boards);
         w.folder = Editor::new("", PATH_MAX, false);
         for letter in ["n", "o", "t", "e", "s"] {
@@ -1373,11 +1549,14 @@ mod tests {
     }
 
     #[test]
-    fn the_last_page_answers_enter_with_the_door_it_is_offering() {
-        // `go(1)` clamps on the last page, so Enter there used to do nothing at
-        // all — on the one page whose first control is drawn accented precisely
-        // to read as the default answer. The four doors were pointer-only.
+    fn the_doors_page_answers_enter_with_the_door_it_is_offering() {
+        // The rule is written against the page and not against its position,
+        // so it survived the page being moved to the front. Walked to here the
+        // long way round, which is the case the position test used to cover.
         let mut w = screen();
+        while w.at() + 1 < w.steps.len() {
+            w.go(1);
+        }
         w.show(Step::Started);
         assert_eq!(w.key("enter", Modifiers::default(), None, &[], 4), settings::Reply::Press(0));
     }
@@ -1454,8 +1633,9 @@ mod tests {
         // in `prefs.rs` that read the same four.
         let _guard = crate::prefs::ENVIRONMENT.lock();
         let quiet = Welcome::open(None);
-        assert_eq!(quiet.steps, Step::ALL.to_vec());
-        assert_eq!(quiet.step, Step::Appearance);
+        assert!(quiet.steps.contains(&Step::Appearance));
+        assert_eq!(quiet.steps.len(), if ON_DISK { 4 } else { 3 });
+        assert_eq!(quiet.step, Step::Started);
 
         // SAFETY: held under `ENVIRONMENT` above, and the variable is read
         // once inside the call below.
@@ -1464,7 +1644,7 @@ mod tests {
         unsafe { std::env::remove_var("MBRD_THEME") };
 
         assert!(!forced.steps.contains(&Step::Appearance), "{:?}", forced.steps);
-        assert_eq!(forced.steps.len(), 3, "the other three are still asked");
-        assert_eq!(forced.step, Step::Boards, "it opens on the first page it has");
+        assert_eq!(forced.steps.len(), if ON_DISK { 3 } else { 2 }, "the rest are still there");
+        assert_eq!(forced.step, Step::Started, "and the way out is still first");
     }
 }

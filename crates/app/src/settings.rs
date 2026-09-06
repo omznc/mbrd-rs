@@ -1460,15 +1460,14 @@ fn general_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
             view,
             cx,
         ),
-        // The way back to the four questions. It is the only route to the
+        // The way back to the questions. It is the only route to the
         // demonstration board and the tour standing side by side, and without
         // it the first-run screen is a thing that happened once and cannot be
         // consulted again.
         spec(
             Section::General,
             Command::Welcome.label(),
-            "The four questions this app asked the first time it opened, and the ways in it \
-             offered.",
+            "The questions this app asked the first time it opened, and the ways in it offered.",
             button("settings-welcome", "Run setup again", true, theme, cx, |this, cx| {
                 this.open_welcome(cx);
             }),
