@@ -60,9 +60,9 @@ and switcher panels 560px wide · icon sizes 12 / 16 / 20px · radii 4 / 6 / 8 /
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
 │ [board name ▾] [⌘] [🔍] [⚙]              [update badge]  [─] [□] [×]  │  titlebar 34
-├────────────────────────────────────────────────────────────────────────┤
-│                                                                        │
-│                                                                        │
+├──┬──────────────┬──────────────────────────────────────────────────────┤
+│  │ ▶ ✋ ⎯ 📝  │  tool strip                                            │
+│  └──────────────┘                                                      │
 │                          THE BOARD                                     │
 │              (infinite canvas — dot grid, axes,                        │
 │               paper outline, cards, ropes, fences)                     │
@@ -72,9 +72,8 @@ and switcher panels 560px wide · icon sizes 12 / 16 / 20px · radii 4 / 6 / 8 /
 │                    │ ‹  card name   ›   ×     │  tour bar (when on)    │
 │                    │    3 of 12               │                        │
 │                    └──────────────────────────┘                        │
-│  ┌──────────────┐                                                      │
-│  │ ▶ ✋ ⎯ 📝  │  tool strip                                            │
-├──┴──────────────┴──────────────────────────────────────────────────────┤
+│                                                                        │
+├────────────────────────────────────────────────────────────────────────┤
 │ ⚠ message line …            │ 42 cards │ 8 selected │ 3 in bin │ 100% │  status 26
 └────────────────────────────────────────────────────────────────────────┘
 ```
@@ -168,7 +167,7 @@ A frame around cards. `Ctrl+G` groups the selection, `Ctrl+Shift+G` dissolves.
 `Esc` steps back out. That inside/outside state needs a visual — right now it is
 barely expressed.
 
-### 4.6 Tool strip (bottom left)
+### 4.6 Tool strip (top left)
 
 Four tools: **Select** (default), **Pan**, **Connect**, **Note**. Keys `1`–`4`
 or `V` / `H` / `C`.
@@ -178,6 +177,15 @@ paying twice: it makes gestures that were hidden behind a modifier visible, and
 it makes repeated ones repeatable — drawing nine ropes shouldn't mean nine trips
 to a card's edge. **No tool is the only way to do anything**; everything is also
 possible from Select.
+
+Two of the four therefore overlap something else on purpose, and the overlap is
+the first thing a new pair of eyes notices. **Connect** does what the four rope
+marks around a card already do (§5), and **Pan** does what a plain drag on empty
+paper already does. Connect still earns its place twice over: a card under 30
+units across is too small for marks at all, and a press anywhere on a card picks
+its own side, so a chain of ropes never needs an aimed press. That reasoning has
+to be *visible*, or the strip reads as a duplicate — see the open question in
+§6.
 
 ### 4.7 Status bar (bottom, 26px)
 
@@ -410,7 +418,7 @@ large is *reported*, never silently refused or silently accepted.
 
 Ranked. These are the places the app is functionally complete and visually thin.
 
-1. **The welcome / first-run screen — does not exist at all.** See §8.
+1. **The welcome / first-run screen.** Built, and the wrong shape. See §8.
 2. **Import progress.** A folder drop is the app's longest wait and has almost
    no visual language for it.
 3. **The update badge and its four states.**
@@ -469,9 +477,14 @@ Two are built in: a warm dark and the same board on paper.
 
 ---
 
-## 8. The welcome screen — what to design
+## 8. The welcome screen — what it is, and what it still needs
 
-**This does not exist yet.** It is a new surface, and here is the spec.
+**This is built.** `crates/app/src/welcome.rs` implements the spec below almost
+to the letter: four steps, the settings page's own controls rather than copies,
+every answer written through on press, no Finish button, Escape out at any
+point. What follows is therefore a description of what is there, and then, at
+the end, the part that is still open — which is no longer *how* it looks but
+*whether it should be four pages of preferences at all*.
 
 ### When it appears
 On **first run only** — determined by there being no preferences file in the
@@ -498,8 +511,8 @@ previews live.
 
 **Step 2 — Where your boards live.**
 - A path, defaulting to `~/mbrd`, with a Browse button.
-- *Engineering note: `dirs::boards()` currently hardcodes `~/mbrd`. Making this
-  choosable needs a new preference key. Flag it in the design.*
+- *Built: `prefs::Prefs::boards_dir` holds it, and an empty field means "follow
+  the platform" rather than a blank path.*
 - Explain in one sentence what goes there: `Ctrl+N` makes a board here, and this
   is where the switcher looks first.
 
@@ -511,20 +524,19 @@ have opinions about:
 - **Look for new versions** — "Check quietly at startup and say so in the top
   bar." (On by default. Off stops the request being made at all, not just the
   message being shown.)
-- **Snap to grid**, **Grid**, **Grid step** — *these are board settings, not app
-  settings*. To ask them here they must become **defaults for new boards**,
-  which is a new preferences key and a real design decision: the Board /
-  Application split is load-bearing elsewhere and mustn't be muddied. Either ask
-  them and label them clearly as defaults, or leave them out. **Recommend
-  labelling them "Defaults for new boards".**
+- **Snap to grid** and **Grid step** — *these are board settings, not app
+  settings*, so they are asked here only as **defaults for new boards**, under
+  that heading, in `prefs::NewBoard`. Nothing on this page reaches into the
+  board that happens to be open. The Board / Application split is load-bearing
+  elsewhere and the heading is what keeps it clean.
 
-**Step 4 — Get started.** Three doors, not a "Finish" button:
+**Step 4 — Get started.** Four doors, not a "Finish" button:
 - **Create a board** (opens a name field, lands you on an empty board)
 - **Open a board** (the switcher, or a file picker)
 - **Look around the demo board** (what the app currently opens on: a note
   explaining the gestures, two photographs, a video card, an audio card)
-- Optionally: **Take the tour** — the tour machinery already exists, so a guided
-  walk of the demo board is nearly free.
+- **Take the tour** — a guided walk of the demo board, built on the tour
+  machinery that already existed.
 
 ### Rules it must follow
 - **Nothing here is a second implementation of a settings row.** Whatever the
@@ -538,6 +550,25 @@ have opinions about:
 - **It must survive being the very first thing anybody sees on any theme**,
   including a light desktop where the app is about to draw dark.
 
+### What is still open
+
+Everything above is done. The question the build raised is the one the spec
+never asked: **three pages of preferences stand between a new person and a
+board.** The screen answers "how do you want the app set up?" before anybody has
+seen the thing being set up. Two directions worth drawing:
+
+- **Doors first.** Move Step 4 to the front. One press reaches a board; the rail
+  is there for whoever wants it.
+- **No screen at all.** Land on the demo board with two or three faint hint
+  cards on it, and keep all four pages behind a "Run setup again" row in
+  Settings.
+
+**And in the browser two of the questions cannot apply.** The WebAssembly build
+has no disk and no update channel, so Step 2 asks for a folder path that means
+nothing and Step 3 offers a check that never runs. That is a bug, not a design
+question, and it is being fixed — but it is worth knowing that a first-time
+person on the web meets it before anything else.
+
 ---
 
 ## 9. One-paragraph summary for the designer
@@ -549,6 +580,6 @@ joined by routed ropes, fenced into groups, tagged and filtered, laid out by an
 arrangement engine, and openable one at a time onto a full-window page that
 shows the actual thing. One titlebar, one status bar, one tool strip, and
 exactly one overlay at a time. No save button, because there is nothing to save.
-What is missing is a first-run experience, a visual language for waiting and for
-error, and polish on the three full-window pages — settings, the opened card,
-and the inventory sheet.
+What is missing is a visual language for waiting and for error, polish on the
+three full-window pages — settings, the opened card, and the inventory sheet —
+and a first run that puts somebody on a board before it asks them anything.
