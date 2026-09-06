@@ -800,6 +800,30 @@ pub struct Editing {
     /// The whole session is one step. Typing forty characters and pressing
     /// Escape should be one thing to undo, not forty.
     open: Pending,
+    /// Whether the card being typed into was made by the press that opened
+    /// this session — a note put down by the Note tool or by `Add note`.
+    ///
+    /// It changes what Escape means, and only for that one case. Escape on a
+    /// note somebody wrote last week puts the words back; Escape on a note
+    /// that appeared half a second ago and was never typed into means "never
+    /// mind", and leaving an empty card behind is not what anybody asked for.
+    /// See [`BoardView::stop_editing`].
+    born: bool,
+}
+
+/// Whether ending an edit should take the card away rather than write to it.
+///
+/// The whole of the rule [`BoardView::stop_editing`] applies, pulled out here
+/// so it can be asserted without a window: the press pipeline needs one and
+/// this decision does not.
+///
+/// True only where all three hold. `keep` is false, so this is Escape rather
+/// than a commit. `born` is true, so the card is one the same press made — a
+/// note from the Note tool or from `Add note`. And the words are still the ones
+/// it was born with, so nobody has written anything worth keeping. A note
+/// somebody emptied on purpose is an empty note they meant, and it stays.
+fn take_back(keep: bool, born: bool, typed: &str, before: &str) -> bool {
+    !keep && born && (typed.trim().is_empty() || typed == before)
 }
 
 /// A selection that was let go of, kept so that Ctrl Z can hand it back.
@@ -3284,6 +3308,12 @@ impl BoardView {
         // it. Clicking away without typing leaves the placeholder, which is
         // what makes the note visible for somebody who only wanted the shape.
         self.edit_card(&id, true, cx);
+        // And Escape from it takes the note with it, because a note that has
+        // never had a word in it is not a thing to put back — see
+        // `Editing::born` and `stop_editing`.
+        if let Some(open) = self.editing.as_mut() {
+            open.born = true;
+        }
         cx.notify();
     }
 
@@ -7191,6 +7221,7 @@ impl BoardView {
             before,
             file: from_file,
             open: self.doc.board.start(),
+            born: false,
         });
         self.hint(Some(hint_for(field)));
         cx.notify();
@@ -9029,6 +9060,7 @@ impl BoardView {
             before,
             file,
             open: self.doc.board.start(),
+            born: false,
         });
         self.hint(Some(hint_for(field)));
         cx.notify();
@@ -9052,6 +9084,7 @@ impl BoardView {
             before,
             file: false,
             open: self.doc.board.start(),
+            born: false,
         });
         self.hint(Some("labeling — enter to keep, escape to put it back".into()));
         cx.notify();
@@ -9075,6 +9108,30 @@ impl BoardView {
         // anyway (a mode line is `shown()`), so whatever it is guarding would
         // silently lose to a bar still reading "renaming — …".
         self.hush();
+
+        // Escape, on a note put down a moment ago and never typed into. There
+        // is nothing to put back — the note itself is what the press made — so
+        // it goes, rather than staying behind as a card reading "# note" that
+        // somebody now has to select and delete.
+        //
+        // Narrow on purpose. Only a note this session created (`born`), only
+        // on Escape (`!keep`), and only while the words are still the ones it
+        // was born with. A note somebody emptied deliberately is an empty note
+        // they meant, and it stays.
+        if take_back(keep, open.born, &typed, &open.before) {
+            if let Subject::Card(id, _) = &on {
+                let id = id.clone();
+                // The session's own step is closed first and with the text it
+                // already had, so it records nothing and nothing is left open
+                // to join the removal below — see `Pending`.
+                self.doc.board.finish(label, open.open);
+                self.doc.board.edit("Remove note", |board| board.items.retain(|i| i.id != id));
+                self.selection.retain(|s| *s != id);
+                self.say("note taken back".into());
+                cx.notify();
+                return;
+            }
+        }
 
         if keep || typed == open.before {
             // Either the typing is being kept, or Escape is putting back text
@@ -17130,6 +17187,33 @@ mod tests {
         assert_eq!(unused_in(&dir, named), dir.join("Kitchen_ideas.mbrd"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn escape_takes_back_a_note_that_was_never_written_in() {
+        // The trap this closes. The Note tool opens its note for typing with
+        // the placeholder selected, so Backspace in there erases text and
+        // never reaches Delete — and the way out used to leave a card reading
+        // "# note" that somebody then had to find, select and delete. Escape
+        // now means "never mind" for exactly that one case.
+        assert!(take_back(false, true, "# note", "# note"), "the placeholder, untouched");
+        assert!(take_back(false, true, "", "# note"), "the placeholder, erased");
+        assert!(take_back(false, true, "   \n ", "# note"), "whitespace is not words");
+    }
+
+    #[test]
+    fn escape_never_takes_back_a_note_somebody_wrote() {
+        // Escape on real typing is `stop_editing`'s other path, which commits
+        // the words and then puts them back as a second step so Ctrl Z can
+        // find them. Taking the card away instead would put them beyond it.
+        assert!(!take_back(false, true, "the kitchen", "# note"), "words were typed");
+        // Not Escape at all. Clicking away keeps the note, placeholder and all,
+        // which is what makes the tool usable for somebody laying out shapes.
+        assert!(!take_back(true, true, "# note", "# note"), "a commit, not an escape");
+        // And a note that was already on the board yesterday is never taken
+        // away by an edit that emptied it.
+        assert!(!take_back(false, false, "", "the kitchen"), "an old note, emptied");
+        assert!(!take_back(false, false, "# note", "# note"), "an old note, untouched");
     }
 
     #[test]
