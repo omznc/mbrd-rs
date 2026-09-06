@@ -88,7 +88,9 @@ impl Tool {
         match self {
             Tool::Select => None,
             Tool::Pan => Some("pan — drag anywhere; escape for select"),
-            Tool::Connect => Some("connect — drag from one card to another; escape for select"),
+            Tool::Connect => Some(
+                "connect — drag card to card; the marks on one card do the same, one at a time",
+            ),
             Tool::Note => {
                 Some("note — press paper to put one down; cards still select; escape for select")
             }

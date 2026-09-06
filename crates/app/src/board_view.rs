@@ -2495,10 +2495,19 @@ impl BoardView {
         // Nothing is offered mid-gesture or mid-edit, which is also the
         // painter's rule — the difference is that the marks that were up now
         // fade out instead of vanishing the instant a drag starts.
+        //
+        // The Connect tool offers every card at once, and that is the whole of
+        // what makes it worth a place on the strip. A designer looking at this
+        // app for the first time read the tool as a duplicate of the marks,
+        // which it was: both started one rope, and the marks did it without a
+        // mode. Armed, it now answers the question the marks cannot — *where
+        // can a rope start from* — for the whole screen rather than for the one
+        // card under the pointer.
         let mut wanted: HashSet<String> = HashSet::new();
+        let roping = self.tool == Tool::Connect;
         if matches!(self.gesture, Gesture::None)
             && self.editing.is_none()
-            && (self.hovering.is_some() || !self.selection.is_empty())
+            && (roping || self.hovering.is_some() || !self.selection.is_empty())
         {
             // Off the index and filtered down to the offered cards, rather
             // than off the offered cards and looked up one by one: this runs
@@ -2511,7 +2520,8 @@ impl BoardView {
             let items = &self.doc.board.items;
             for i in found {
                 let item = &items[i as usize];
-                let offered = self.hovering.as_deref() == Some(item.id.as_str())
+                let offered = roping
+                    || self.hovering.as_deref() == Some(item.id.as_str())
                     || selected.contains(item.id.as_str());
                 if !offered {
                     continue;
