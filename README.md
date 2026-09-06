@@ -70,7 +70,9 @@ what it draws.
 | | |
 |---|---|
 | drag empty space | pan around |
-| wheel / `Shift` + wheel | zoom to the cursor / pan sideways |
+| wheel / `Ctrl` + wheel / pinch | zoom to the cursor |
+| two fingers on a trackpad | pan (Settings turns this back into zoom) |
+| `Shift` + wheel | pan sideways |
 | middle-drag | pan from anywhere, even over a card |
 | click empty space | let go of the selection; `Ctrl`+`Z` puts it back |
 | `Shift` or `Ctrl` + drag empty space | select several cards |

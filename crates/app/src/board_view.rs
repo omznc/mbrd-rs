@@ -66,6 +66,7 @@ use crate::theme::Theme;
 use crate::tools::Tool;
 use crate::transport::{self, Face};
 use crate::update;
+use crate::wheel;
 use crate::wires::{self, Wire, Wires};
 use mbrd_core::align;
 use mbrd_core::fence::Fences;
@@ -124,9 +125,14 @@ const ROPE_REACH: f32 = 7.0;
 /// the paper it is sitting on would be a seam nobody could explain.
 const ENOUGH: f32 = 4.0;
 
-/// One wheel notch. Small enough that a trackpad's many small deltas do not
-/// rocket through the whole zoom range in one flick.
-const ZOOM_PER_LINE: f32 = 0.12;
+/// One wheel notch. Small enough that a held key or a long flick does not
+/// rocket through the whole zoom range.
+///
+/// Kept named here because the keyboard zoom and the opened page both read it,
+/// but owned by `wheel.rs`, which derives its pinch rates from it — two
+/// literals that had to stay equal is exactly the drift worth spending a
+/// re-export on.
+const ZOOM_PER_LINE: f32 = crate::wheel::PER_LINE;
 
 /// How far an arrow key pans the camera, in screen pixels, when there is
 /// nothing selected to nudge instead.
@@ -3426,6 +3432,7 @@ impl BoardView {
             Command::ToggleMotion => ("Animation", &mut self.prefs.motion),
             Command::ToggleUpdateChecks => ("Looking for new versions", &mut self.prefs.update),
             Command::ToggleLinkFetch => ("Fetching pasted links", &mut self.prefs.fetch_links),
+            Command::ToggleTrackpadPan => ("Two-finger panning", &mut self.prefs.trackpad_pans),
             _ => return,
         };
         *flag = !*flag;
@@ -5387,9 +5394,14 @@ impl BoardView {
     }
 
     /// The opened page's scroll wheel, which always dollies the one mesh it
-    /// is showing — the same wheel-to-factor arithmetic `on_scroll` uses for
-    /// the board's Position-gated branch, kept in one place since both are
-    /// this same "one notch, one small zoom" decision.
+    /// is showing. The board's Position-gated branch lands here too, since both
+    /// are the same "one notch, one small zoom" decision.
+    ///
+    /// Deliberately not `wheel::read`, and this is the one surface where that
+    /// is right: an orbit has nothing to pan. There is a single object in the
+    /// middle of the frame and the only thing two fingers could sensibly do to
+    /// it is move the camera in and out — so pixels keep the old arithmetic
+    /// here even while the board reads them as a pan.
     pub(crate) fn dolly_mesh(
         &mut self,
         id: &str,
@@ -11008,34 +11020,36 @@ impl BoardView {
             }
         }
 
-        let (dx, dy) = match event.delta {
-            // A trackpad reports exact pixels; a wheel reports lines. Scaling
-            // them the same way is what makes one notch and one flick feel
-            // like the same amount of zoom.
-            ScrollDelta::Pixels(p) => (f(p.x) / 40.0, f(p.y) / 40.0),
-            ScrollDelta::Lines(p) => (p.x, p.y),
+        // What the event *means* is decided in `wheel.rs`, away from the window,
+        // because it is the one piece of this file that is pure arithmetic over
+        // four numbers and worth asserting directly. See that module for why a
+        // pinch, a trackpad and a wheel are three gestures inside one event.
+        let delta = match event.delta {
+            ScrollDelta::Pixels(p) => wheel::Delta::Pixels { dx: f(p.x), dy: f(p.y) },
+            ScrollDelta::Lines(p) => wheel::Delta::Lines { dx: p.x, dy: p.y },
         };
+        let held = wheel::Held { control: event.modifiers.control, shift: event.modifiers.shift };
 
-        // Both of these go through the camera rather than onto the viewport,
+        // Both answers go through the camera rather than onto the viewport,
         // because a wheel arrives in notches and a notch applied straight to
         // the camera is a jump. The spring is short — it exists to join the
         // detents up, not to take the scenic route — and it is also what gives
         // the ends of the zoom range something to push against.
-        if event.modifiers.shift {
-            // Shift is pan-sideways, not zoom. Note that the *vertical* delta
-            // drives it: a mouse with one wheel has nothing else to give, and a
-            // trackpad's horizontal delta is added on top.
-            self.camera.nudge((dy + dx) * 40.0, 0.0, &self.viewport);
-        } else {
-            // The same window-to-canvas correction `world_at` makes, but
-            // stopping at canvas-local pixels: the anchor is a thing to hold
-            // still on screen, so it is measured in screen units.
-            let local = (
-                f(event.position.x) - f(self.canvas_bounds.origin.x),
-                f(event.position.y) - f(self.canvas_bounds.origin.y),
-            );
-            let factor = (1.0 + ZOOM_PER_LINE).powf(dy);
-            self.camera.zoom_by(factor, local, &self.viewport);
+        match wheel::read(delta, held, self.prefs.trackpad_pans) {
+            // `Reading::Pan` is where the board goes; `nudge` is told where the
+            // camera goes, and the two agree on one axis already. See the
+            // variant's own note.
+            wheel::Reading::Pan { dx, dy } => self.camera.nudge(dx, -dy, &self.viewport),
+            wheel::Reading::Zoom { factor } => {
+                // The same window-to-canvas correction `world_at` makes, but
+                // stopping at canvas-local pixels: the anchor is a thing to hold
+                // still on screen, so it is measured in screen units.
+                let local = (
+                    f(event.position.x) - f(self.canvas_bounds.origin.x),
+                    f(event.position.y) - f(self.canvas_bounds.origin.y),
+                );
+                self.camera.zoom_by(factor, local, &self.viewport);
+            }
         }
         cx.notify();
     }

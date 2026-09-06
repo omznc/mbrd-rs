@@ -335,7 +335,7 @@ stall at the exact moment the question was asked.
 
 ### First five minutes
 Open the app → land on a demonstration board with a few cards and a note that
-says how to move → pan by dragging, zoom on the wheel → drop a folder of images
+says how to move → pan by dragging or with two fingers, zoom on the wheel → drop a folder of images
 onto the window → watch cards land in batches → press `F` to fit everything →
 `N` to write a note → `Ctrl+P`, name a new board, start for real.
 
@@ -353,7 +353,9 @@ The full table (this is also the README's controls section):
 | Gesture | Does |
 |---|---|
 | drag empty space | pan |
-| wheel / `Shift`+wheel | zoom to cursor / pan sideways |
+| wheel / `Ctrl`+wheel / pinch | zoom to cursor |
+| two fingers on a trackpad | pan (Settings turns this back into zoom) |
+| `Shift`+wheel | pan sideways |
 | middle-drag | pan from anywhere, even over a card |
 | click empty space | deselect (`Ctrl+Z` puts it back) |
 | `Shift`/`Ctrl` + drag empty space | marquee-select |

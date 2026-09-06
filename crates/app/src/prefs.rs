@@ -243,6 +243,15 @@ pub struct Prefs {
     /// what a failed fetch already leaves.
     pub fetch_links: bool,
 
+    /// Whether a scroll made of pixels pans the board rather than zooming it.
+    ///
+    /// On, because a trackpad is the common case and every other infinite
+    /// canvas pans with two fingers. Off is the shape this app had before —
+    /// two fingers zoom, and the board is panned with a drag, the Pan tool or
+    /// the middle button. See `wheel.rs`, which holds the whole of the
+    /// decision this switch turns.
+    pub trackpad_pans: bool,
+
     /// What a board this app makes is born with. See [`NewBoard`], whose note
     /// is about why these are here and not on the settings page's Canvas
     /// section.
@@ -260,6 +269,7 @@ impl Default for Prefs {
             boards_dir: None,
             welcomed: false,
             fetch_links: true,
+            trackpad_pans: true,
             new_board: NewBoard::default(),
         }
     }
@@ -368,6 +378,9 @@ pub fn load() -> Prefs {
                 }
                 if let Some(fetch) = value.get("fetchLinks").and_then(Value::as_bool) {
                     prefs.fetch_links = fetch;
+                }
+                if let Some(pans) = value.get("trackpadPans").and_then(Value::as_bool) {
+                    prefs.trackpad_pans = pans;
                 }
                 if let Some(update) = value.get("update").and_then(Value::as_bool) {
                     prefs.update = update;
@@ -506,6 +519,7 @@ pub fn save(prefs: &Prefs) {
     out.insert("theme_light".into(), Value::String(prefs.theme_light.clone()));
     out.insert("welcomed".into(), Value::Bool(prefs.welcomed));
     out.insert("fetchLinks".into(), Value::Bool(prefs.fetch_links));
+    out.insert("trackpadPans".into(), Value::Bool(prefs.trackpad_pans));
     out.insert("newBoardSnap".into(), Value::Bool(prefs.new_board.snap));
     out.insert("newBoardGridStep".into(), Value::from(f64::from(prefs.new_board.grid_step)));
     // Removed rather than written as `null` or as the default path when
@@ -571,6 +585,13 @@ mod tests {
         // why paste is worth pressing — and a switch, because it is the one
         // thing this app does that reaches somebody else's computer unasked.
         assert!(Prefs::default().fetch_links);
+    }
+
+    #[test]
+    fn two_fingers_pan_until_somebody_says_otherwise() {
+        // The default that answers the complaint. Before this there was no way
+        // to pan up or down on a trackpad at all — see `wheel.rs`.
+        assert!(Prefs::default().trackpad_pans);
     }
 
     #[test]

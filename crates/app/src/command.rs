@@ -150,6 +150,15 @@ pub enum Command {
     /// what was in the clipboard. Off, every paste is the link card a failed
     /// fetch already leaves.
     ToggleLinkFetch,
+    /// Whether a scroll made of pixels pans the board rather than zooming it.
+    ///
+    /// The one preference in the app that is about a *device* rather than
+    /// about a person or a board, and it is here because no device announces
+    /// itself: a trackpad, a pinch and — in a browser — a mouse wheel all
+    /// arrive as the same event carrying pixels. `wheel.rs` reads them apart
+    /// as well as they can be read apart, and this is the way out for the
+    /// hands that reading gets wrong.
+    ToggleTrackpadPan,
     /// Find out whether a newer version exists, and then — pressed again —
     /// install it and restart into it.
     ///
@@ -438,6 +447,7 @@ impl Command {
             Self::ToggleMotion => "Animation",
             Self::ToggleUpdateChecks => "Look for new versions",
             Self::ToggleLinkFetch => "Fetch pasted links",
+            Self::ToggleTrackpadPan => "Two fingers pan",
             Self::CheckForUpdates => "Check for updates…",
             Self::Settings => "Settings…",
             Self::Welcome => "Welcome screen…",
@@ -594,6 +604,9 @@ impl Command {
             Self::ToggleMotion => Icon::Sparkle,
             Self::ToggleUpdateChecks | Self::CheckForUpdates => Icon::Restart,
             Self::ToggleLinkFetch => Icon::Link,
+            // The tool strip's own hand, because this switch is the question
+            // of whether two fingers do what that tool does.
+            Self::ToggleTrackpadPan => Icon::Pan,
             Self::Settings => Icon::Settings,
             Self::Welcome => Icon::Explore,
             Self::SelectTheme => Icon::SectionAppearance,
@@ -743,7 +756,8 @@ impl Command {
             | Self::FitText
             | Self::ToggleMotion
             | Self::ToggleUpdateChecks
-            | Self::ToggleLinkFetch => "",
+            | Self::ToggleLinkFetch
+            | Self::ToggleTrackpadPan => "",
             Self::Align(_) | Self::Distribute(_) | Self::Separate => "",
             // No key: a whole-board relayout is deliberate and rare, and a
             // single letter that scattered twenty thousand cards would be the
@@ -1024,6 +1038,7 @@ impl Command {
             Self::ToggleMotion => Some(view.prefs.motion),
             Self::ToggleUpdateChecks => Some(view.prefs.update),
             Self::ToggleLinkFetch => Some(view.prefs.fetch_links),
+            Self::ToggleTrackpadPan => Some(view.prefs.trackpad_pans),
             // The arrangement the board was last laid out in, so the Layout
             // list reads as a state and not only as eight verbs.
             Self::Arrange(arrangement) => {
@@ -1097,6 +1112,7 @@ impl Command {
             Self::ToggleMotion => view.toggle_pref(Self::ToggleMotion, cx),
             Self::ToggleUpdateChecks => view.toggle_pref(Self::ToggleUpdateChecks, cx),
             Self::ToggleLinkFetch => view.toggle_pref(Self::ToggleLinkFetch, cx),
+            Self::ToggleTrackpadPan => view.toggle_pref(Self::ToggleTrackpadPan, cx),
             Self::OpenBoard => view.open_switcher(window, cx),
             Self::Palette => view.open_palette(crate::palette::Mode::Commands, cx),
             Self::Search => view.open_palette(crate::palette::Mode::Search, cx),
@@ -1198,6 +1214,7 @@ impl Command {
             Self::ToggleMotion => "reduced motion accessibility animate",
             Self::ToggleUpdateChecks => "updates version automatic",
             Self::ToggleLinkFetch => "paste url download embed privacy network",
+            Self::ToggleTrackpadPan => "trackpad scroll wheel pinch zoom two fingers mouse",
             Self::CheckForUpdates => "upgrade version new",
             Self::Settings => "preferences options configure grid step gap spacing media fit",
             Self::Welcome => "first run setup onboarding getting started tour demo again",
@@ -1308,6 +1325,7 @@ impl Command {
             Self::ToggleMotion,
             Self::ToggleUpdateChecks,
             Self::ToggleLinkFetch,
+            Self::ToggleTrackpadPan,
             Self::CheckForUpdates,
             Self::Settings,
             Self::Welcome,
@@ -1950,6 +1968,7 @@ mod tests {
                 | Command::ToggleMotion
                 | Command::ToggleUpdateChecks
                 | Command::ToggleLinkFetch
+                | Command::ToggleTrackpadPan
                 | Command::OpenBoard
                 | Command::Palette
                 | Command::Search
@@ -1995,7 +2014,7 @@ mod tests {
                 }
             }
         }
-        // 70 nullary, plus the eight that carry values mapped over their own
+        // 71 nullary, plus the eight that carry values mapped over their own
         // modules' lists: 8 arrangements, 8 paper sizes, 6 edges, 2 axes, 5
         // colours, 4 arrows, 3 styles, 3 weights.
         //
@@ -2004,7 +2023,7 @@ mod tests {
         // `CheckForUpdates` is in here and is dimmed in an unsigned build.
         assert_eq!(
             Command::all().len(),
-            70 + 8 + 8 + 6 + 2 + 5 + 4 + 3 + 3,
+            71 + 8 + 8 + 6 + 2 + 5 + 4 + 3 + 3,
             "a command was added to the enum and not to Command::all",
         );
     }

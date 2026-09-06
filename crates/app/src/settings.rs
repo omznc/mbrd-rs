@@ -1444,6 +1444,15 @@ fn general_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
         }),
         toggle(
             Section::General,
+            Command::ToggleTrackpadPan,
+            "Two fingers on a trackpad move the board, the way they move a page. Off, they zoom \
+             instead. A pinch zooms either way, and so does a mouse wheel.",
+            None,
+            view,
+            cx,
+        ),
+        toggle(
+            Section::General,
             Command::ToggleLinkFetch,
             "A pasted address that points at a picture or a video becomes that card. Off, every \
              paste is a link — and nothing here contacts the address.",

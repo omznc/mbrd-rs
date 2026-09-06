@@ -112,6 +112,7 @@ mod webfs;
 #[cfg(target_family = "wasm")]
 mod webget;
 mod welcome;
+mod wheel;
 mod wires;
 
 use std::cell::RefCell;
