@@ -1,0 +1,27 @@
+{
+  "name": "Sepia",
+  "type": "light",
+  "author": "mbrd",
+  "colors": {
+    "editor.background": "#f7efdc",
+    "editor.foreground": "#2b2519",
+    "sideBar.background": "#efe6d2",
+    "sideBar.border": "#2a2b201f",
+    "editorWidget.background": "#fdf7e9",
+    "editorWidget.border": "#2a2b2024",
+    "focusBorder": "#9b4a17",
+    "textLink.foreground": "#9b4a17",
+    "descriptionForeground": "#615645",
+    "icon.foreground": "#867a66",
+    "editorRuler.foreground": "#2a2b2024",
+    "terminal.ansiYellow": "#8a5e10ff",
+    "terminal.ansiGreen": "#466b2eff",
+    "terminal.ansiRed": "#a62f2fff",
+    "widget.shadow": "#00000073",
+    "gitDecoration.addedResourceForeground": "#466b2eff",
+    "gitDecoration.deletedResourceForeground": "#a62f2fff",
+    "terminal.ansiBlue": "#4b3d8fff",
+    "terminal.ansiMagenta": "#983441ff",
+    "terminal.ansiCyan": "#47855aff"
+  }
+}

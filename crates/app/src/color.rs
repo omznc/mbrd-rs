@@ -116,7 +116,7 @@ pub mod hex_pad {
 /// Always eight digits, even at full alpha: a theme round-tripped through the
 /// settings page and back to disk should not quietly change shape depending on
 /// whether one of its colours happened to be opaque.
-fn write(color: Hsla) -> String {
+pub fn write(color: Hsla) -> String {
     let color = hsla_to_rgba(color);
     let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     let (r, g, b, a) = (byte(color.red), byte(color.green), byte(color.blue), byte(color.alpha));
@@ -126,12 +126,10 @@ fn write(color: Hsla) -> String {
 /// A colour from `#rgb`, `#rgba`, `#rrggbb` or `#rrggbbaa`.
 ///
 /// The error is a sentence rather than a type because nothing matches on it:
-/// [`crate::theme::overlay`] turns any failure into `None` — a colour that
-/// does not parse is the whole theme declining rather than a palette with a
-/// hole in it — and what a person sees is `themes.rs` counting that refusal
-/// on the settings page. The sentence is for whoever is reading a serde error
-/// while working out why.
-fn read(value: &str) -> Result<Hsla, String> {
+/// a colour that does not parse is simply not one this theme named, and
+/// `vscode.rs` computes the slot it was for out of the ones that did. The
+/// sentence is for whoever is reading a serde error while working out why.
+pub fn read(value: &str) -> Result<Hsla, String> {
     const EXPECTED: &str = "expected #rgb, #rgba, #rrggbb or #rrggbbaa";
 
     let Some(("", digits)) = value.trim().split_once('#') else {

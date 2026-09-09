@@ -1,0 +1,27 @@
+{
+  "name": "Cobalt",
+  "type": "light",
+  "author": "mbrd",
+  "colors": {
+    "editor.background": "#eceef7ff",
+    "editor.foreground": "#141b2eff",
+    "sideBar.background": "#e0e4f2ff",
+    "sideBar.border": "#141b2e1f",
+    "editorWidget.background": "#f8f9fdff",
+    "editorWidget.border": "#141b2e24",
+    "focusBorder": "#2b4fbdff",
+    "textLink.foreground": "#2646a8ff",
+    "descriptionForeground": "#465073ff",
+    "icon.foreground": "#6a7396ff",
+    "editorRuler.foreground": "#141b2e22",
+    "terminal.ansiYellow": "#8a610fff",
+    "terminal.ansiGreen": "#43682eff",
+    "terminal.ansiRed": "#a52f34ff",
+    "widget.shadow": "#00000073",
+    "gitDecoration.addedResourceForeground": "#466b2eff",
+    "gitDecoration.deletedResourceForeground": "#a62f2fff",
+    "terminal.ansiBlue": "#293aa3ff",
+    "terminal.ansiMagenta": "#6629a3ff",
+    "terminal.ansiCyan": "#2974a3ff"
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "name": "Ink",
+  "type": "dark",
+  "author": "mbrd",
+  "colors": {
+    "editor.background": "#0e1014ff",
+    "editor.foreground": "#dee4efff",
+    "sideBar.background": "#161a23ff",
+    "sideBar.border": "#dfe4ef16",
+    "editorWidget.background": "#1e2330ff",
+    "editorWidget.border": "#dfe4ef1f",
+    "focusBorder": "#5a8de0ff",
+    "textLink.foreground": "#7fa9ecff",
+    "descriptionForeground": "#9aa5baff",
+    "icon.foreground": "#6d7789ff",
+    "editorRuler.foreground": "#dfe4ef22",
+    "terminal.ansiYellow": "#c9913fff",
+    "terminal.ansiGreen": "#6f9455ff",
+    "terminal.ansiRed": "#bf4a4aff",
+    "widget.shadow": "#000000ff",
+    "gitDecoration.addedResourceForeground": "#6f9455ff",
+    "gitDecoration.deletedResourceForeground": "#d66666ff",
+    "terminal.ansiBlue": "#616dc7ff",
+    "terminal.ansiMagenta": "#9667c1ff",
+    "terminal.ansiCyan": "#57acd1ff"
+  }
+}

@@ -267,7 +267,7 @@ Board          ← travels in the .mbrd, undoable
 
 Application    ← about this computer, never saved into a file you send
   General      Animation
-  Appearance   Appearance (System/Light/Dark) · Dark theme ▾ · Light theme ▾ · Themes folder [Reload]
+  Appearance   Appearance (System/Light/Dark) · Dark theme ▾ · Light theme ▾ · More themes [Browse] [Open folder] [Reload]
   Updates      Look for new versions · [Check now / Download / Restart to update]
 ```
 
@@ -343,7 +343,8 @@ stall at the exact moment the question was asked.
 
 ### First five minutes
 Open the app → land on a demonstration board with a few cards and a note that
-says how to move → pan by dragging or with two fingers, zoom on the wheel → drop a folder of images
+says how to move, and on every launch after this one on the board you had open
+last → pan by dragging or with two fingers, zoom on the wheel → drop a folder of images
 onto the window → watch cards land in batches → press `F` to fit everything →
 `N` to write a note → `Ctrl+P`, name a new board, start for real.
 
@@ -468,12 +469,27 @@ word — 4.5:1 floor). Two tokens because one colour usually can't clear both.
 **Connections:** `rope_line` `rope_accent` `rope_warm` `rope_leaf` `rope_danger`
 · `anchor`
 
-Themes ship as **families** — a name, an author, and an array of themes, so a
-light and a dark meant to be worn as a pair live in one file. Every key is
-optional and inherits from the built-in palette for its appearance. Users drop
-a `.json` in their themes folder and press Reload.
+**A theme file is a VS Code colour theme**, not a format of ours. One file is
+one theme; every key in it is optional. None of the tokens above is a key
+anybody writes — VS Code has no word for a card, a note tint or a rope, so each
+one is either mapped from an editor key or derived on the fly from the three
+that everything else is built out of: the background, the foreground and the
+accent. The six card tints come from the terminal palette, which is the one
+part of that format that is a set of *named colours* rather than a set of
+surfaces.
 
-Two are built in: a warm dark and the same board on paper.
+The contrast floors above are therefore **enforced on load rather than
+assumed**: a colour that misses its floor is moved away from its background in
+small steps until it clears. That is what lets a theme picked at random off a
+registry land on a readable board.
+
+Users get one two ways, and both are on the one row: search open-vsx.org and
+install what comes back, or open the themes folder, drop a `.json` in it and
+press Reload. The search is also reached by the plus in the theme picker
+itself, which is the surface somebody is on when they find that none of the
+themes they have is the one they want.
+
+Sixteen are built in: eight pairs, each a light and a dark.
 
 ---
 
@@ -505,7 +521,13 @@ previews live.
 - The **dark theme** and the **light theme** by name, both shown regardless of
   which is currently worn — the pair is chosen once and then followed, so the
   half you aren't looking at has to be reachable while you aren't looking at it.
-- A note pointing at the themes folder for people who want their own.
+- The two names and nothing about where a theme comes from. The picker opens
+  here without its plus, and the open-vsx search is on the settings page only:
+  the first thing somebody sees on a first run should not be a search field
+  pointed at a registry. On that page the panel is the theme picker's twin down
+  to the width, with two differences it cannot avoid: arrowing it previews
+  nothing, because none of those themes is on this computer yet, and it has a
+  waiting state and a failed state that a list of files on disk cannot have.
 - **Design opportunity:** this is the one place a theme preview is worth real
   space. A miniature board — a few cards, a rope, the grid — recoloured live.
 

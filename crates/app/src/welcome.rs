@@ -461,7 +461,10 @@ pub fn render(screen: &Welcome, view: &BoardView, cx: &mut Context<BoardView>) -
                 ),
         )
         .when_some(screen.picking.as_ref(), |d, picker| {
-            d.child(settings::picker_panel(picker, view, cx))
+            // No plus: the first thing somebody sees on a first run should
+            // not be a search field pointed at a registry. See the `Get` arm
+            // of this screen's key handler.
+            d.child(settings::picker_panel(picker, false, view, cx))
         })
 }
 

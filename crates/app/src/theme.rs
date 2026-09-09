@@ -23,7 +23,6 @@ use std::sync::Arc;
 
 use gpui::{hsla, point, px, BoxShadow, FontFeatures, Hsla};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
 
 use crate::color::{rgb, rgba, Tint};
 
@@ -405,65 +404,6 @@ pub const NOTE_TINT_COUNT: u32 = 4;
 /// two rows of eight, and every one of them distinguishable from its
 /// neighbours at the size of a card's corner.
 pub const SHADE_COUNT: u32 = 16;
-
-/// A theme file's `style` object, laid over a palette that is already whole.
-///
-/// This is the entire loader, and it is six lines because [`Theme`] is
-/// `Serialize` *and* `Deserialize`: the base is written out to a map of hex
-/// strings, the file's keys are laid on top of it, and the result is read back
-/// as a `Theme`. There is no second list of field names anywhere — adding a
-/// colour to the struct adds it to the file format, and no other line of this
-/// module has to hear about it.
-///
-/// **Every key is optional.** A file naming three colours gets those three and
-/// the base for the other thirty, which is what makes a theme somebody can
-/// actually write by hand: the alternative is a format where a person tweaking
-/// an accent has to restate the whole palette and gets a black board when they
-/// miss one.
-///
-/// **Keys this build does not know are ignored**, and deliberately not an
-/// error — the same bargain `prefs.rs` and `mbrd-core` make with their own
-/// formats. A theme written for a later build that names a colour this one has
-/// not got should draw in every colour it *does* share, not refuse.
-///
-/// A value that is not a colour — `"grue"`, a number, an object — is `None`
-/// rather than a palette with a hole in it. Blunt on purpose, twice over: a
-/// half-applied theme is a board where four things moved and thirty did not,
-/// which is harder to diagnose than one that plainly did not take; and a
-/// `None` is something the caller can *count*, which is how a typo in
-/// somebody's theme file ends up said out loud on the settings page instead of
-/// silently drawing the palette they were trying to change.
-/// The keys in a `style` object this build has no colour for.
-///
-/// [`overlay`] ignores them, and `THEMES.md` promises it will: a theme written
-/// against a later build should draw in every colour it shares with this one
-/// rather than refuse. **But a key that is simply misspelled is ignored in
-/// exactly the same silence**, and from where the author is sitting "I set
-/// `acent` and nothing happened" and "I set a key this build predates" are the
-/// same non-event. Naming them is what lets `themes.rs` tell somebody which of
-/// the two they are looking at, without this having to guess which it was.
-///
-/// Asked of [`Theme::dark`] because the field list is the type's, not the
-/// palette's — the two built-ins carry the same keys and differ only in what
-/// they are set to.
-pub fn unknown_keys(style: &Map<String, Value>) -> Vec<String> {
-    let Ok(Value::Object(known)) = serde_json::to_value(Theme::dark()) else {
-        return Vec::new();
-    };
-    style.keys().filter(|key| !known.contains_key(*key)).cloned().collect()
-}
-
-pub fn overlay(base: Theme, style: &Map<String, Value>) -> Option<Theme> {
-    let Ok(Value::Object(mut out)) = serde_json::to_value(base) else {
-        return None;
-    };
-    for (key, value) in style {
-        if out.contains_key(key) {
-            out.insert(key.clone(), value.clone());
-        }
-    }
-    serde_json::from_value(Value::Object(out)).ok()
-}
 
 /// The corner radii, named rather than picked fresh at every call site.
 ///
@@ -967,17 +907,20 @@ mod tests {
 
     #[test]
     fn a_palette_is_still_written_down_as_hex_strings() {
-        // What every theme file on somebody's disk is holding this struct to.
-        // The colour type belongs to a colour library now and that library
-        // writes an object of three numbers by itself — `crate::color::hex` is
-        // what keeps the format a person can type, and this is the test that
-        // says so from the outside, where a theme file stands.
-        let Value::Object(written) = serde_json::to_value(Theme::dark()).unwrap() else {
+        // Not the theme file's shape any more — that is a VS Code theme, and
+        // `vscode.rs` builds this struct rather than deserialising it. What is
+        // still held to hex is the *palette*: the colour type belongs to a
+        // colour library that writes an object of three numbers by itself, and
+        // a palette that cannot be said in hex is one that comes back subtly
+        // different from its own round trip, which is what the built-ins'
+        // notes claim and the test below measures.
+        let serde_json::Value::Object(written) = serde_json::to_value(Theme::dark()).unwrap()
+        else {
             panic!("a theme is an object of colours");
         };
-        assert_eq!(written["ground"], Value::String("#14150fff".into()));
-        assert_eq!(written["accent"], Value::String("#b4553aff".into()));
-        assert_eq!(written["text"], Value::String("#e8e2d0ff".into()));
+        assert_eq!(written["ground"], serde_json::Value::String("#14150fff".into()));
+        assert_eq!(written["accent"], serde_json::Value::String("#b4553aff".into()));
+        assert_eq!(written["text"], serde_json::Value::String("#e8e2d0ff".into()));
         // The pad is four of them and stays a list.
         assert!(written["notes"].as_array().is_some_and(|pad| pad.len() == 4));
         for (key, value) in &written {
@@ -997,54 +940,6 @@ mod tests {
             let text = serde_json::to_string(&theme).unwrap();
             let back: Theme = serde_json::from_str(&text).unwrap();
             assert_eq!(back, theme, "a palette changed on the way to disk and back");
-        }
-    }
-
-    #[test]
-    fn a_theme_file_that_names_one_colour_gets_the_rest_of_the_palette() {
-        // The bargain that makes a theme writable by hand. Somebody changing
-        // an accent should not have to restate thirty colours, and missing one
-        // should not hand them a black board.
-        let style = serde_json::from_str(r##"{ "accent": "#00ff00ff" }"##).unwrap();
-        let out = overlay(Theme::dark(), &style).expect("one good colour is a theme");
-        assert_eq!(out.accent, rgb(0x00ff00));
-        assert_eq!(out.ground, Theme::dark().ground, "everything else is the base");
-    }
-
-    #[test]
-    fn a_theme_file_may_name_a_colour_this_build_has_never_heard_of() {
-        // The same promise `prefs.rs` makes about its own file: a theme
-        // written for a later build draws in every colour it does share rather
-        // than refusing.
-        let style =
-            serde_json::from_str(r##"{ "accent": "#00ff00ff", "gutter_hover": "#123456" }"##)
-                .unwrap();
-        let out = overlay(Theme::dark(), &style).expect("an unknown key is not an error");
-        assert_eq!(out.accent, rgb(0x00ff00));
-    }
-
-    #[test]
-    fn a_theme_file_that_says_something_that_is_not_a_colour_is_refused_outright() {
-        // Blunt on purpose, and *refused* rather than ignored: a `None` here
-        // is what `themes.rs` counts, which is what puts "1 theme could not be
-        // read" on the settings page instead of quietly handing somebody the
-        // palette they were trying to change.
-        for bad in [r##"{ "accent": "grue" }"##, r##"{ "accent": 12 }"##, r##"{ "accent": {} }"##] {
-            let style = serde_json::from_str(bad).unwrap();
-            assert_eq!(overlay(Theme::dark(), &style), None, "{bad}");
-        }
-    }
-
-    #[test]
-    fn a_palette_survives_the_round_trip_through_the_file_format() {
-        // The one thing `overlay` assumes and nothing else checks: that a
-        // theme written out as hex reads back as itself. If it did not, a file
-        // naming *no* keys would still come back a different palette.
-        for theme in [Theme::dark(), Theme::light()] {
-            let Value::Object(written) = serde_json::to_value(theme).unwrap() else {
-                panic!("a theme writes itself as an object")
-            };
-            assert_eq!(overlay(Theme::light(), &written), Some(theme));
         }
     }
 }

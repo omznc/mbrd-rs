@@ -1,11 +1,32 @@
-# Writing a theme
+# Themes
 
-Every colour mbrd draws with comes from one place, and this is how to replace
-it.
+mbrd wears **VS Code colour themes**. Not a format that looks like one — the
+same one. A `.json` out of any editor extension is a theme here, and a theme
+written here opens in that editor.
 
-Drop a `.json` in your themes folder, press **Reload** on
-*Settings → Application → Appearance*, and it appears in the list. The folder
-is printed on that same page, and is:
+There are two ways to get one.
+
+## Install one from open-vsx.org
+
+*Settings → Application → Appearance → **More themes** → Browse* opens a search
+over [open-vsx.org](https://open-vsx.org), the Eclipse Foundation's open
+extension registry. Type, press Enter, arrow to the one you want, press Enter
+again. The extension is downloaded, every theme in it is written into your
+themes folder, and the two dropdowns above have the new names in them straight
+away.
+
+The theme picker — the list that opens when you press either dropdown — has the
+same search behind the **+** beside its search field, or behind `Ctrl N`. It
+opens over the list rather than in place of it: Escape puts the search away and
+leaves you in the list, with whatever you installed now in it.
+
+Desktop only. A browser tab has neither a folder to keep a theme in nor
+permission to fetch one.
+
+## Write one, or drop one in
+
+Press **Open folder** on the same row, put a `.json` in it, and press
+**Reload**. The folder is printed on that row, and is:
 
 | | |
 |---|---|
@@ -17,148 +38,200 @@ is printed on that same page, and is:
 
 ## The shape of a file
 
-One file is a **family**: a name, an author, and however many themes under it.
-A light and a dark meant to be worn as a pair belong in one file, which is the
-whole reason the array is there.
+One file is one theme.
 
 ```json
 {
   "name": "Ink",
-  "author": "you",
-  "themes": [
-    {
-      "name": "Ink",
-      "appearance": "dark",
-      "style": {
-        "ground": "#0e1014",
-        "accent": "#5a8de0",
-        "accent_text": "#7fa9ec"
-      }
-    }
-  ]
+  "type": "dark",
+  "colors": {
+    "editor.background": "#0e1014",
+    "editor.foreground": "#e6e9ef",
+    "focusBorder": "#5a8de0"
+  }
 }
 ```
 
-`appearance` is `"dark"` or `"light"`. It decides two things: which of the two
-slots on the settings page your theme can be chosen into, and — more
-importantly — **which built-in palette it inherits from**.
+That is a complete theme. Everything else — the cards, the note tints, the
+ropes, the hairlines — is worked out from those three.
 
-**Every key in `style` is optional.** Anything you leave out comes from the
-built-in palette for that appearance. The three keys above are a complete
-theme; the other thirty-odd fill themselves in. This is deliberate: a format
-where changing an accent means restating the whole palette is one where you
-get a black board the first time you miss a key.
+- **`name`** is what the settings page calls it. Leave it out and the file name
+  is used instead.
+- **`type`** is `"dark"`, `"light"`, `"hc"` or `"hcLight"`. It decides which of
+  the two slots on the settings page your theme can be chosen into. Leave it out
+  and mbrd reads the brightness of the background instead, which is right nearly
+  always and is why so many themes on the registry get away without it.
+- **`colors`** is the VS Code colour map. Every key in it is optional.
+- **`include`** is followed inside an extension, which is how a light theme that
+  is its dark twin with six colours moved is written. A theme installed from
+  open-vsx is flattened on the way in, so the file in your folder never needs it.
 
-Colours are `#rgb`, `#rgba`, `#rrggbb` or `#rrggbbaa`. Alpha matters for a
-handful of them — the grid, the axes, the hairlines — and is noted below.
+Colours are `#rgb`, `#rgba`, `#rrggbb` or `#rrggbbaa`. Comments and trailing
+commas are allowed, because the format allows them and most themes use them.
 
-Keys mbrd does not recognise are ignored rather than refused, so a theme
-written for a later build still draws in every colour it shares with this one.
-**They are named on the settings page anyway**, because a key you misspelled is
-ignored in exactly the same silence as one this build predates, and the two are
-only tellable apart by being told. A theme with a typo in it still loads.
+`tokenColors` and `semanticTokenColors` are read past. mbrd has no syntax
+highlighting to apply them to. Every other key it does not use is ignored in
+silence — a VS Code theme names hundreds of them.
 
-A *value* that is not a colour is a different matter: it fails the whole theme,
-which then shows up on the settings page under the file it was in. Failing
-loudly beats a palette with four things moved and thirty not.
+The one thing that is refused is a file that names **no** surface, word or hue
+key from the tables below. Borders and shadows do not count: a theme that is
+only hairlines is not a theme. A file like that is either not a colour theme at
+all or is nothing but syntax highlighting, and loading it would show the
+built-in palette wearing your file's name. The settings page says which file,
+and why.
+
+### Two keys that are not VS Code's
+
+Both optional, both ignored by every other reader of the format.
+
+| key | what it is |
+|---|---|
+| `author` | who wrote it. Shown beside the name in the picker |
+| `family` | where it came from. Written by the open-vsx install so a theme can be credited to the extension it came out of; a theme you wrote yourself is credited to its file name |
 
 ---
 
-## Every colour
+## What mbrd reads
 
-### The board itself
+In fallback chains: the first key your theme sets wins, and if none of them is
+set the last column says what happens instead.
 
-| key | what it is |
-|---|---|
-| `ground` | behind the canvas — the paper the board sits on |
-| `grid` | the dots of the grid. **Alpha is ignored**: it is computed from the zoom, so a grid stays a grid when you pull back instead of turning into a texture |
-| `axis` | the world axes through the origin. Low alpha |
-| `guide` | the rules that flash while a drag lines up with a neighbour. Low alpha — this appears over somebody's photographs while their hand is down |
+### The board
 
-### Furniture
+| mbrd draws | from | if absent |
+|---|---|---|
+| the board itself | `editor.background`, `editorPane.background`, `tab.activeBackground` | the built-in ground |
+| body text | `editor.foreground`, `foreground`, `editorLineNumber.activeForeground` | the built-in text |
+| the accent | `focusBorder`, `button.background`, `activityBarBadge.background`, `progressBar.background`, `textLink.foreground`, `editorCursor.foreground` | the built-in accent |
 
-| key | what it is |
-|---|---|
-| `chrome` | the sidebar, menus, panels, tooltips |
-| `chrome_edge` | their hairline. Low alpha |
-| `shadow` | what a floating surface casts. **The alpha is a dial**: the three shadow sizes carry their own opacity and multiply it by this one, so `#000000ff` is full strength and `#00000073` is a little under half. Turn it down for a light theme |
+### Surfaces
 
-### Cards
+| mbrd draws | from | if absent |
+|---|---|---|
+| the chrome — sidebar, menus, panels | `sideBar.background`, `activityBar.background`, `panel.background`, `editorWidget.background`, `menu.background` | a step off the board towards the text |
+| a card | `editorWidget.background`, `editorHoverWidget.background`, `input.background`, `dropdown.background`, `editorSuggestWidget.background` | a step off the board |
 
-| key | what it is |
-|---|---|
-| `card` | a plain card, and the fallback for any card type this build has never heard of |
-| `card_edge` | its outline. Low alpha |
-| `selected_edge` | the outline of a selected card |
-| `note`, `image`, `video`, `audio`, `link`, `fence` | per-type card tints, so a board reads as a board rather than a wall of identical grey rectangles |
-| `notes` | **an array of exactly four** — the note pad, `--note-1..4`. A note or a sticker carries which one it was torn from |
-| `swatch_fallback` | what a swatch draws as when its hex is missing or unreadable. Grey, not card-coloured: a grey swatch is still a swatch |
+A card that comes out the same colour as the board is pushed off it anyway. A
+great many themes set `editorWidget.background` to `editor.background` exactly,
+and a card nobody can see the edge of is not a card.
+
+### Hairlines and faint furniture
+
+Every one of these is taken at a low alpha, because a hairline lifted at full
+opacity is a stripe.
+
+| mbrd draws | from | if absent |
+|---|---|---|
+| the chrome hairline | `sideBar.border`, `panel.border`, `editorWidget.border`, `contrastBorder` | the text colour, faint |
+| the card outline | `editorWidget.border`, `input.border`, `widget.border`, `contrastBorder` | the text colour, faint |
+| the world axes | `editorRuler.foreground`, `editorIndentGuide.activeBackground1`, `tree.indentGuidesStroke` | the text colour, faint |
+| what a floating surface casts | `widget.shadow`, `scrollbar.shadow` | the built-in shadow |
+
+The grid takes its hue from the text and **not** its alpha: that is computed
+from the zoom, so a grid stays a grid when you pull back instead of turning
+into a texture.
+
+`widget.shadow`'s alpha is a dial. The three shadow sizes carry their own
+opacity and multiply it by this one, so `#000000ff` is full strength and
+`#00000073` is a little under half. Turn it down for a light theme.
 
 ### Words
 
-| key | what it is |
+| mbrd draws | from | if absent |
+|---|---|---|
+| labels, counts, the status bar | `descriptionForeground`, `editorLineNumber.activeForeground`, `input.placeholderForeground` | the text, moved towards the chrome |
+| chevrons and icons beside a count | `icon.foreground`, `editorLineNumber.foreground`, `tab.inactiveForeground` | the text, moved further |
+| the accent as a word | `textLink.foreground`, `textLink.activeForeground` | the accent |
+| a link inside a note | `textLink.foreground`, `textLink.activeForeground` | the accent |
+
+A code fence inside a note is the accent at a low alpha. A swatch whose hex is
+missing or unreadable draws grey, at this theme's own end of the range: a grey
+swatch is still a swatch, and `#8c8c8c` is a swatch on a dark board and a smudge
+on paper.
+
+### The six hues
+
+| mbrd draws | from |
 |---|---|
-| `text` | body text, everywhere |
-| `muted` | labels, counts, the status bar, placeholders — anything secondary that is still **read**. Solid, not `text` at low alpha, so a call site can dim it on purpose without something else dimming it by accident |
-| `tertiary` | decorative marks that are *not* read as words: a chevron, the icon beside a count. Allowed under the contrast floor. Never put a word in this |
-| `quote` | a quote's bar and a rule's line, drawn **on a card** |
-| `note_link` | a markdown link, drawn **on a card** |
+| a note card, and note pad 1 | `terminal.ansiYellow` |
+| an image card | `terminal.ansiCyan` |
+| a video card | `terminal.ansiMagenta`, and note pad 4 |
+| an audio card | `terminal.ansiGreen`, and note pad 2 |
+| a link card | `terminal.ansiBlue`, and note pad 3 |
+| a red rope, and a removed line in a diff | `terminal.ansiRed` |
 
-### The accent
+The terminal palette is the one part of a VS Code theme that is a *set of named
+colours* rather than a set of surfaces, which is exactly what six card tints and
+a four-slot note pad need — and it is already tuned to sit together. Each hue is
+washed onto the card colour rather than used at full strength: a tinted card is
+a card, not a swatch.
 
-| key | what it is |
-|---|---|
-| `accent` | the accent as a *fill or an edge* — a selection outline, the wash behind a chosen row, a lit segment |
-| `accent_text` | the accent as a *word*. A separate key because the two are held to different floors and one colour usually cannot clear both: an outline needs 3:1 and a sentence needs 4.5:1. Set them the same if your accent is dark enough |
+A theme with no terminal palette gets six fixed hues at a fixed, low saturation.
+That is duller than a real ANSI set and still tells six kinds of card apart. The
+saturation is fixed rather than borrowed from the accent on purpose — an accent
+is often the loudest colour in a theme, and six tints borrowing it turn a quiet
+palette into a paint chart.
 
-### Connections
+### Diffs
 
-`rope_line`, `rope_accent`, `rope_warm`, `rope_leaf`, `rope_danger` — the five
-colours a connection may be named. The format stores the *name*, never a hex
-triple, which is exactly what lets a theme change underneath an existing
-board. `anchor` is the faint marks that appear beside a card you point at.
+| mbrd draws | from | if absent |
+|---|---|---|
+| an added line | `gitDecoration.addedResourceForeground`, `charts.green` | the green above |
+| a removed line | `gitDecoration.deletedResourceForeground`, `charts.red` | the red above |
+
+### Ropes, anchors and guides
+
+A connection is stored as a **name** — Line, Accent, Warm, Leaf, Danger — and
+never as a hex triple, which is what lets a theme change underneath a board that
+already exists. Line is the text colour at low alpha; Accent, Warm, Leaf and
+Danger are the accent, the yellow, the green and the red. The faint marks beside
+a card you point at, and the rules that flash while a drag lines up with a
+neighbour, are the text colour at low alpha.
 
 ---
 
-## Making one that is actually readable
+## Contrast is enforced, not assumed
 
-The built-in palettes are held to two floors, and both are checked by tests
-rather than by eye:
+This is the part that is not in the format, and it is why a theme picked at
+random off a registry lands on a readable board.
 
-- **`text`, `quote` and `note_link` clear 4.5:1 against every card colour**,
-  including all four note tints — not just against the chrome. A quote is
-  drawn on a card, never on the chrome behind it, and this is the exact check
-  the shipped dark theme was quietly failing before there was a second palette
-  to compare it to.
-- **`text`, `muted` and `accent_text` clear 4.5:1 against `chrome`.**
+- **Anything read as a sentence clears 4.5:1** against every surface it is drawn
+  on. Body text, quotes and note links are checked against the card *and* all
+  four note pad tints *and* all five card type tints, not merely against the
+  chrome — a quote is drawn on a card, never on the chrome behind it.
+- **Marks and furniture clear 3:1** against what they sit on: the accent, the
+  selection outline, the four rope colours.
+- Chevrons and the icons beside a count are the one exemption. They repeat the
+  words next to them, so they are held to 3:1 and no higher.
 
-`tertiary` is deliberately exempt: it is for marks that repeat the words
-beside them.
+A colour that misses its floor is moved away from its background in small steps
+until it clears, towards white on a dark surface and towards black on a light
+one. Your hue survives; your unreadable lightness does not.
 
-Nothing enforces this on *your* theme — it is your app — but the numbers are
-what the two built-ins were tuned to, and a theme that ignores them is one
-where the quotes on a note disappear into the card at some point you will not
-be looking.
+Nothing about this is optional and nothing about it is a warning. It happens on
+load, to built-in themes and downloaded ones alike.
+
+---
 
 ## Overriding a built-in
 
-Name a theme the same as one that ships and yours wins. That is the only way
-to correct a built-in without waiting for a release. A light and a dark may
-share a name — that is the usual way to name a pair — because a theme is
-identified by its name *and* its appearance.
+Name a theme the same as one that ships and yours wins. That is the only way to
+correct a built-in without waiting for a release. A light and a dark may share a
+name — that is the usual way to name a pair — because a theme is identified by
+its name *and* its appearance.
 
 ## If a theme goes missing
 
-The choice is stored as a **name**, not a palette, so it survives you editing
-the file it came from. If you delete that file, mbrd falls back to the
-built-in and the settings page says so, keeping the name written down — put
-the file back and your theme returns.
+The choice is stored as a **name**, not a palette, so it survives you editing the
+file it came from. If you delete that file, mbrd falls back to the built-in and
+the settings page says so, keeping the name written down. Put the file back and
+your theme returns.
 
 ## From the environment
 
-Two variables, for the case where you need the app to be a particular
-brightness *before* you can comfortably look at it to change it. Both win over
-whatever is saved, so a toggle that disagrees with one says so on its row.
+Two variables, for the case where you need the app to be a particular brightness
+*before* you can comfortably look at it to change it. Both win over whatever is
+saved, so a toggle that disagrees with one says so on its row.
 
 ```
 MBRD_APPEARANCE=system|light|dark

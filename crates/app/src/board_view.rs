@@ -5738,10 +5738,11 @@ impl BoardView {
 
     /// A new, empty board — asked about by name first.
     ///
-    /// One line over the board — see `name_bar` — with the old behaviour as
-    /// the default answer: Enter on nothing makes `untitled`, because a
-    /// board you can start drawing on immediately is the point of the
-    /// command, and Escape makes nothing at all. A name given here lands in
+    /// A dialogue in the middle of the window — see `name_dialog` — with the
+    /// old behaviour as the default answer: Enter on nothing makes
+    /// `untitled`, because a board you can start drawing on immediately is
+    /// the point of the command, and Escape makes nothing at all. A name
+    /// given here lands in
     /// both places at once — the board's title and, through
     /// `naming::file_name_for`, its file — so a board made with a name never
     /// spends a moment being called `untitled-4`. The making itself is
@@ -5753,15 +5754,18 @@ impl BoardView {
             cx.notify();
             return;
         }
-        // One text field at a time, the rule every field in this app keeps:
-        // a note being typed is committed, and the other two one-line
-        // questions are put away rather than fought with — the measure bar
-        // sits exactly where this one does.
+        // One text field at a time, the rule every field in this app keeps: a
+        // note being typed is committed, and the other two one-line questions
+        // are put away rather than fought with. They no longer share a spot
+        // with this one — see `name_dialog` — but they do share the keyboard,
+        // and two fields both certain the next letter is theirs is worse than
+        // two fixtures overlapping.
         if self.editing.is_some() {
             self.stop_editing(true, cx);
         }
         self.stop_calibrating(true, cx);
-        // The tour bar shares the spot too. See `start_calibrating`.
+        // And the tour, which is a fixture rather than a field but is no
+        // easier to read through a scrim. See `start_calibrating`.
         self.end_tour(true, cx);
         self.naming = Some(Editor::new("", mbrd_core::model::BOARD_TITLE_MAX, false));
         cx.notify();
@@ -6863,6 +6867,173 @@ impl BoardView {
         self.retheme(cx);
     }
 
+    /// Open the open-vsx panel over the settings page.
+    ///
+    /// Refused where it cannot work, and said out loud rather than done
+    /// quietly: the row's button is already dead on the web, but the keyboard
+    /// reaches every row on this page whether or not its control is live, and
+    /// a panel that opened onto a search that can never answer would be worse
+    /// than a sentence saying so.
+    pub fn get_themes(&mut self, cx: &mut Context<Self>) {
+        if cfg!(target_family = "wasm") {
+            self.warn("this build cannot install themes".into());
+            cx.notify();
+            return;
+        }
+        if crate::dirs::themes().is_none() {
+            self.warn("there is nowhere on this computer to keep themes".into());
+            cx.notify();
+            return;
+        }
+        if let Overlay::Settings(page) = &mut self.overlay {
+            page.get_themes();
+            cx.notify();
+        }
+    }
+
+    /// Put it away.
+    ///
+    /// Nothing is undone: a theme already written to the folder stays written,
+    /// and the registry has already been read again. Closing this is closing a
+    /// search field, not abandoning a choice — which is why it has no
+    /// counterpart to `cancel_theme_pick`.
+    pub fn close_get_themes(&mut self, cx: &mut Context<Self>) {
+        if let Overlay::Settings(page) = &mut self.overlay {
+            page.getting = None;
+            cx.notify();
+        }
+    }
+
+    /// Move the open-vsx highlight with the pointer.
+    ///
+    /// Highlight only. The theme picker's equivalent tries each palette on as
+    /// the pointer crosses it; there is nothing to try on here, because none
+    /// of these themes is on this computer yet.
+    pub fn hover_openvsx(&mut self, at: usize, cx: &mut Context<Self>) {
+        let Overlay::Settings(page) = &mut self.overlay else { return };
+        let Some(getting) = page.getting.as_mut() else { return };
+        if getting.cursor != at && at < getting.found.len() {
+            getting.cursor = at;
+            cx.notify();
+        }
+    }
+
+    /// Ask open-vsx what it has.
+    ///
+    /// On the background executor for the reason `look_for_update` gives about
+    /// itself: this is a blocking HTTPS request, and none of it may happen on
+    /// the thread that draws.
+    pub fn search_openvsx(&mut self, query: String, cx: &mut Context<Self>) {
+        let Overlay::Settings(page) = &mut self.overlay else { return };
+        let Some(getting) = page.getting.as_mut() else { return };
+        getting.doing = crate::settings::Doing::Searching;
+        getting.said.clear();
+        cx.notify();
+
+        let asked = query.clone();
+        let looking = cx.background_executor().spawn(async move { crate::openvsx::search(&asked) });
+        cx.spawn(async move |view, cx| {
+            let found = looking.await;
+            view.update(cx, |view, cx| {
+                view.settle_search(query, found);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// What the registry answered.
+    ///
+    /// The query comes back with the answer and is written down beside it.
+    /// That is what tells the panel its list is the answer to what is in the
+    /// field — see `settings::Getting::searches` — and it is why a search that
+    /// failed writes the query down as well: otherwise Enter on the same text
+    /// would go straight back out to a registry that has just refused it.
+    fn settle_search(&mut self, query: String, found: anyhow::Result<Vec<crate::openvsx::Found>>) {
+        let Overlay::Settings(page) = &mut self.overlay else { return };
+        let Some(getting) = page.getting.as_mut() else { return };
+        getting.doing = crate::settings::Doing::Nothing;
+        getting.searched = query;
+        getting.cursor = 0;
+        match found {
+            Ok(found) => {
+                getting.said = match found.len() {
+                    0 => String::new(),
+                    1 => "One theme extension.".into(),
+                    many => format!("{many} theme extensions."),
+                };
+                getting.found = found;
+            }
+            // The whole sentence, not "search failed". This is the one place
+            // in the app where the thing that went wrong is somebody else's
+            // machine, and the difference between "could not reach" and
+            // "answered 503" is the difference between checking the wifi and
+            // waiting ten minutes.
+            Err(why) => {
+                getting.found.clear();
+                getting.said = format!("{why}");
+            }
+        }
+    }
+
+    /// Download the extension under the highlight and read the folder again.
+    pub fn install_openvsx(&mut self, at: usize, cx: &mut Context<Self>) {
+        let Overlay::Settings(page) = &mut self.overlay else { return };
+        let Some(getting) = page.getting.as_mut() else { return };
+        // One at a time. Two downloads writing into the same folder would land
+        // in either order, and the panel has one line to say what happened in.
+        if getting.doing != crate::settings::Doing::Nothing {
+            return;
+        }
+        let Some(found) = getting.found.get(at).cloned() else { return };
+        getting.cursor = at;
+        getting.doing = crate::settings::Doing::Installing;
+        getting.said.clear();
+        cx.notify();
+
+        let installing =
+            cx.background_executor().spawn(async move { crate::openvsx::install(&found) });
+        cx.spawn(async move |view, cx| {
+            let written = installing.await;
+            view.update(cx, |view, cx| {
+                view.settle_install(written, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// What the install left in the folder.
+    ///
+    /// The registry is read again on the way through, so the two theme
+    /// dropdowns behind the panel have the new names in them by the time
+    /// anybody closes it. Reading it again is a directory listing and a few
+    /// dozen small files, which is what the Reload button costs and nobody has
+    /// ever noticed.
+    fn settle_install(&mut self, written: anyhow::Result<Vec<String>>, cx: &mut Context<Self>) {
+        let said = match &written {
+            // Named, and up to three of them. An extension may contribute one
+            // theme or fifteen, and "installed" without saying what leaves
+            // somebody to go and find out which of forty rows is new.
+            Ok(names) => match names.len() {
+                0 => "Nothing in it was a theme.".to_string(),
+                1..=3 => format!("Installed {}. Choose it above.", names.join(", ")),
+                many => format!("Installed {many} themes, including {}.", names[..2].join(" and ")),
+            },
+            Err(why) => format!("{why}"),
+        };
+        if written.is_ok() {
+            self.themes = crate::themes::Registry::load();
+            self.retheme(cx);
+        }
+        let Overlay::Settings(page) = &mut self.overlay else { return };
+        let Some(getting) = page.getting.as_mut() else { return };
+        getting.doing = crate::settings::Doing::Nothing;
+        getting.said = said;
+    }
+
     /// Open the settings page onto Appearance with the theme list already up.
     ///
     /// What `Command::SelectTheme` does. It goes through the settings page
@@ -7005,27 +7176,43 @@ impl BoardView {
             return;
         };
 
-        // Three spellings of one command. Windows needs the extra dance
-        // because `start` is a shell builtin rather than a program, and its
-        // first argument is taken as the *window title* — hence the empty
-        // string, which is the documented way of saying "the path is the
-        // path, not the title".
-        #[cfg(target_os = "linux")]
-        let (program, before): (&str, &[&str]) = ("xdg-open", &[]);
-        #[cfg(target_os = "macos")]
-        let (program, before): (&str, &[&str]) = ("open", &[]);
-        #[cfg(windows)]
-        let (program, before): (&str, &[&str]) = ("cmd", &["/C", "start", ""]);
-        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-        let (program, before): (&str, &[&str]) = ("xdg-open", &[]);
+        match hand_to_desktop(&path) {
+            Ok(()) => self.tell(format!("Opened {}", path.display())),
+            Err(_) => self.warn(format!("Nothing on this computer would open {}", path.display())),
+        }
+        cx.notify();
+    }
 
-        let mut command = std::process::Command::new(program);
-        command.args(before);
-        // Detached and never waited on. Whatever opens a `.json` here is a
-        // text editor somebody will sit in for a while, and a canvas that
-        // blocked its own frame loop on one closing would be a hang.
-        match command.arg(&path).spawn() {
-            Ok(_) => self.tell(format!("Opened {}", path.display())),
+    /// Open the themes folder in whatever this desktop browses files with.
+    ///
+    /// The folder is made first, and for the same reason `edit_settings_file`
+    /// writes the file first: on a fresh install nothing has ever been dropped
+    /// in there, so the folder does not exist yet — and a file manager handed
+    /// a path to nothing reports an error about a folder the app has just
+    /// finished naming on the row above the button. Made rather than
+    /// complained about, because the folder existing is what the press meant.
+    ///
+    /// The theme list is not reloaded afterwards. Dropping a file in is the
+    /// slow half of this, `Reload` is beside this button, and re-reading a
+    /// folder somebody has not put anything in yet would say "everything there
+    /// was read" about a folder they are still looking at.
+    ///
+    /// Not built for the web, where nothing calls it: a page may not start a
+    /// program, so `settings.rs` draws no button for it there.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn open_themes_folder(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = crate::dirs::themes() else {
+            self.warn("There is nowhere on this computer to keep themes.".into());
+            cx.notify();
+            return;
+        };
+        if let Err(why) = std::fs::create_dir_all(&path) {
+            self.warn(format!("{} could not be made: {why}", path.display()));
+            cx.notify();
+            return;
+        }
+        match hand_to_desktop(&path) {
+            Ok(()) => self.tell(format!("Opened {}", path.display())),
             Err(_) => self.warn(format!("Nothing on this computer would open {}", path.display())),
         }
         cx.notify();
@@ -11202,6 +11389,9 @@ impl BoardView {
                 crate::settings::Reply::Choose(appearance, name) => {
                     self.set_theme(appearance, name, cx);
                 }
+                crate::settings::Reply::Get => self.get_themes(cx),
+                crate::settings::Reply::Look(query) => self.search_openvsx(query, cx),
+                crate::settings::Reply::Install(at) => self.install_openvsx(at, cx),
                 crate::settings::Reply::Cancel(appearance, was) => {
                     // The choice goes back through the prefs and the palette
                     // through `cancel_preview`, in that order and for the
@@ -11269,6 +11459,15 @@ impl BoardView {
                 crate::settings::Reply::Nudge(at, by) => {
                     self.press_welcome_control(at, by, window, cx)
                 }
+                // The welcome screen shares this vocabulary because it shares
+                // the theme picker, and it does not share the open-vsx panel:
+                // the first thing somebody sees on a first run should not be
+                // a search field pointed at a registry. Nothing to do rather
+                // than `unreachable!`, for the reason the `Folder` arm on the
+                // settings page gives about the mirror image of this.
+                crate::settings::Reply::Get
+                | crate::settings::Reply::Look(_)
+                | crate::settings::Reply::Install(_) => {}
             }
             cx.notify();
             return;
@@ -14228,9 +14427,15 @@ impl BoardView {
     /// dismiss button would leave somebody staring at a blank grid with the
     /// three things they could do now hidden behind having pressed it.
     ///
-    /// **It names where the origin is.** An infinite canvas with nothing on it
-    /// is the one state where "where am I" has no answer available by looking,
-    /// and the panel is sitting exactly on the spot the axes cross.
+    /// **It sits on the origin**, and travels with the board rather than with
+    /// the window: pan, and it slides off the way a card would. An infinite
+    /// canvas with nothing on it is the one state where "where am I" has no
+    /// answer available by looking, and a panel pinned to the middle of the
+    /// window is no answer either — it is in the middle wherever you go, so
+    /// the board underneath reads as motionless. Stuck to the spot the axes
+    /// cross it says both things at once: where the origin is, and that the
+    /// drag it is describing did something. It used to say the first of those
+    /// in words, sitting still while it did.
     ///
     /// Withheld while anything is arriving. A drop that has been read but
     /// whose first card has not landed yet is a board that is empty for a
@@ -14245,6 +14450,14 @@ impl BoardView {
             return None;
         }
         let theme = self.theme;
+        // The origin, as an offset from the middle of the view. The panel is
+        // laid out centred — which is where the origin is on a board nobody
+        // has panned yet — and then pushed by this, so the layout does the
+        // sizing and the camera does the placing.
+        let vp = self.viewport;
+        let origin = vp.to_screen(point(0.0, 0.0));
+        let dx = origin.x - vp.size.width / 2.0;
+        let dy = origin.y - vp.size.height / 2.0;
 
         /// One of the three ways to put the first thing on a board.
         ///
@@ -14305,24 +14518,37 @@ impl BoardView {
                 // a press.
                 .child(
                     div()
+                        // Relative rather than absolute, so the flex box above
+                        // still centres it and this only moves it from there.
+                        // An absolute panel would have to be told its own size
+                        // to stay centred on a point, and it is sized by what
+                        // is in it.
+                        .relative()
+                        .left(px(dx))
+                        .top(px(dy))
                         .flex()
                         .flex_col()
                         .items_center()
                         .gap(px(16.0))
-                        .px(px(30.0))
-                        .py(px(24.0))
+                        // The same on all four sides. The doors inside are
+                        // wide, so a wider side pad than top pad reads as the
+                        // panel being off-centre rather than as breathing
+                        // room.
+                        .p(px(24.0))
                         .rounded(px(crate::theme::RADIUS_LG))
                         // Over the ground rather than over the grid: the dots
                         // behind the words are the one place on this screen
                         // where the grid is actively unhelpful.
                         .bg(theme.ground.opacity(0.92))
+                        // An edge, and no shadow. The edge is what gives the
+                        // words a boundary on a screen that has nothing else
+                        // on it; a shadow would lift them off the board, and
+                        // this is not chrome floating over a board — it is the
+                        // shape the board has while it is empty, sitting at
+                        // the origin and moving with the grid.
+                        .border_1()
+                        .border_color(theme.chrome_edge)
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(
-                            div()
-                                .text_size(px(14.0))
-                                .text_color(theme.muted)
-                                .child("Nothing here yet. The origin is under this note."),
-                        )
                         .child(
                             div()
                                 .flex()
@@ -14509,71 +14735,211 @@ impl BoardView {
         )
     }
 
-    /// The one-line question `Ctrl N` asks: what is the board called?
+    /// The question `Ctrl N` asks: what is the board called?
     ///
-    /// The same fixture as [`Self::measure_bar`], in the same place, for the
-    /// same reasons — and never up at the same time, because arming either
-    /// question puts the other away. The placeholder is the default answer
-    /// spelled out: Enter on an empty field makes `untitled`, exactly what
-    /// the command made before it learned to ask.
-    fn name_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    /// A panel in the middle of a dimmed board, and not the one-line strip
+    /// this used to be at the foot of the window beside [`Self::measure_bar`].
+    /// That spot is right for the measuring question and wrong for this one,
+    /// and the difference is what the question is *about*: a measurement is
+    /// named against a line somebody just drew and can still see, so the strip
+    /// has to keep out of the way of it. A board that does not exist yet has
+    /// nothing behind it worth keeping in view — so the strip bought nothing,
+    /// and cost the one thing that matters here, which is being noticed. A
+    /// question nobody sees is a question answered by pressing Enter at
+    /// whatever the field happened to hold.
+    ///
+    /// **Drawn as the palette and the switcher are**, down to the numbers: the
+    /// same chrome panel, the same scrim over the board behind it, the same
+    /// header pad, the same accent chip naming which question this is, and the
+    /// same footer strip naming the keys that leave. This is the app's third
+    /// modal text field and it should not be the app's third idea of what one
+    /// looks like — so the field is a caret and a placeholder, exactly as it
+    /// is in the other two, rather than the boxed input this briefly grew.
+    ///
+    /// A press on the scrim cancels, which is what every other panel here does
+    /// with a press outside, and what Escape does. The placeholder and the
+    /// footer between them spell out the default answer: Enter on an empty
+    /// field makes `untitled`, exactly what the command made before it learned
+    /// to ask.
+    fn name_dialog(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let name = self.naming.as_ref()?;
         let theme = self.theme;
+        // Every way of saying no does the same thing, and there are three of
+        // them: the Cancel button, a press on the scrim, and the Escape the
+        // field itself answers.
+        let dismiss = |this: &mut Self, cx: &mut Context<Self>| {
+            this.naming = None;
+            cx.notify();
+        };
         Some(
             div()
                 .absolute()
-                .bottom(px(STATUS_HEIGHT))
+                .top_0()
                 .left_0()
                 .right_0()
+                .bottom_0()
                 .flex()
+                .items_center()
                 .justify_center()
-                .pb(px(14.0))
-                // Chrome over a live board — see `measure_bar`, which stops
-                // the same three buttons for the same reason.
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
-                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                // The same wash at the same strength `palette.rs` puts behind
+                // its own list, for the reason given there: the board behind a
+                // modal should read as *behind* it rather than merely covered.
+                .bg(theme.ground.opacity(0.25))
+                // The wheel belongs to the panel rather than to the board
+                // behind it, or scrolling over a question would zoom a canvas
+                // nobody can reach. Same reason `palette.rs` stops its own.
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event, _window, cx| {
+                        cx.stop_propagation();
+                        dismiss(this, cx);
+                    }),
+                )
+                // The right button too, or a press outside would put the
+                // question away *and* open the board's own menu behind it —
+                // a menu about a card nobody could see.
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, _event, _window, cx| {
+                        cx.stop_propagation();
+                        dismiss(this, cx);
+                    }),
+                )
                 .child(
                     div()
+                        .w(px(420.0))
                         .flex()
-                        .items_center()
-                        .gap(px(10.0))
-                        .px(px(12.0))
-                        .py(px(8.0))
-                        .rounded(px(crate::theme::RADIUS_MD))
+                        .flex_col()
+                        .rounded(px(crate::theme::RADIUS_LG))
                         .bg(theme.chrome)
                         .border_1()
                         .border_color(theme.chrome_edge)
-                        .text_size(px(12.0))
-                        .child(div().flex_none().text_color(theme.text).child("Name the new board"))
-                        .child(div().min_w(px(160.0)).max_w(px(260.0)).child(
-                            crate::palette::query_line(name, "untitled", 13.0, true, &theme),
-                        ))
+                        .shadow(theme.shadow_large())
+                        .text_color(theme.text)
+                        // Chrome over a live board: a press inside the panel is
+                        // not a press outside it, and none of the three buttons
+                        // may reach the canvas — see `measure_bar`, which stops
+                        // the same three for the same reason.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
+                        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                         .child(
                             div()
-                                .flex_none()
-                                .text_size(px(10.5))
-                                .text_color(theme.muted)
-                                .child("enter to make it \u{00b7} esc to cancel"),
+                                .flex()
+                                .items_center()
+                                .gap(px(10.0))
+                                .px(px(crate::palette::HEADER_PAD_X))
+                                .py(px(crate::palette::HEADER_PAD_Y))
+                                .border_b_1()
+                                .border_color(theme.chrome_edge)
+                                .text_size(px(14.0))
+                                // Which question this is, said once and held
+                                // still while the answer beside it is typed
+                                // and retyped — the same chip the palette
+                                // names its own mode with.
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .px(px(7.0))
+                                        .py(px(2.0))
+                                        .rounded(px(4.0))
+                                        .bg(theme.accent.opacity(0.14))
+                                        .text_size(px(10.0))
+                                        .text_color(theme.accent_text)
+                                        .child("New board"),
+                                )
+                                .child(div().flex_1().min_w_0().py(px(4.0)).child(
+                                    crate::palette::query_line(
+                                        name,
+                                        "name it\u{2026}",
+                                        14.0,
+                                        true,
+                                        &theme,
+                                    ),
+                                )),
                         )
                         .child(
                             div()
-                                .id("name-close")
                                 .flex()
                                 .items_center()
-                                .justify_center()
-                                .size(px(22.0))
-                                .rounded(px(crate::theme::RADIUS_SM))
-                                .hover(|s| s.bg(theme.accent.opacity(0.16)))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _event, _window, cx| {
-                                        this.naming = None;
-                                        cx.notify();
-                                        cx.stop_propagation();
-                                    }),
+                                .gap(px(9.0))
+                                .px(px(14.0))
+                                .py(px(9.0))
+                                .border_t_1()
+                                .border_color(theme.chrome_edge)
+                                // Names the keys that leave this mode, the
+                                // rule every mode in this app keeps — and the
+                                // default answer with them, because a field
+                                // somebody leaves empty is the commonest way
+                                // this question gets answered.
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_size(px(10.0))
+                                        .text_color(theme.muted)
+                                        .child(
+                                            "enter makes it \u{00b7} esc cancels \u{00b7} \
+                                             no name makes untitled",
+                                        ),
                                 )
-                                .child(icon(Icon::Close, ICON_SM, theme.muted)),
+                                // The quieter of the two answers, because it
+                                // is the one that changes nothing — the same
+                                // weighting `switcher::confirm` gives its own
+                                // pair, and the same geometry.
+                                .child(
+                                    div()
+                                        .id("name-cancel")
+                                        .flex_none()
+                                        .px(px(10.0))
+                                        .py(px(4.0))
+                                        .rounded(px(crate::theme::RADIUS_XS))
+                                        .border_1()
+                                        .border_color(theme.chrome_edge)
+                                        .text_size(px(11.5))
+                                        .text_color(theme.text)
+                                        .hover(|s| s.bg(theme.text.opacity(0.08)))
+                                        .active(|s| s.bg(theme.text.opacity(0.14)))
+                                        .child("Cancel")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _event, _window, cx| {
+                                                cx.stop_propagation();
+                                                dismiss(this, cx);
+                                            }),
+                                        ),
+                                )
+                                // And the answer that does something, filled.
+                                // The word is `ground` rather than
+                                // `accent_text`: reversed out of the accent it
+                                // is sitting *on* the accent, and
+                                // `accent_text` is the accent as a word on
+                                // chrome — which put a barely legible orange
+                                // on orange here. See `welcome::walk`, which
+                                // is the same button.
+                                .child(
+                                    div()
+                                        .id("name-make")
+                                        .flex_none()
+                                        .px(px(10.0))
+                                        .py(px(4.0))
+                                        .rounded(px(crate::theme::RADIUS_XS))
+                                        .text_size(px(11.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(theme.ground)
+                                        .bg(theme.accent)
+                                        .hover(|s| s.opacity(0.88))
+                                        .active(|s| s.opacity(0.75))
+                                        .child("Create")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _event, _window, cx| {
+                                                cx.stop_propagation();
+                                                this.make_board(cx);
+                                            }),
+                                        ),
+                                ),
                         ),
                 ),
         )
@@ -16796,6 +17162,32 @@ impl gpui::EntityInputHandler for BoardView {
     }
 }
 
+/// Hand a path to whatever this desktop opens it with.
+///
+/// Three spellings of one command. Windows needs the extra dance because
+/// `start` is a shell builtin rather than a program, and its first argument is
+/// taken as the *window title* — hence the empty string, which is the
+/// documented way of saying "the path is the path, not the title".
+///
+/// Shelled out rather than taken as a dependency. This is one command with
+/// three spellings, and the workspace's note about `dirs` applies exactly:
+/// eight direct dependencies, each of them a decision, and this is not worth
+/// being the ninth.
+///
+/// Detached and never waited on. What opens is a text editor or a file manager
+/// somebody will sit in for a while, and a canvas that blocked its own frame
+/// loop on one closing would be a hang.
+fn hand_to_desktop(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let (program, before): (&str, &[&str]) = ("open", &[]);
+    #[cfg(windows)]
+    let (program, before): (&str, &[&str]) = ("cmd", &["/C", "start", ""]);
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let (program, before): (&str, &[&str]) = ("xdg-open", &[]);
+
+    std::process::Command::new(program).args(before).arg(path).spawn().map(|_| ())
+}
+
 impl Focusable for BoardView {
     fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
         self.focus_handle.clone()
@@ -17114,8 +17506,15 @@ impl Render for BoardView {
                     .child(tools)
                     .children(self.tour_bar(cx))
                     .children(self.measure_bar(cx))
-                    .children(self.name_bar(cx))
                     .child(self.status_bar(cx))
+                    // Over the strip and over the status bar, unlike the two
+                    // one-line questions above it: this one covers the window
+                    // rather than sitting in it, and a scrim with live chrome
+                    // showing through is a scrim that has not been drawn. It
+                    // cannot be up at the same time as an `Overlay` — the
+                    // command that arms it closes whatever ran it — so being
+                    // under `overlay` here settles nothing either way.
+                    .children(self.name_dialog(cx))
                     // Above the strip as well as the board: a menu opened near
                     // the bottom of the window flips upward, but one opened on
                     // a short window may still reach it. There is only ever

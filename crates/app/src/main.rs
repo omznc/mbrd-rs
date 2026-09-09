@@ -8,12 +8,13 @@
 //! mbrd [board.mbrd]
 //! ```
 //!
-//! Opening nothing gives you a demonstration board, which exists so that the
-//! canvas has something on it before the import path does. A board named on
-//! the command line that turns out not to open — moved, corrupted, a typo —
-//! gets the same demonstration board and a warning in the window, rather than
-//! no window at all: see the note in [`main`] on why that failure has to end
-//! up somewhere other than a terminal nobody launched from one is watching.
+//! Opening nothing gives you the board you had open last, and on a first run
+//! a demonstration board, which exists so that the canvas has something on it
+//! before the import path does. A board named on the command line that turns
+//! out not to open — moved, corrupted, a typo — gets that same demonstration
+//! board and a warning in the window, rather than no window at all: see the
+//! note in [`main`] on why that failure has to end up somewhere other than a
+//! terminal nobody launched from one is watching.
 
 // On Windows a console-subsystem binary opens a console window behind the app
 // every time somebody double-clicks it. Ask for the GUI subsystem in release
@@ -93,6 +94,13 @@ mod stock;
 // Where a file goes, and — on the web, where there is no disk — what stands
 // in for one. See the module notes; every read and write outside a test goes
 // through `store`.
+/// Every path into this module is native — `search` and `install` are the only
+/// two doors and both of them are a `bail!` on the web, for the reason the
+/// module note gives. So the whole of it below those doors is unreachable
+/// there rather than unused, and the same idiom `fetch.rs` uses for the same
+/// shape says so without splitting the file in two.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
+mod openvsx;
 mod store;
 mod switcher;
 mod taps;
@@ -103,6 +111,7 @@ mod titlebar;
 mod tools;
 mod transport;
 mod update;
+mod vscode;
 #[cfg(target_family = "wasm")]
 mod webfiles;
 // The way out: which desktop build this browser wants, and where it is. Only
@@ -120,8 +129,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui::{
-    point, px, size, App, AppContext as _, Bounds, Entity, Size, TitlebarOptions, Window,
-    WindowAppearance, WindowBounds, WindowDecorations, WindowOptions,
+    point, px, size, App, AppContext as _, Bounds, Entity, Focusable as _, Size, TitlebarOptions,
+    Window, WindowAppearance, WindowBounds, WindowDecorations, WindowOptions,
 };
 use mbrd_core::Document;
 
@@ -208,17 +217,24 @@ fn launch() {
 
     // What this launch is *about*, where it is about anything.
     //
-    // On a desktop that is a path in `argv`: a board double-clicked, or one
-    // named at a shell. A browser has neither — there is no command line and
-    // nothing to double-click — so what a tab being opened means there is "the
-    // board I had open last time", which is the same question `mac::reopen`
-    // answers for a Dock click and is answered out of the same list. Without
-    // this a reload lands on the welcome board every time, and a board that is
-    // saved and not shown reads exactly like a board that was not saved.
+    // Two questions in order, and the first one wins. A path in `argv` is
+    // somebody saying what this launch is for — a board double-clicked, or one
+    // named at a shell — and nothing may overrule that. With no path there is
+    // still an answer worth giving, and it is "the board I had open last
+    // time": opening the app is not the same as finishing with the board that
+    // was in it, exactly as closing a window is not, which is the sentence
+    // `reopen_window` has always been written to.
+    //
+    // A browser only ever has the second question. There is no command line
+    // and nothing to double-click there, so a tab being opened *is* a reopen —
+    // and without this a reload landed on the demonstration board every time,
+    // which made a board that was saved and not shown read exactly like a
+    // board that was not saved. Both platforms now read the one list.
     #[cfg(target_family = "wasm")]
     let path = recent::load().into_iter().next();
     #[cfg(not(target_family = "wasm"))]
-    let path = std::env::args().nth(1).map(PathBuf::from);
+    let path =
+        std::env::args().nth(1).map(PathBuf::from).or_else(|| recent::load().into_iter().next());
 
     // The window always opens on the demonstration board, whatever was asked
     // for on the command line. It used to be otherwise: the file named in
@@ -497,6 +513,27 @@ fn open_window(cx: &mut App, doc: Document, title: String) -> Option<Entity<Boar
         // panic rather than a borrow error. Before the shadowing `let`
         // below, for the same reason.
         view.desktop_appearance(appearance(window), cx);
+
+        // The keyboard, handed to the board the moment there is a board.
+        //
+        // Every key this app reads arrives through the canvas's focus
+        // handle, and gpui only offers a key to the handlers on the focus
+        // path — with nothing focused at all it walks the root of the
+        // dispatch tree and stops there, so a window nobody has clicked in
+        // is a window where no key does anything. The canvas claimed focus
+        // in `on_mouse_down` and nowhere else, which made the first click a
+        // toll: invisible most of the time, because clicking the board is
+        // the first thing anybody does anyway.
+        //
+        // It was not invisible on the routes that open a text field from a
+        // button — the switcher's `+`, a door on the welcome screen. Every
+        // button in the chrome stops its own press, so the press never
+        // reaches the canvas, and the field came up with a caret in it and
+        // no way to type. Escape on the first-run welcome screen had the
+        // same hole, and there the whole screen is chrome, so there was
+        // nothing to click to fix it. Focus is taken once, here, and every
+        // route in behaves the same afterwards.
+        window.focus(&view.focus_handle(cx), cx);
 
         let view = cx.entity();
         window.on_window_should_close(cx, move |_window, cx| {

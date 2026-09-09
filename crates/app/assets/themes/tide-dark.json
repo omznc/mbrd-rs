@@ -1,0 +1,27 @@
+{
+  "name": "Tide",
+  "type": "dark",
+  "author": "mbrd",
+  "colors": {
+    "editor.background": "#0b1417ff",
+    "editor.foreground": "#dceff0ff",
+    "sideBar.background": "#111e22ff",
+    "sideBar.border": "#dceff018",
+    "editorWidget.background": "#1a2c31ff",
+    "editorWidget.border": "#dceff020",
+    "focusBorder": "#3fb8b0ff",
+    "textLink.foreground": "#54cdc4ff",
+    "descriptionForeground": "#94b0b3ff",
+    "icon.foreground": "#6f8b8fff",
+    "editorRuler.foreground": "#dceff022",
+    "terminal.ansiYellow": "#d9a441ff",
+    "terminal.ansiGreen": "#6faa55ff",
+    "terminal.ansiRed": "#d75a5aff",
+    "widget.shadow": "#000000ff",
+    "gitDecoration.addedResourceForeground": "#6f9455ff",
+    "gitDecoration.deletedResourceForeground": "#d66666ff",
+    "terminal.ansiBlue": "#5772d1ff",
+    "terminal.ansiMagenta": "#8e5cccff",
+    "terminal.ansiCyan": "#54b6d4ff"
+  }
+}

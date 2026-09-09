@@ -1,0 +1,27 @@
+{
+  "name": "Ember",
+  "type": "light",
+  "author": "mbrd",
+  "colors": {
+    "editor.background": "#f6efe7ff",
+    "editor.foreground": "#2b1d13ff",
+    "sideBar.background": "#efe4d8ff",
+    "sideBar.border": "#2b1d131f",
+    "editorWidget.background": "#fffaf4ff",
+    "editorWidget.border": "#2b1d1324",
+    "focusBorder": "#a44c14ff",
+    "textLink.foreground": "#93430fff",
+    "descriptionForeground": "#6b5344ff",
+    "icon.foreground": "#8d7566ff",
+    "editorRuler.foreground": "#2b1d1322",
+    "terminal.ansiYellow": "#8d5c0bff",
+    "terminal.ansiGreen": "#4f6f2bff",
+    "terminal.ansiRed": "#a92f2bff",
+    "widget.shadow": "#00000073",
+    "gitDecoration.addedResourceForeground": "#466b2eff",
+    "gitDecoration.deletedResourceForeground": "#a62f2fff",
+    "terminal.ansiBlue": "#2937a3ff",
+    "terminal.ansiMagenta": "#8929a3ff",
+    "terminal.ansiCyan": "#2981a3ff"
+  }
+}

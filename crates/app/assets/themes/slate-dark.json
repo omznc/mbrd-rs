@@ -1,0 +1,27 @@
+{
+  "name": "Slate",
+  "type": "dark",
+  "author": "mbrd",
+  "colors": {
+    "editor.background": "#161618ff",
+    "editor.foreground": "#e4e5e7ff",
+    "sideBar.background": "#1e1f22ff",
+    "sideBar.border": "#e4e5e716",
+    "editorWidget.background": "#2f3237ff",
+    "editorWidget.border": "#e4e5e71f",
+    "focusBorder": "#367aabff",
+    "textLink.foreground": "#3c8dc6ff",
+    "descriptionForeground": "#a6a9b0ff",
+    "icon.foreground": "#84888eff",
+    "editorRuler.foreground": "#e4e5e722",
+    "terminal.ansiYellow": "#c9913fff",
+    "terminal.ansiGreen": "#6f9455ff",
+    "terminal.ansiRed": "#bf4a4aff",
+    "widget.shadow": "#000000ff",
+    "gitDecoration.addedResourceForeground": "#6f9455ff",
+    "gitDecoration.deletedResourceForeground": "#d66666ff",
+    "terminal.ansiBlue": "#5e70caff",
+    "terminal.ansiMagenta": "#a467c1ff",
+    "terminal.ansiCyan": "#63b4c5ff"
+  }
+}

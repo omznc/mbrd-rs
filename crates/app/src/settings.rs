@@ -258,6 +258,88 @@ impl Picker {
     }
 }
 
+/// The open-vsx panel: a search field, a list of extensions, and what the
+/// last press of it did.
+///
+/// A second panel rather than more rows on the page, and the same panel shape
+/// the theme picker uses, because it is the same gesture — type, arrow, press
+/// — aimed at a list nobody can see the whole of. The differences are the two
+/// that matter: this list comes over a network, so it has a *waiting* state
+/// and a *failed* state that a list of files on disk cannot have, and pressing
+/// a row writes a file rather than choosing one.
+///
+/// **No live preview.** Arrowing the theme picker puts each palette on as it
+/// goes; arrowing this one cannot, because none of these themes is on this
+/// computer yet. That is why [`Reply::Preview`] has no counterpart here, and
+/// why the footer says "Enter to install" rather than "Enter to keep".
+#[derive(Debug, Clone)]
+pub struct Getting {
+    pub query: Editor,
+    /// Which of the results is highlighted.
+    pub cursor: usize,
+    /// The query the rows below are the answer to.
+    ///
+    /// This is what makes one key do both jobs: while it disagrees with the
+    /// field, Enter runs a search, and once it agrees, Enter installs the row
+    /// under the highlight. Typing, then Enter, then arrows, then Enter — in
+    /// that order, which is the order somebody does it in anyway. See
+    /// [`Getting::searches`].
+    pub searched: String,
+    pub found: Vec<crate::openvsx::Found>,
+    /// Whether something is in flight, and which thing.
+    pub doing: Doing,
+    /// The last thing worth saying, under the field. Empty on the first frame
+    /// and after that never a lie: a search that failed says so here, and so
+    /// does an install that worked.
+    pub said: String,
+}
+
+/// What the panel is waiting on.
+///
+/// Held so the panel can say so. Both of these hold a thread of the background
+/// pool for as long as they last — see `openvsx.rs` — and a panel that gave no
+/// sign of it would be a panel somebody presses Enter on four more times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Doing {
+    Nothing,
+    Searching,
+    Installing,
+}
+
+impl Getting {
+    pub(crate) fn open() -> Self {
+        Self {
+            query: Editor::new("", 64, false),
+            cursor: 0,
+            searched: String::new(),
+            found: Vec::new(),
+            doing: Doing::Nothing,
+            said: String::new(),
+        }
+    }
+
+    /// Whether Enter searches rather than installs.
+    ///
+    /// True while the field says something the list is not the answer to,
+    /// which includes the moment the panel opens and the moment after any
+    /// letter is typed.
+    pub(crate) fn searches(&self) -> bool {
+        let asked = self.query.text();
+        let asked = asked.trim();
+        !asked.is_empty() && asked != self.searched
+    }
+
+    pub(crate) fn step(&mut self, by: isize) {
+        let len = self.found.len();
+        if len == 0 {
+            self.cursor = 0;
+            return;
+        }
+        let at = self.cursor as isize + by;
+        self.cursor = at.clamp(0, len as isize - 1) as usize;
+    }
+}
+
 /// What the page is currently showing. Lives inside `Overlay::Settings`.
 #[derive(Debug, Clone)]
 pub struct Page {
@@ -296,6 +378,11 @@ pub struct Page {
     /// answer "is there a row below this one".
     pub shown: std::cell::Cell<usize>,
     pub picking: Option<Picker>,
+    /// The open-vsx panel, when it is up. Never at the same time as
+    /// [`Page::picking`] — both are the same rectangle over the same page, and
+    /// opening either closes nothing because neither row can be reached while
+    /// the other is on screen.
+    pub getting: Option<Getting>,
 }
 
 impl Page {
@@ -308,6 +395,7 @@ impl Page {
             focus: None,
             shown: std::cell::Cell::new(0),
             picking: None,
+            getting: None,
         }
     }
 
@@ -330,6 +418,11 @@ impl Page {
     /// Start choosing a theme for one of the two slots.
     pub fn pick_theme(&mut self, appearance: Appearance, was: &str, names: &[String]) {
         self.picking = Some(Picker::open(appearance, was, names));
+    }
+
+    /// Open the open-vsx panel.
+    pub fn get_themes(&mut self) {
+        self.getting = Some(Getting::open());
     }
 }
 
@@ -372,6 +465,23 @@ pub enum Reply {
     /// Left or right on the focused row: `-1` or `1`. Only a segmented control
     /// does anything with it.
     Nudge(usize, isize),
+    /// The plus in the theme picker. Open the open-vsx panel over it.
+    ///
+    /// Over rather than in place of: the picker is still the answer to the
+    /// question that was asked, and a theme installed while it is open lands
+    /// in the list behind — so Escape out of the search and the thing that was
+    /// just downloaded is under the highlight, which is the whole reason the
+    /// plus is in the picker rather than only on the row underneath it.
+    Get,
+    /// Enter in the open-vsx panel, with a query the list is not the answer
+    /// to yet. Go and ask the registry.
+    ///
+    /// The query rather than nothing, because by the time this is answered
+    /// the request is on a background thread and the field may have moved on
+    /// — so the thing that comes back has to be able to say what it was for.
+    Look(String),
+    /// Enter in the open-vsx panel, on the result at this index. Install it.
+    Install(usize),
     /// The welcome screen's folder field took the key and its text may now be
     /// different. The view writes it through to the prefs — see
     /// `BoardView::commit_welcome_folder`.
@@ -397,6 +507,9 @@ impl Page {
         text: Option<&str>,
         names: &[String],
     ) -> Reply {
+        if self.getting.is_some() {
+            return self.getting_key(key, mods, text);
+        }
         if self.picking.is_some() {
             return self.picker_key(key, mods, text, names);
         }
@@ -478,11 +591,64 @@ impl Page {
         picker_key(&mut self.picking, key, mods, text, names)
     }
 
+    /// One key press, while the open-vsx panel is open.
+    ///
+    /// Not shared with [`picker_key`], and the reason is the one in
+    /// [`Getting`]'s note: the two panels look alike and answer the same keys,
+    /// but Enter means a different thing in each and the arrows here preview
+    /// nothing. Folding them together would be one function with a flag
+    /// saying which of the two it was being.
+    fn getting_key(&mut self, key: &str, mods: Modifiers, text: Option<&str>) -> Reply {
+        let Some(getting) = self.getting.as_mut() else { return Reply::Held };
+
+        match key {
+            "escape" => {
+                // The one way out, and it is the *only* way out that does not
+                // install something. Nothing is undone by it: a theme already
+                // written to the folder stays written.
+                self.getting = None;
+                return Reply::Held;
+            }
+            "enter" => {
+                // A request is already out. A second Enter would put a second
+                // one out beside it and the two would land in either order.
+                if getting.doing != Doing::Nothing {
+                    return Reply::Held;
+                }
+                if getting.searches() {
+                    return Reply::Look(getting.query.text().trim().to_string());
+                }
+                if getting.found.is_empty() {
+                    return Reply::Held;
+                }
+                return Reply::Install(getting.cursor);
+            }
+            "down" | "up" => {
+                getting.step(if key == "up" { -1 } else { 1 });
+                return Reply::Held;
+            }
+            _ => {}
+        }
+
+        let reply = getting.query.key(key, editor::Mods::from(mods), text);
+        if reply != editor::Reply::Ignored {
+            // The list is about to be the answer to a question nobody asked
+            // any more, and an index into it points at whatever is still
+            // there. See `searches`.
+            getting.cursor = 0;
+        }
+        if reply == editor::Reply::Ignored && mods.secondary() && key == "v" {
+            return Reply::Paste;
+        }
+        Reply::Held
+    }
+
     /// Paste into whichever field is currently taking keys.
     pub fn insert(&mut self, text: &str) {
-        match &mut self.picking {
-            Some(picker) => picker.query.insert(text),
-            None => self.query.insert(text),
+        match (&mut self.getting, &mut self.picking) {
+            (Some(getting), _) => getting.query.insert(text),
+            (None, Some(picker)) => picker.query.insert(text),
+            (None, None) => self.query.insert(text),
         }
     }
 }
@@ -578,6 +744,15 @@ pub(crate) fn picker_key(
                 };
             }
             _ => {}
+        }
+
+        // Before the field, not after it: a modifier and a letter is a chord
+        // the editor has no answer for, and asking it first only means the
+        // answer has to be undone. `Ctrl V` below is the exception because a
+        // paste *is* the field's business — it is asked first there so that a
+        // field which handled it keeps it.
+        if mods.secondary() && key == "n" {
+            return Reply::Get;
         }
 
         let reply = picker.query.key(key, editor::Mods::from(mods), text);
@@ -728,7 +903,13 @@ pub fn render(page: &Page, view: &BoardView, cx: &mut Context<BoardView>) -> imp
                         ),
                 ),
         )
-        .when_some(page.picking.as_ref(), |d, picker| d.child(picker_panel(picker, view, cx)))
+        // The picker's plus only where the panel it opens can work, which is
+        // the same answer the More themes row gives its Browse button.
+        .when_some(page.picking.as_ref(), |d, picker| {
+            let can = cfg!(not(target_family = "wasm")) && crate::dirs::themes().is_some();
+            d.child(picker_panel(picker, can, view, cx))
+        })
+        .when_some(page.getting.as_ref(), |d, getting| d.child(getting_panel(getting, view, cx)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1575,38 +1756,157 @@ fn appearance_rows(view: &BoardView, cx: &mut Context<BoardView>) -> Vec<Spec> {
         );
     }
 
-    all.push(
-        spec(
-            Section::Appearance,
-            "Themes folder",
-            match crate::dirs::themes() {
-                Some(path) => {
-                    // Named, and with the reason. This was a count, and a count is
-                    // the one thing nobody can act on: "one file there could not be
-                    // read" is the same sentence whether the folder holds one theme
-                    // or forty, and it does not say which of the two silences a
-                    // misspelled key fell into. See `themes::Complaint`.
-                    let said = match view.themes.complaints.as_slice() {
-                        [] => "Everything there was read.".to_string(),
-                        [one] => format!("{} {}.", one.file, one.why),
-                        many => many
-                            .iter()
-                            .map(|c| format!("{} {}", c.file, c.why))
-                            .collect::<Vec<_>>()
-                            .join("; "),
-                    };
-                    format!("Drop a .json in {} and press Reload. {said}", path.display())
+    // Where a theme comes from, in one row. It was two — a "Themes folder"
+    // row carrying the path and its two buttons, and this one under it — which
+    // put the way in that needs nothing but a search field *below* the way in
+    // that needs a file manager and a text editor. One row, and the verbs in
+    // the order somebody reaches for them: search the registry, or open the
+    // folder, drop a file in it, come back and reload.
+    //
+    // A browser tab has neither of the two things installing a theme needs: a
+    // request to another origin it is allowed to make, and a folder to put the
+    // answer in. The row is still shown there, saying so, and its Reload still
+    // works — a tab keeps the themes it knows about in the store `webfs.rs`
+    // holds, which is a folder in every sense except the one a file manager
+    // cares about.
+    let can = cfg!(not(target_family = "wasm")) && crate::dirs::themes().is_some();
+    let about: SharedString = match crate::dirs::themes() {
+        Some(path) => {
+            let said = complained(&view.themes.complaints);
+            let how = match can {
+                true => format!("Search open-vsx.org, or drop a .json in {}", path.display()),
+                false => {
+                    format!("This build cannot install themes. Drop a .json in {}", path.display())
                 }
-                None => "There is nowhere on this computer to keep themes.".into(),
-            },
-            button("settings-reload-themes", "Reload", true, theme, cx, |this, cx| {
+            };
+            format!("{how} and press Reload. {said}").into()
+        }
+        None => "There is nowhere on this computer to keep themes.".into(),
+    };
+
+    // Enter on the row presses the first of the buttons, which is the verb the
+    // row is named for. Where that button is not there at all, it presses the
+    // one that is.
+    #[cfg(target_family = "wasm")]
+    let press: fn(&mut BoardView, &mut Context<BoardView>) = |this, cx| this.reload_themes(cx);
+    #[cfg(not(target_family = "wasm"))]
+    let press: fn(&mut BoardView, &mut Context<BoardView>) = |this, cx| this.get_themes(cx);
+
+    all.push(
+        spec(Section::Appearance, "More themes", about, {
+            let reload = button("settings-reload-themes", "Reload", true, theme, cx, |this, cx| {
                 this.reload_themes(cx);
-            }),
-        )
-        .does(Does::Press(|this, cx| this.reload_themes(cx))),
+            });
+
+            // The web has no folder to open: a page may not start a program,
+            // and the themes a tab knows about live in the store `webfs.rs`
+            // keeps rather than anywhere a file manager could be pointed at.
+            // The same rule the Boards folder row follows — a button that
+            // opened nothing would be worse than no button. Browse goes with
+            // it, for the reason the note above gives.
+            #[cfg(target_family = "wasm")]
+            {
+                reload
+            }
+
+            // The row names the path already, and a path is the one thing on
+            // this page nobody can act on — it cannot be pressed, and typing
+            // it out somewhere else is what the middle button saves.
+            #[cfg(not(target_family = "wasm"))]
+            {
+                gpui::div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(button("settings-get-themes", "Browse", can, theme, cx, |this, cx| {
+                        this.get_themes(cx)
+                    }))
+                    .child(button(
+                        "settings-open-themes",
+                        "Open folder",
+                        crate::dirs::themes().is_some(),
+                        theme,
+                        cx,
+                        |this, cx| this.open_themes_folder(cx),
+                    ))
+                    .child(reload)
+                    .into_any_element()
+            }
+        })
+        .does(Does::Press(press)),
     );
+
     all
 }
+
+/// What is wrong in the themes folder, in one sentence somebody can act on.
+///
+/// **Named, and with the reason.** This was a count once, and a count is the
+/// one thing nobody can act on: "one file there could not be read" is the same
+/// sentence whether the folder holds one theme or forty, and it does not say
+/// which of the two silences a misspelled key fell into. See
+/// `themes::Complaint`.
+///
+/// **Then it was one clause per file**, which is how a folder of eight themes
+/// written against another app turned this row into five lines of "has no
+/// themes in it; has no themes in it; has no themes in it". Eight files with
+/// one thing wrong is *one* fact, so it is said once and the files are listed
+/// in front of it. Nothing is dropped that changes what to do next: every
+/// distinct reason keeps its own sentence, and the first files under each are
+/// named, because the fix starts by opening one of them.
+///
+/// The cut-offs are what fits a row without becoming a wall — three names, and
+/// then how many more there are. Somebody with thirty broken files does not
+/// need thirty names; they need to open one and find out what this app wanted.
+fn complained(complaints: &[crate::themes::Complaint]) -> String {
+    if complaints.is_empty() {
+        return "Everything there was read.".to_string();
+    }
+
+    // Grouped by the reason, in the order the reasons first came up — which is
+    // the order the folder was read in, so the sentences follow the files.
+    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+    for complaint in complaints {
+        match groups.iter_mut().find(|(why, _)| *why == complaint.why) {
+            Some((_, files)) => files.push(&complaint.file),
+            None => groups.push((&complaint.why, vec![&complaint.file])),
+        }
+    }
+
+    let mut left = 0;
+    if groups.len() > MOST_REASONS {
+        left = groups[MOST_REASONS..].iter().map(|(_, files)| files.len()).sum();
+        groups.truncate(MOST_REASONS);
+    }
+
+    let mut said: Vec<String> = groups
+        .into_iter()
+        .map(|(why, files)| match files.as_slice() {
+            // The subject is singular either way — the reasons are written as
+            // "has no themes in it", agreeing with one file — so a list of
+            // them takes "each" rather than a verb this code would have to
+            // rewrite. See `themes::Registry::read`, which writes them.
+            [one] => format!("{one} {why}."),
+            many => {
+                let shown = many.len().min(MOST_FILES);
+                let names = many[..shown].join(", ");
+                match many.len() - shown {
+                    0 => format!("{names}: each {why}."),
+                    more => format!("{names} and {more} more: each {why}."),
+                }
+            }
+        })
+        .collect();
+    if left > 0 {
+        said.push(format!("{left} other files there have trouble of their own."));
+    }
+    said.join(" ")
+}
+
+/// How many distinct reasons the row spells out before it starts counting.
+const MOST_REASONS: usize = 3;
+/// How many files a single reason names before it starts counting.
+const MOST_FILES: usize = 3;
 
 /// The control that opens the theme list.
 ///
@@ -1687,6 +1987,7 @@ fn swatches(palette: Theme) -> AnyElement {
 /// The list itself: a panel over the page, searchable, previewing live.
 pub(crate) fn picker_panel(
     picker: &Picker,
+    can_get: bool,
     view: &BoardView,
     cx: &mut Context<BoardView>,
 ) -> AnyElement {
@@ -1750,19 +2051,23 @@ pub(crate) fn picker_panel(
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(
                     div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
                         .px(px(12.0))
                         .py(px(9.0))
                         .border_b_1()
                         .border_color(theme.chrome_edge)
                         .text_size(px(13.0))
                         .text_color(theme.text)
-                        .child(crate::palette::query_line(
+                        .child(div().flex_1().min_w_0().child(crate::palette::query_line(
                             &picker.query,
                             &format!("Search {} themes…", picker.appearance.label().to_lowercase()),
                             13.0,
                             true,
                             &theme,
-                        )),
+                        )))
+                        .when(can_get, |d| d.child(get_button(theme, cx))),
                 )
                 .child(
                     div()
@@ -1848,10 +2153,261 @@ pub(crate) fn picker_panel(
                         .border_color(theme.chrome_edge)
                         .text_size(px(10.0))
                         .text_color(theme.tertiary)
-                        .child("Arrows to look · Enter to keep · Escape to put it back"),
+                        .child(match can_get {
+                            true => {
+                                "Arrows to look · Enter to keep · Ctrl N for more · Escape to put \
+                                 it back"
+                            }
+                            false => "Arrows to look · Enter to keep · Escape to put it back",
+                        }),
                 ),
         )
         .into_any_element()
+}
+
+/// The plus in the theme picker's header: the way from choosing a theme to
+/// getting one.
+///
+/// Here because this is the surface that is *about* themes. Somebody who opens
+/// the picker and finds none they want is somebody who wants another one, and
+/// closing it, finding the row underneath and pressing Browse is a long way
+/// round to the question they have already asked. The switcher's plus is the
+/// same button for the same reason — see `new_board_button`.
+///
+/// Wordless, because what it stands beside is a field, and a word in front of
+/// a field reads as a label for the field. The tooltip carries the name and
+/// the key, which is what every wordless button in this app does.
+fn get_button(theme: Theme, cx: &mut Context<BoardView>) -> impl IntoElement {
+    div()
+        .id("theme-picker-get")
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .w(px(22.0))
+        .h(px(22.0))
+        .rounded(px(crate::theme::RADIUS_XS))
+        .hover(|s| s.bg(theme.accent.opacity(0.16)))
+        .active(|s| s.bg(theme.accent.opacity(0.32)))
+        .tooltip(crate::tip::tip(theme, "Install a theme", "Ctrl N"))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _event, _window, cx| {
+                cx.stop_propagation();
+                this.get_themes(cx);
+            }),
+        )
+        .child(icon(Icon::New, crate::icons::ICON_SM, theme.muted))
+}
+
+/// The open-vsx panel: a search field, what came back, and what it is doing.
+///
+/// Modelled on [`picker_panel`] down to the width, and deliberately: they are
+/// two lists of themes over the same page, and a person who has used one has
+/// used the other. What differs is what a row says — a description and a
+/// download count instead of a palette, because there is no palette to show
+/// until the file is on this computer — and the line under the field, which is
+/// the only place a network can be honest about itself.
+pub(crate) fn getting_panel(
+    getting: &Getting,
+    view: &BoardView,
+    cx: &mut Context<BoardView>,
+) -> AnyElement {
+    let theme = view.theme;
+    let busy = getting.doing != Doing::Nothing;
+
+    // One line under the field, and the order is what makes it honest: what is
+    // happening now beats what happened last, and both beat the standing
+    // instruction. A panel that went on saying "Installed Dracula" while a
+    // second install was running would be a panel that is out of date at the
+    // one moment somebody is reading it.
+    let said: SharedString = match (getting.doing, getting.said.is_empty()) {
+        (Doing::Searching, _) => "Asking open-vsx…".into(),
+        (Doing::Installing, _) => "Downloading…".into(),
+        (Doing::Nothing, false) => getting.said.clone().into(),
+        (Doing::Nothing, true) => "Type what you are looking for, then press Enter.".into(),
+    };
+
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .flex()
+        .items_start()
+        .justify_center()
+        .bg(theme.ground.opacity(0.55))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _event, _window, cx| {
+                // Stopped here, because there can be a theme picker under
+                // this one and its own outside press abandons the choice. A
+                // press that put the search away *and* threw away the theme
+                // underneath would be one gesture doing two things, only one
+                // of which was aimed at.
+                cx.stop_propagation();
+                this.close_get_themes(cx);
+            }),
+        )
+        .child(
+            div()
+                .mt(px(96.0))
+                .w(px(430.0))
+                .flex()
+                .flex_col()
+                .rounded(px(crate::theme::RADIUS_LG))
+                .bg(theme.chrome)
+                .border_1()
+                .border_color(theme.chrome_edge)
+                .shadow(theme.shadow_large())
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .px(px(12.0))
+                        .py(px(9.0))
+                        .border_b_1()
+                        .border_color(theme.chrome_edge)
+                        .text_size(px(13.0))
+                        .text_color(theme.text)
+                        .child(crate::palette::query_line(
+                            &getting.query,
+                            "Search open-vsx.org…",
+                            13.0,
+                            true,
+                            &theme,
+                        )),
+                )
+                .child(
+                    div()
+                        .px(px(12.0))
+                        .py(px(6.0))
+                        .border_b_1()
+                        .border_color(theme.chrome_edge.opacity(0.6))
+                        .text_size(px(11.0))
+                        .text_color(if busy { theme.accent_text } else { theme.muted })
+                        .child(said),
+                )
+                .child(
+                    div()
+                        .id("openvsx-list")
+                        .flex()
+                        .flex_col()
+                        .p(px(6.0))
+                        .max_h(px(320.0))
+                        .overflow_y_scroll()
+                        .children(getting.found.iter().enumerate().map(|(i, found)| {
+                            let lit = i == getting.cursor;
+                            div()
+                                .id(SharedString::from(format!("openvsx-{i}")))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(12.0))
+                                .px(px(8.0))
+                                .py(px(5.0))
+                                .rounded(px(crate::theme::RADIUS_SM))
+                                .text_size(px(12.0))
+                                .cursor_pointer()
+                                .when(lit, |d| {
+                                    d.bg(theme.accent.opacity(0.14)).text_color(theme.text)
+                                })
+                                .when(!lit, |d| {
+                                    d.text_color(theme.muted)
+                                        .hover(|s| s.bg(theme.accent.opacity(0.07)))
+                                })
+                                .on_hover(cx.listener(move |this, over: &bool, _window, cx| {
+                                    if *over {
+                                        this.hover_openvsx(i, cx);
+                                    }
+                                }))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _event, _window, cx| {
+                                        cx.stop_propagation();
+                                        this.install_openvsx(i, cx);
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(1.0))
+                                        .min_w_0()
+                                        .child(div().truncate().child(found.display.clone()))
+                                        // The publisher and the blurb on one
+                                        // quieter line. Two extensions with
+                                        // the same name is the ordinary case
+                                        // on a registry anybody may publish
+                                        // to, and the publisher is the only
+                                        // thing that tells them apart.
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_size(px(10.0))
+                                                .text_color(theme.tertiary)
+                                                .child(match found.description.is_empty() {
+                                                    true => found.namespace.clone(),
+                                                    false => format!(
+                                                        "{} · {}",
+                                                        found.namespace, found.description
+                                                    ),
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(10.0))
+                                        .text_color(theme.tertiary)
+                                        .child(installs(found.downloads)),
+                                )
+                                .into_any_element()
+                        }))
+                        .when(getting.found.is_empty(), |d| {
+                            d.child(
+                                div()
+                                    .px(px(8.0))
+                                    .py(px(8.0))
+                                    .text_size(px(12.0))
+                                    .text_color(theme.muted)
+                                    .child(match getting.searched.is_empty() {
+                                        true => "Themes written for VS Code work here.",
+                                        false => "Nothing on open-vsx answers to that.",
+                                    }),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .px(px(12.0))
+                        .py(px(7.0))
+                        .border_t_1()
+                        .border_color(theme.chrome_edge)
+                        .text_size(px(10.0))
+                        .text_color(theme.tertiary)
+                        .child(match getting.searches() {
+                            true => "Enter to search · Escape to close",
+                            false => "Arrows to look · Enter to install · Escape to close",
+                        }),
+                ),
+        )
+        .into_any_element()
+}
+
+/// A download count, short enough for the end of a row.
+///
+/// Rounded hard, because the exact number is not the question being asked of
+/// it. "4.1M" and "2.9k" answer "is this the one everybody uses" in the width
+/// a row has; "4,134,872" answers a question nobody asked and pushes the
+/// theme's own name out of the row.
+fn installs(count: u64) -> SharedString {
+    match count {
+        0 => "new".into(),
+        n if n < 1_000 => format!("{n}").into(),
+        n if n < 1_000_000 => format!("{:.0}k", n as f64 / 1_000.0).into(),
+        n => format!("{:.1}M", n as f64 / 1_000_000.0).into(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2137,6 +2693,65 @@ fn update_row(view: &BoardView, cx: &mut Context<BoardView>) -> Spec {
 mod tests {
     use super::*;
 
+    fn complaint(file: &str, why: &str) -> crate::themes::Complaint {
+        crate::themes::Complaint { file: file.to_string(), why: why.to_string() }
+    }
+
+    #[test]
+    fn one_thing_wrong_with_eight_files_is_said_once() {
+        // The row this is for: a folder of themes written for another app,
+        // every one of them the same kind of not-a-theme. Said eight times it
+        // filled five lines and read as eight different problems.
+        let same: Vec<_> = ["a.json", "b.json", "c.json", "d.json", "e.json"]
+            .iter()
+            .map(|file| complaint(file, "has no themes in it"))
+            .collect();
+        assert_eq!(
+            complained(&same),
+            "a.json, b.json, c.json and 2 more: each has no themes in it."
+        );
+    }
+
+    #[test]
+    fn one_file_is_still_named_with_its_own_reason() {
+        // The whole point of the list. A count cannot be acted on; a file name
+        // can be opened.
+        assert_eq!(
+            complained(&[complaint("mine.json", "is not readable JSON in this format")]),
+            "mine.json is not readable JSON in this format."
+        );
+        assert_eq!(complained(&[]), "Everything there was read.");
+    }
+
+    #[test]
+    fn different_reasons_keep_their_own_sentences() {
+        let mixed = [
+            complaint("a.json", "has no themes in it"),
+            complaint("b.json", "is not readable JSON in this format"),
+            complaint("c.json", "has no themes in it"),
+        ];
+        assert_eq!(
+            complained(&mixed),
+            "a.json, c.json: each has no themes in it. b.json is not readable JSON in this \
+             format."
+        );
+    }
+
+    #[test]
+    fn a_folder_of_many_troubles_stops_naming_them_and_counts() {
+        // Four reasons is one more than the row spells out, and the files
+        // under the ones it drops are counted rather than forgotten: the
+        // sentence must never say less is wrong than is wrong.
+        let many: Vec<_> = ["a.json", "b.json", "c.json", "d.json", "e.json"]
+            .iter()
+            .enumerate()
+            .map(|(at, file)| complaint(file, &format!("is wrong in way {at}")))
+            .collect();
+        let said = complained(&many);
+        assert!(said.ends_with("2 other files there have trouble of their own."), "{said}");
+        assert!(said.starts_with("a.json is wrong in way 0."), "{said}");
+    }
+
     #[test]
     fn every_section_belongs_to_the_group_that_lists_it() {
         // The two directions have to agree, and nothing else checks them: the
@@ -2331,6 +2946,114 @@ mod tests {
         assert_eq!(page.key("escape", Modifiers::default(), None, &[]), Reply::Close);
     }
 
+    /// Type into the open-vsx panel, one letter at a time.
+    fn typed(page: &mut Page, text: &str) {
+        for letter in text.chars() {
+            let key = letter.to_string();
+            page.key(&key, Modifiers::default(), Some(&key), &[]);
+        }
+    }
+
+    fn a_result(display: &str) -> crate::openvsx::Found {
+        crate::openvsx::Found {
+            namespace: "somebody".into(),
+            name: display.to_lowercase(),
+            display: display.into(),
+            description: String::new(),
+            downloads: 0,
+            vsix: String::new(),
+        }
+    }
+
+    #[test]
+    fn enter_searches_until_the_list_is_the_answer_and_installs_after_that() {
+        // The whole of the panel's keyboard in one test, because it is one
+        // decision: one key does both jobs, and which one it does is settled
+        // by whether the rows below still answer what the field says.
+        let mut page = Page::open();
+        page.get_themes();
+        // Nothing typed: Enter is not a search for nothing.
+        assert_eq!(page.key("enter", Modifiers::default(), None, &[]), Reply::Held);
+
+        typed(&mut page, "nord");
+        assert_eq!(page.key("enter", Modifiers::default(), None, &[]), Reply::Look("nord".into()));
+
+        // The answer comes back, which is what `settle_search` writes.
+        let getting = page.getting.as_mut().unwrap();
+        getting.searched = "nord".into();
+        getting.found = vec![a_result("Nord"), a_result("Nordic")];
+        getting.doing = Doing::Nothing;
+
+        assert_eq!(page.key("enter", Modifiers::default(), None, &[]), Reply::Install(0));
+        assert_eq!(page.key("down", Modifiers::default(), None, &[]), Reply::Held);
+        assert_eq!(page.key("enter", Modifiers::default(), None, &[]), Reply::Install(1));
+
+        // And one more letter makes the list stale again, so Enter goes back
+        // to being a search. Without this, typing past a finished search would
+        // install whatever the old list happened to have under the highlight.
+        typed(&mut page, "i");
+        assert_eq!(page.key("enter", Modifiers::default(), None, &[]), Reply::Look("nordi".into()));
+    }
+
+    #[test]
+    fn a_second_enter_while_something_is_downloading_does_nothing() {
+        // Both of these hold a thread of the background pool, and the panel
+        // has one line to say what happened in. See `install_openvsx`.
+        let mut page = Page::open();
+        page.get_themes();
+        typed(&mut page, "nord");
+        assert_eq!(page.key("enter", Modifiers::default(), None, &[]), Reply::Look("nord".into()));
+        page.getting.as_mut().unwrap().doing = Doing::Searching;
+        assert_eq!(page.key("enter", Modifiers::default(), None, &[]), Reply::Held);
+    }
+
+    #[test]
+    fn the_highlight_stops_at_both_ends_of_what_came_back() {
+        // Stopping rather than wrapping, which is the opposite of the page's
+        // own Tab ring: this is an aim at a list, and a list that jumped from
+        // the last row to the first would install the wrong extension.
+        let mut page = Page::open();
+        page.get_themes();
+        let getting = page.getting.as_mut().unwrap();
+        getting.found = vec![a_result("One"), a_result("Two")];
+        page.key("up", Modifiers::default(), None, &[]);
+        assert_eq!(page.getting.as_ref().unwrap().cursor, 0);
+        page.key("down", Modifiers::default(), None, &[]);
+        page.key("down", Modifiers::default(), None, &[]);
+        assert_eq!(page.getting.as_ref().unwrap().cursor, 1);
+    }
+
+    #[test]
+    fn escape_closes_the_open_vsx_panel_and_leaves_the_page_open() {
+        // Two things to back out of and one key, in the order they were most
+        // recently taken on — the same rule the rest of this page follows.
+        let mut page = Page::open();
+        page.get_themes();
+        assert_eq!(page.key("escape", Modifiers::default(), None, &[]), Reply::Held);
+        assert!(page.getting.is_none());
+        assert_eq!(page.key("escape", Modifiers::default(), None, &[]), Reply::Close);
+    }
+
+    #[test]
+    fn a_paste_lands_in_whichever_field_is_taking_keys() {
+        let mut page = Page::open();
+        page.insert("moss");
+        assert_eq!(page.query.text(), "moss");
+        page.get_themes();
+        page.insert("nord");
+        assert_eq!(page.getting.as_ref().unwrap().query.text(), "nord");
+        assert_eq!(page.query.text(), "moss", "the page's own search is untouched");
+    }
+
+    #[test]
+    fn a_download_count_is_rounded_to_something_a_row_can_hold() {
+        assert_eq!(installs(0), "new");
+        assert_eq!(installs(842), "842");
+        assert_eq!(installs(4_082), "4k");
+        assert_eq!(installs(413_434), "413k");
+        assert_eq!(installs(4_134_872), "4.1M");
+    }
+
     #[test]
     fn a_picker_opens_on_the_theme_that_is_already_chosen() {
         // Not at the top. Because arrowing previews, a list that always
@@ -2407,6 +3130,24 @@ mod tests {
         assert_eq!(
             page.key("enter", Modifiers::default(), None, &names),
             Reply::Cancel(Appearance::Dark, "Ash".into())
+        );
+    }
+
+    #[test]
+    fn the_plus_in_the_picker_opens_the_search_over_it_rather_than_instead_of_it() {
+        // The picker stays. A theme installed from the panel over it lands in
+        // the list behind, and a picker that closed to make room for the
+        // search would have thrown away the question that was being asked.
+        let names: Vec<String> = ["Ash", "Ink"].map(String::from).to_vec();
+        let mut page = Page::open();
+        page.pick_theme(Appearance::Dark, "Ash", &names);
+        assert_eq!(page.key("n", Modifiers::secondary_key(), Some("n"), &names), Reply::Get);
+        assert!(page.picking.is_some(), "the picker is still the answer being given");
+        // And the letter on its own is a letter, which is the whole reason
+        // the plus needs a modifier at all: "Ink" has one in it.
+        assert_eq!(
+            page.key("n", Modifiers::default(), Some("n"), &names),
+            Reply::Preview(Appearance::Dark, "Ink".into())
         );
     }
 

@@ -21,7 +21,7 @@ are retaken.
 Grab a build from the [releases](https://github.com/omznc/mbrd-rs/releases), or:
 
 ```
-cargo run -p mbrd                       # a demonstration board
+cargo run -p mbrd                       # the board you had open last
 cargo run -p mbrd -- some-board.mbrd    # a real one
 ```
 
@@ -57,9 +57,10 @@ python3 -m http.server -d dist  # and look at it
 ## Themes
 
 *Settings → Application → Appearance* — a light theme and a dark one, and
-whether to follow your desktop or pin one. Drop a `.json` in your themes
-folder for your own; [`THEMES.md`](THEMES.md) is every colour there is and
-what it draws.
+whether to follow your desktop or pin one. mbrd wears **VS Code colour
+themes**: press *Browse* on the *More themes* row to search open-vsx.org and
+install one, or put a `.json` in your themes folder. [`THEMES.md`](THEMES.md) is every key mbrd
+reads, what it draws, and what is worked out from what.
 
 | The same board, light | Where that is chosen |
 |---|---|

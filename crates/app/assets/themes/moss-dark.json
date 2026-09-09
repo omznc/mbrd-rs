@@ -1,0 +1,27 @@
+{
+  "name": "Moss",
+  "type": "dark",
+  "author": "mbrd",
+  "colors": {
+    "editor.background": "#0f1711ff",
+    "editor.foreground": "#e4ebe0ff",
+    "sideBar.background": "#152018ff",
+    "sideBar.border": "#e4ebe016",
+    "editorWidget.background": "#213326ff",
+    "editorWidget.border": "#e4ebe01f",
+    "focusBorder": "#9d7925ff",
+    "textLink.foreground": "#a3812fff",
+    "descriptionForeground": "#9aae91ff",
+    "icon.foreground": "#7a8b71ff",
+    "editorRuler.foreground": "#e4ebe022",
+    "terminal.ansiYellow": "#c9913fff",
+    "terminal.ansiGreen": "#6f9455ff",
+    "terminal.ansiRed": "#bf4a4aff",
+    "widget.shadow": "#000000ff",
+    "gitDecoration.addedResourceForeground": "#6f9455ff",
+    "gitDecoration.deletedResourceForeground": "#d66666ff",
+    "terminal.ansiBlue": "#5e70caff",
+    "terminal.ansiMagenta": "#a467c1ff",
+    "terminal.ansiCyan": "#63b4c5ff"
+  }
+}

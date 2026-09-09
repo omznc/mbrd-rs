@@ -1,0 +1,27 @@
+{
+  "name": "Vellum",
+  "type": "dark",
+  "author": "mbrd",
+  "colors": {
+    "editor.background": "#121212ff",
+    "editor.foreground": "#eaeaeaff",
+    "sideBar.background": "#1a1a1aff",
+    "sideBar.border": "#eaeaea18",
+    "editorWidget.background": "#262626ff",
+    "editorWidget.border": "#eaeaea22",
+    "focusBorder": "#c8322eff",
+    "textLink.foreground": "#e2635fff",
+    "descriptionForeground": "#a6a6a6ff",
+    "icon.foreground": "#828282ff",
+    "editorRuler.foreground": "#eaeaea22",
+    "terminal.ansiYellow": "#d69b3aff",
+    "terminal.ansiGreen": "#6fa054ff",
+    "terminal.ansiRed": "#c8322eff",
+    "widget.shadow": "#000000ff",
+    "gitDecoration.addedResourceForeground": "#6f9455ff",
+    "gitDecoration.deletedResourceForeground": "#d66666ff",
+    "terminal.ansiBlue": "#6470c4ff",
+    "terminal.ansiMagenta": "#aa63c5ff",
+    "terminal.ansiCyan": "#54add4ff"
+  }
+}

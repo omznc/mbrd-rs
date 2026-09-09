@@ -1,0 +1,27 @@
+{
+  "name": "Plum",
+  "type": "light",
+  "author": "mbrd",
+  "colors": {
+    "editor.background": "#eee9f2ff",
+    "editor.foreground": "#2a1b2fff",
+    "sideBar.background": "#e4dbe9ff",
+    "sideBar.border": "#2a1b2f1f",
+    "editorWidget.background": "#f7f4f9ff",
+    "editorWidget.border": "#2a1b2f24",
+    "focusBorder": "#962eb9ff",
+    "textLink.foreground": "#962eb9ff",
+    "descriptionForeground": "#684b71ff",
+    "icon.foreground": "#897290ff",
+    "editorRuler.foreground": "#2a1b2f22",
+    "terminal.ansiYellow": "#8a5e10ff",
+    "terminal.ansiGreen": "#466b2eff",
+    "terminal.ansiRed": "#a62f2fff",
+    "widget.shadow": "#00000073",
+    "gitDecoration.addedResourceForeground": "#466b2eff",
+    "gitDecoration.deletedResourceForeground": "#a62f2fff",
+    "terminal.ansiBlue": "#293ba3ff",
+    "terminal.ansiMagenta": "#a3297aff",
+    "terminal.ansiCyan": "#298ea3ff"
+  }
+}
