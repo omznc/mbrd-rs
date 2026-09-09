@@ -24,15 +24,21 @@ jobs:
       # on Linux alone — see crates/app/Cargo.toml.
       - name: Install Linux build dependencies
         run: |
-          # The runner image carries apt lists for Google Chrome and Microsoft,
-          # and nothing here installs from either. A hash sum mismatch on one
-          # of them fails `apt-get update` outright — which is how a briefly
-          # inconsistent Chrome index stopped a release that has no Chrome
-          # anywhere in it. Dropped rather than swallowed with `|| true`: a
-          # list this build *does* install from is still worth failing on.
-          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
-            /etc/apt/sources.list.d/microsoft-prod.list
-          sudo apt-get update
+          # Nothing below comes from a third-party apt list, and the runner
+          # image carries several — Google Chrome and Microsoft among them. A
+          # hash sum mismatch on any one of them fails `apt-get update`
+          # outright, which is how a briefly inconsistent Chrome index stopped
+          # two runs of a release with no Chrome anywhere in it. So the two are
+          # dropped by what they point at rather than by file name, which is
+          # the image's to change and already is not the name Chrome's own
+          # package uses. If the update still trips over a list, it runs again
+          # over `/etc/apt/sources.list` alone — the Ubuntu archive on 22.04,
+          # and where every package below comes from. Not `|| true`: an update
+          # that fails on the archive itself still stops the build.
+          grep -rlE 'dl\.google\.com|packages\.microsoft\.com' \
+            /etc/apt/sources.list.d | xargs -r sudo rm -fv
+          sudo apt-get update \
+            || sudo apt-get update -o Dir::Etc::sourceparts=/dev/null
           # `libgstreamer1.0-dev` depends on `libunwind-dev`, and the runner image
           # ships LLVM's `libunwind-14-dev`, which declares `Breaks: libunwind-dev`.
           # apt will not pick between the two: it reports "held broken packages" and
@@ -101,15 +107,21 @@ jobs:
       - name: Install Linux build dependencies
         if: matrix.platform == 'ubuntu-22.04'
         run: |
-          # The runner image carries apt lists for Google Chrome and Microsoft,
-          # and nothing here installs from either. A hash sum mismatch on one
-          # of them fails `apt-get update` outright — which is how a briefly
-          # inconsistent Chrome index stopped a release that has no Chrome
-          # anywhere in it. Dropped rather than swallowed with `|| true`: a
-          # list this build *does* install from is still worth failing on.
-          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
-            /etc/apt/sources.list.d/microsoft-prod.list
-          sudo apt-get update
+          # Nothing below comes from a third-party apt list, and the runner
+          # image carries several — Google Chrome and Microsoft among them. A
+          # hash sum mismatch on any one of them fails `apt-get update`
+          # outright, which is how a briefly inconsistent Chrome index stopped
+          # two runs of a release with no Chrome anywhere in it. So the two are
+          # dropped by what they point at rather than by file name, which is
+          # the image's to change and already is not the name Chrome's own
+          # package uses. If the update still trips over a list, it runs again
+          # over `/etc/apt/sources.list` alone — the Ubuntu archive on 22.04,
+          # and where every package below comes from. Not `|| true`: an update
+          # that fails on the archive itself still stops the build.
+          grep -rlE 'dl\.google\.com|packages\.microsoft\.com' \
+            /etc/apt/sources.list.d | xargs -r sudo rm -fv
+          sudo apt-get update \
+            || sudo apt-get update -o Dir::Etc::sourceparts=/dev/null
           # `libgstreamer1.0-dev` depends on `libunwind-dev`, and the runner image
           # ships LLVM's `libunwind-14-dev`, which declares `Breaks: libunwind-dev`.
           # apt will not pick between the two: it reports "held broken packages" and
