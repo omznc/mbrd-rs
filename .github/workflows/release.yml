@@ -119,6 +119,14 @@ jobs:
       - name: Install Linux build dependencies
         if: matrix.platform == 'ubuntu-22.04'
         run: |
+          # The runner image carries apt lists for Google Chrome and Microsoft,
+          # and nothing here installs from either. A hash sum mismatch on one
+          # of them fails `apt-get update` outright — which is how a briefly
+          # inconsistent Chrome index stopped a release that has no Chrome
+          # anywhere in it. Dropped rather than swallowed with `|| true`: a
+          # list this build *does* install from is still worth failing on.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+            /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
           # `libgstreamer1.0-dev` depends on `libunwind-dev`, and the runner image
           # ships LLVM's `libunwind-14-dev`, which declares `Breaks: libunwind-dev`.
